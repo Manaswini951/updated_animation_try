@@ -221,7 +221,6 @@ def paste_layer(canvas, crop, alpha, cx, cy):
 
     bg_crop = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
 
-    # Dynamic RGBA/RGB Channel Handling to prevent shape mismatch
     if canvas.shape[2] == 4:
         if c_crop.shape[2] == 3:
             c_crop = cv2.cvtColor(c_crop, cv2.COLOR_BGR2BGRA)
@@ -249,14 +248,13 @@ def apply_glow_effect(image, mask, intensity):
     return np.clip(image.astype(np.float32) * (1.0 - alpha * 0.5) + glow_layer * (alpha * 0.5), 0, 255).astype(np.uint8)
 
 
-# Sequential Master Rendering Function: Walk-In -> Cross-Fade -> Color Animation
 def render_sequential_frame(
     original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask, 
     global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength, transparent_mode=False
 ):
     h, w = original_img.shape[:2]
 
-    # --- PHASE 1: WALK-IN FROM OFF-SCREEN ---
+    # PHASE 1: WALK-IN FROM OFF-SCREEN
     if global_t < walk_frac:
         local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
@@ -276,12 +274,11 @@ def render_sequential_frame(
             canvas = paper_bg.copy()
             return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
-    # --- PHASE 2: CROSS-FADE & MANDATORY IN-SCENE COLOR ANIMATION ---
+    # PHASE 2: CROSS-FADE & MANDATORY IN-SCENE COLOR ANIMATION
     else:
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
-        fade_alpha = ease_in_out(min(1.0, local_t * 2.5))  # Smooth cross-fade to full scene
+        fade_alpha = ease_in_out(min(1.0, local_t * 2.5))
 
-        # Base Canvas State
         if transparent_mode:
             base_img = np.zeros((h, w, 4), dtype=np.uint8)
             base_canvas = paste_layer(base_img, char_crop, alpha_crop, home_center[0], home_center[1])
@@ -292,7 +289,6 @@ def render_sequential_frame(
                 0, 255
             ).astype(np.uint8)
 
-        # Apply In-Scene Color Animation
         ys, xs = np.where(color_mask > 20)
         if len(xs) == 0:
             return base_canvas
@@ -375,14 +371,15 @@ if uploaded_files:
         st.markdown("---")
         st.subheader(f"🖼️ Drawing {idx + 1}: {file.name}")
 
+        file.seek(0)
         file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
         image = resize_image(auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)))
 
         col_box1, col_box2 = st.columns(2)
         with col_box1:
-            x_range = st.slider(f"Horizontal Bounding Box (X %) #{idx+1}", 0, 100, (15, 85))
+            x_range = st.slider(f"Horizontal Bounding Box (X %) #{idx+1}", 0, 100, (15, 85), key=f"x_{idx}_{file.name}")
         with col_box2:
-            y_range = st.slider(f"Vertical Bounding Box (Y %) #{idx+1}", 0, 100, (10, 90))
+            y_range = st.slider(f"Vertical Bounding Box (Y %) #{idx+1}", 0, 100, (10, 90), key=f"y_{idx}_{file.name}")
 
         bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
 
@@ -392,17 +389,17 @@ if uploaded_files:
             st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Image", use_container_width=True)
         with c2:
             selected_label = st.selectbox(
-                f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}"
+                f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}_{file.name}"
             )
             selected_color = next(c for c in detected_colors if c["label"] == selected_label)
-            tolerance = st.slider(f"Color Tolerance #{idx+1}", 10, 80, 45, key=f"tol_{idx}")
+            tolerance = st.slider(f"Color Tolerance #{idx+1}", 10, 80, 45, key=f"tol_{idx}_{file.name}")
             color_mask = make_color_mask(image, selected_color["bgr"], tolerance)
             st.image(
                 cv2.cvtColor(cv2.bitwise_and(image, image, mask=color_mask), cv2.COLOR_BGR2RGB), 
                 caption="Isolated Color Motion Region", use_container_width=True
             )
 
-        if st.button(f"✨ Process & Animate Sequence ({file.name})", key=f"btn_{idx}", type="primary", use_container_width=True):
+        if st.button(f"✨ Process & Animate Sequence ({file.name})", key=f"btn_{idx}_{file.name}", type="primary", use_container_width=True):
             with st.spinner("Extracting character & preparing pipeline..."):
                 char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
                 paper_bg = extract_paper_background(image)
@@ -414,7 +411,7 @@ if uploaded_files:
             frame_count = max(8, int(fps * duration))
             walk_frac = walk_percent / 100.0
 
-            # --- RENDER FULL SCENE ---
+            # RENDER FULL SCENE
             progress = st.progress(0, text="Rendering Full Scene Sequence...")
             full_frames = []
             for i in range(frame_count):
@@ -428,7 +425,7 @@ if uploaded_files:
 
             progress.empty()
 
-            # --- RENDER TRANSPARENT OVERLAY ---
+            # RENDER TRANSPARENT OVERLAY
             progress_trans = st.progress(0, text="Rendering Transparent Overlay Sequence...")
             transparent_frames = []
             for i in range(frame_count):
@@ -451,11 +448,11 @@ if uploaded_files:
                 st.markdown("**1. Full Scene Animated Sequence**")
                 st.image(full_gif, use_container_width=True)
                 st.download_button(
-                    "⬇️ Download Full Scene GIF", full_gif, f"full_scene_{file.name}.gif", "image/gif", use_container_width=True
+                    "⬇️ Download Full Scene GIF", full_gif, f"full_scene_{file.name}.gif", "image/gif", key=f"dl_full_{idx}_{file.name}", use_container_width=True
                 )
             with p2:
                 st.markdown("**2. Transparent Overlay Sequence (For Video Editors)**")
                 st.image(trans_gif, use_container_width=True)
                 st.download_button(
-                    "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", use_container_width=True
+                    "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", key=f"dl_trans_{idx}_{file.name}", use_container_width=True
                 )
