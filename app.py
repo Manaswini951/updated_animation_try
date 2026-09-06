@@ -25,10 +25,10 @@ st.title("🎨 Enhanced Hand-Drawn Animation Engine")
 st.markdown(
     """
 **Sequential Pipeline Executed Per Image:**
-1. **Lighting & Shadow Removal:** Cleans up dark camera shadows, flattens paper lighting, and boosts color contrast.
-2. **Walk-In & Merge:** Main character walks in smoothly, settles into place, and cross-fades into the full enhanced drawing.
-3. **In-Scene Seamless Motion:** Inpaints background holes behind animated color parts to eliminate double-object ghosting!
-4. **Bulk Single-Click Processing:** Process all uploaded images at once and download as a single ZIP archive!
+1. **Vivid Color Correction & Shadow Flattening:** Brightens paper while boosting color saturation and contrast.
+2. **Walk-In & Merge:** Character walks in smoothly, settles into place, and cross-fades into the full drawing.
+3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels while keeping the rest of the scene locked.
+4. **Bulk Single-Click Processing:** Process all uploaded images at once and download as a ZIP archive!
 """
 )
 
@@ -43,7 +43,7 @@ COLOR_ANIMATION_MODES = [
 
 
 # ============================================================
-# IMAGE ENHANCEMENT & SHADOW REMOVAL
+# VIVID COLOR CORRECTION & SHADOW REMOVAL
 # ============================================================
 
 def auto_rotate_vertical(image):
@@ -61,22 +61,29 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
     return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def enhance_paper_photo(image, clip_limit=2.5, tile_size=8, brightness_boost=15):
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+def enhance_paper_photo(image, brightness_boost=10, saturation_boost=1.25):
+    """
+    Cleans up uneven shadows without washing out colors.
+    Boosts saturation and contrast to make artwork pop.
+    """
+    # Convert to HSV to separate color saturation from lighting
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
 
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
-    cl = clahe.apply(l)
-
-    enhanced_lab = cv2.merge((cl, a, b))
-    enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-
-    gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
-    bg_illumination = cv2.GaussianBlur(gray, (101, 101), 0)
+    # Estimate background lighting using heavy Gaussian blur
+    illumination = cv2.GaussianBlur(v, (101, 101), 0)
     
-    normalized = cv2.divide(enhanced_bgr, cv2.cvtColor(bg_illumination, cv2.COLOR_GRAY2BGR), scale=255.0)
-    result = cv2.convertScaleAbs(normalized, alpha=1.1, beta=brightness_boost)
-    return result
+    # Flatten uneven shadows
+    v_norm = cv2.divide(v, illumination + 1e-5, scale=255.0)
+    v_boosted = cv2.convertScaleAbs(v_norm, alpha=1.05, beta=brightness_boost)
+    
+    # Boost saturation of hand-drawn colors
+    s_boosted = np.clip(s * saturation_boost, 0, 255).astype(np.uint8)
+
+    enhanced_hsv = cv2.merge((h.astype(np.uint8), s_boosted, v_boosted))
+    enhanced_bgr = cv2.cvtColor(enhanced_hsv, cv2.COLOR_HSV2BGR)
+    
+    return enhanced_bgr
 
 
 def extract_paper_background(image):
@@ -92,13 +99,14 @@ def extract_paper_background(image):
 
 
 def inpaint_color_hole(image, mask):
+    """Inpaints background behind animated region to prevent ghosting."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     dilated_mask = cv2.dilate(mask, kernel, iterations=2)
     return cv2.inpaint(image, dilated_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 
 # ============================================================
-# COLOR EXTRACTION & MASKING
+# ACCURATE COLOR SEPARATION & MASKING
 # ============================================================
 
 def get_color_name(rgb):
@@ -107,7 +115,7 @@ def get_color_name(rgb):
     hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
     hue, sat = int(hsv[0]), int(hsv[1])
 
-    if sat < 30:
+    if sat < 25:
         return "Neutral/White/Gray"
     if hue < 10 or hue >= 170:
         return "Red"
@@ -129,7 +137,8 @@ def extract_dominant_colors(image, max_colors=6):
     small = cv2.resize(image, (150, 150), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     
-    valid_pixels = small[hsv[:, :, 1] > 35].reshape(-1, 3)
+    # Filter out paper background pixels
+    valid_pixels = small[hsv[:, :, 1] > 30].reshape(-1, 3)
     if len(valid_pixels) < 100:
         valid_pixels = small.reshape(-1, 3)
 
@@ -159,11 +168,33 @@ def extract_dominant_colors(image, max_colors=6):
     return detected
 
 
-def make_color_mask(image, target_bgr, tolerance=45):
-    diff = np.abs(image.astype(np.int16) - np.array(target_bgr, dtype=np.int16))
-    dist = np.sqrt(np.sum(diff ** 2, axis=2))
-    
-    mask = (dist < tolerance).astype(np.uint8) * 255
+def make_color_mask(image, target_bgr, tolerance=35):
+    """
+    Uses HSV color-space thresholding to separate distinct colors 
+    without leaking into nearby shades (e.g. green grass vs yellow rabbit).
+    """
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    target_pixel = np.uint8([[[target_bgr[0], target_bgr[1], target_bgr[2]]]])
+    target_hsv = cv2.cvtColor(target_pixel, cv2.COLOR_BGR2HSV)[0][0]
+
+    hue_tol = max(8, int(tolerance * 0.35))
+    sat_tol = max(30, int(tolerance * 1.2))
+    val_tol = max(30, int(tolerance * 1.5))
+
+    lower_bound = np.array([
+        max(0, int(target_hsv[0]) - hue_tol),
+        max(20, int(target_hsv[1]) - sat_tol),
+        max(20, int(target_hsv[2]) - val_tol)
+    ], dtype=np.uint8)
+
+    upper_bound = np.array([
+        min(179, int(target_hsv[0]) + hue_tol),
+        min(255, int(target_hsv[1]) + sat_tol),
+        min(255, int(target_hsv[2]) + val_tol)
+    ], dtype=np.uint8)
+
+    mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.GaussianBlur(mask, (3, 3), 0)
@@ -304,7 +335,7 @@ def render_sequential_frame(
             canvas = paper_bg.copy()
             return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
-    # PHASE 2: CROSS-FADE & COLOR MOTION
+    # PHASE 2: CROSS-FADE & STRICT LOCALIZED COLOR MOTION
     else:
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(min(1.0, local_t * 2.5))
@@ -375,10 +406,10 @@ def build_gif(frames, fps):
 # STREAMLIT UI & CONTROLS
 # ============================================================
 
-st.sidebar.header("☀️ Image Enhancement")
-enable_enhancement = st.sidebar.checkbox("Enable Light & Shadow Cleaning", value=True)
-clip_limit = st.sidebar.slider("Shadow Flattening (CLAHE)", 1.0, 5.0, 2.5, 0.5)
-brightness_boost = st.sidebar.slider("Paper Brightness Boost", 0, 40, 15)
+st.sidebar.header("☀️ Vivid Color & Lighting Controls")
+enable_enhancement = st.sidebar.checkbox("Enable Vivid Color & Shadow Correction", value=True)
+brightness_boost = st.sidebar.slider("Paper Brightness Boost", 0, 30, 10)
+saturation_boost = st.sidebar.slider("Color Saturation Boost", 1.0, 2.0, 1.25, 0.05)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎬 Motion Controls")
@@ -403,7 +434,6 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    # Single Master Button to process all files in one click
     st.markdown("---")
     process_all = st.button("🚀 Process & Animate ALL Uploaded Files", type="primary", use_container_width=True)
 
@@ -418,7 +448,7 @@ if uploaded_files:
         raw_image = auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
 
         if enable_enhancement:
-            image = resize_image(enhance_paper_photo(raw_image, clip_limit=clip_limit, brightness_boost=brightness_boost))
+            image = resize_image(enhance_paper_photo(raw_image, brightness_boost=brightness_boost, saturation_boost=saturation_boost))
         else:
             image = resize_image(raw_image)
 
@@ -433,20 +463,19 @@ if uploaded_files:
         detected_colors = extract_dominant_colors(image)
         c1, c2 = st.columns(2)
         with c1:
-            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Enhanced Lighting Image", use_container_width=True)
+            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Vivid Color Enhanced Image", use_container_width=True)
         with c2:
             selected_label = st.selectbox(
                 f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}_{file.name}"
             )
             selected_color = next(c for c in detected_colors if c["label"] == selected_label)
-            tolerance = st.slider(f"Color Tolerance #{idx+1}", 10, 80, 45, key=f"tol_{idx}_{file.name}")
+            tolerance = st.slider(f"Color Tolerance #{idx+1}", 10, 80, 35, key=f"tol_{idx}_{file.name}")
             color_mask = make_color_mask(image, selected_color["bgr"], tolerance)
             st.image(
                 cv2.cvtColor(cv2.bitwise_and(image, image, mask=color_mask), cv2.COLOR_BGR2RGB), 
                 caption="Isolated Color Region", use_container_width=True
             )
 
-        # Trigger processing if individual button or Master "Process All" button is clicked
         single_click = st.button(f"✨ Process & Animate ({file.name})", key=f"btn_{idx}_{file.name}", use_container_width=True)
 
         if process_all or single_click:
