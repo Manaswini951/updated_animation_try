@@ -26,7 +26,7 @@ st.markdown(
     """
 **Sequential Animation & Extraction Pipeline:**
 1. **Clean Extraction:** Isolates character outline cleanly without grabbing paper textures or scenery.
-2. **Smooth Walk-In & Merge:** Character walks in smoothly, settles into place, and cross-fades into the complete scene.
+2. **Smooth Walk-In & Merge:** Starts on a pure white canvas, character walks in, then cross-fades slowly into the real scene.
 3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels with HSV discrimination.
 4. **Dual Export & Bulk ZIP:** Generates both Full Scene and Transparent Overlay GIFs, plus a bulk ZIP download.
 """
@@ -474,7 +474,7 @@ def render_sequential_frame(
 ):
     h, w = original_img.shape[:2]
 
-    # PHASE 1: WALK-IN
+    # PHASE 1: WALK-IN ON A PURE WHITE CANVAS
     if global_t < walk_frac:
         local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
@@ -491,10 +491,11 @@ def render_sequential_frame(
             canvas = np.zeros((h, w, 4), dtype=np.uint8)
             return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
         else:
-            canvas = paper_bg.copy()
+            # Start on a completely white canvas (255, 255, 255)
+            canvas = np.full((h, w, 3), 255, dtype=np.uint8)
             return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
-    # PHASE 2: CROSS-FADE TO ORIGINAL & IN-SCENE COLOR MOTION
+    # PHASE 2: CROSS-FADE FROM WHITE CANVAS TO REAL IMAGE & IN-SCENE COLOR MOTION
     else:
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(min(1.0, local_t * 2.5))
@@ -503,11 +504,14 @@ def render_sequential_frame(
             base_canvas = np.zeros((h, w, 4), dtype=np.uint8)
             base_canvas = paste_layer(base_canvas, char_crop, alpha_crop, home_center[0], home_center[1])
         else:
-            canvas_p1 = paste_layer(paper_bg.copy(), char_crop, alpha_crop, home_center[0], home_center[1])
+            # Prepare pure white base with character in home position
+            white_bg = np.full((h, w, 3), 255, dtype=np.uint8)
+            canvas_p1 = paste_layer(white_bg, char_crop, alpha_crop, home_center[0], home_center[1])
             if canvas_p1.shape[2] == 3:
                 canvas_p1 = cv2.cvtColor(canvas_p1, cv2.COLOR_BGR2BGRA)
             orig_rgba = cv2.cvtColor(original_img, cv2.COLOR_BGR2BGRA) if original_img.shape[2] == 3 else original_img.copy()
 
+            # Cross-fade from white_bg+char (canvas_p1) to original image (orig_rgba)
             base_canvas = np.clip(
                 canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + orig_rgba.astype(np.float32) * fade_alpha,
                 0, 255
