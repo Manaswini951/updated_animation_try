@@ -27,7 +27,7 @@ st.markdown(
 **Sequential Animation & Extraction Pipeline:**
 1. **Clean Extraction:** Isolates character outline cleanly without grabbing paper textures or scenery.
 2. **Smooth Walk-In & Merge:** Character walks in smoothly, settles into place, and cross-fades into the complete scene.
-3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels (e.g. shirt, cap) with HSV discrimination.
+3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels with HSV discrimination.
 4. **Dual Export & Bulk ZIP:** Generates both Full Scene and Transparent Overlay GIFs, plus a bulk ZIP download.
 """
 )
@@ -178,6 +178,37 @@ def contour_fill_from_outline(outline, sensitivity=55):
     return cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
 
 
+def fallback_grabcut(crop, outline):
+    h, w = crop.shape[:2]
+    mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    border = max(2, int(min(h, w) * 0.025))
+
+    mask[:border, :] = cv2.GC_BGD
+    mask[-border:, :] = cv2.GC_BGD
+    mask[:, :border] = cv2.GC_BGD
+    mask[:, -border:] = cv2.GC_BGD
+
+    mask[outline > 0] = cv2.GC_PR_FGD
+    seed = cv2.dilate(outline, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
+    mask[seed > 0] = cv2.GC_PR_FGD
+
+    bg_model = np.zeros((1, 65), np.float64)
+    fg_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(crop, mask, None, bg_model, fg_model, 5, cv2.GC_INIT_WITH_MASK)
+        result = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+        
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(result, connectivity=8)
+        if n <= 1:
+            return np.zeros_like(outline)
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        index = 1 + int(np.argmax(areas))
+        return np.where(labels == index, 255, 0).astype(np.uint8)
+    except Exception:
+        return np.zeros_like(outline)
+
+
 def extract_character_mask(image, bbox_pct, outline_sensitivity=55, detail_strength=45):
     x1, y1, x2, y2 = bbox_from_percentages(image, bbox_pct)
     crop = image[y1:y2, x1:x2].copy()
@@ -188,6 +219,11 @@ def extract_character_mask(image, bbox_pct, outline_sensitivity=55, detail_stren
 
     outline = detect_dark_outline(crop, sensitivity=outline_sensitivity)
     silhouette = contour_fill_from_outline(outline, sensitivity=outline_sensitivity)
+
+    silhouette_area = np.count_nonzero(silhouette)
+    bbox_area = max(1, cw * ch)
+    if silhouette_area < bbox_area * 0.01 or silhouette_area > bbox_area * 0.88:
+        silhouette = fallback_grabcut(crop, outline)
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     saturation = hsv[:, :, 1].astype(np.float32)
@@ -499,7 +535,10 @@ def render_sequential_frame(
                 crop_c, crop_a, scale_x, scale_y, math.sin(phase_c * 0.5) * strength * 0.3, pivot
             )
             cy -= bounce
-        else:
+        elif color_mode == "Glowing Zoom In/Out":
+            scale = 1.0 + math.sin(phase_c) * (strength * 0.015)
+            warped_c, warped_a = transform_layer(crop_c, crop_a, scale, scale, 0.0, pivot)
+        else: # Storytelling Speech Cadence
             angle = math.sin(phase_c * 0.5) * strength
             warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
 
