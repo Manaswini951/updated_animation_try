@@ -14,21 +14,22 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Hand-Drawn Frame Animator Pro",
+    page_title="Hand-Drawn Walk Away Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Frame Animator Pro")
+st.title("🎨 Hand-Drawn Character Walk-Away Animator")
 
 st.markdown(
     """
-Turn a single hand-drawn character into a frame-by-frame style animation.
+Turn a single hand-drawn character into a simple frame-by-frame animation.
 
-The engine extracts the original artwork, separates colored parts,
-creates many slightly different poses, and plays those frames rapidly
-to create a traditional hand-drawn animation feel.
+**The character is separated from the background, then walks away from the
+canvas until it completely disappears.**
+
+No AI model is required.
 """
 )
 
@@ -39,917 +40,723 @@ to create a traditional hand-drawn animation feel.
 
 MAX_IMAGE_SIZE = 1100
 
-MOTIONS = [
-    "Idle Breathing",
-    "Wave",
-    "Walk",
-    "Run",
-    "Jump",
-    "Dance",
-    "Bounce",
-    "Shake",
-    "Float",
-    "Celebrate",
-    "Move Across Canvas",
-    "Exit Right",
-    "Exit Left",
+DIRECTIONS = [
+    "Right",
+    "Left",
+    "Down",
+    "Up",
+    "Diagonal Down-Right",
+    "Diagonal Down-Left",
+    "Diagonal Up-Right",
+    "Diagonal Up-Left",
+]
+
+BACKGROUND_MODES = [
+    "White / Light Paper",
+    "Dark Background",
+    "Automatic",
 ]
 
 
 # ============================================================
-# COLOR UTILITIES
+# IMAGE HELPERS
 # ============================================================
 
-def get_color_name(rgb):
-    r, g, b = [int(x) for x in rgb]
+def resize_image(image, max_size=MAX_IMAGE_SIZE):
+    h, w = image.shape[:2]
 
-    pixel = np.uint8([[[b, g, r]]])
-    hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
+    if max(h, w) <= max_size:
+        return image.copy()
 
-    hue = int(hsv[0])
-    sat = int(hsv[1])
+    scale = max_size / float(max(h, w))
 
-    if sat < 35:
-        return "Neutral"
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
 
-    if hue < 8 or hue >= 172:
-        return "Red"
-    elif hue < 22:
-        return "Orange"
-    elif hue < 35:
-        return "Yellow"
-    elif hue < 85:
-        return "Green"
-    elif hue < 130:
-        return "Blue"
-    elif hue < 155:
-        return "Purple"
-    else:
-        return "Pink"
-
-
-def extract_dominant_colors(image, num_clusters=8):
-    """
-    Detect dominant saturated colors.
-
-    The image is resized before clustering so this remains reasonably
-    fast on Streamlit Cloud.
-    """
-
-    try:
-        small = cv2.resize(
-            image,
-            (160, 160),
-            interpolation=cv2.INTER_AREA,
-        )
-
-        hsv_small = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-
-        saturation = hsv_small[:, :, 1]
-
-        valid = saturation > 45
-
-        pixels = small[valid].reshape(-1, 3)
-
-        if len(pixels) < 50:
-            return []
-
-        pixels = pixels.astype(np.float32)
-
-        k = min(
-            num_clusters,
-            max(2, len(pixels) // 80),
-        )
-
-        criteria = (
-            cv2.TERM_CRITERIA_EPS +
-            cv2.TERM_CRITERIA_MAX_ITER,
-            30,
-            1.0,
-        )
-
-        _, labels, centers = cv2.kmeans(
-            pixels,
-            k,
-            None,
-            criteria,
-            5,
-            cv2.KMEANS_PP_CENTERS,
-        )
-
-        counts = np.bincount(
-            labels.flatten(),
-            minlength=k,
-        )
-
-        total = max(1, int(np.sum(counts)))
-
-        detected = []
-
-        for idx, center in enumerate(centers):
-
-            b, g, r = [int(x) for x in center]
-
-            hsv = cv2.cvtColor(
-                np.uint8([[[b, g, r]]]),
-                cv2.COLOR_BGR2HSV,
-            )[0][0]
-
-            h_val = int(hsv[0])
-            s_val = int(hsv[1])
-            v_val = int(hsv[2])
-
-            coverage = counts[idx] / total * 100
-
-            if coverage < 2.0:
-                continue
-
-            if s_val < 45:
-                continue
-
-            hex_code = f"#{r:02x}{g:02x}{b:02x}"
-
-            detected.append(
-                {
-                    "label": (
-                        f"{get_color_name((r, g, b))} "
-                        f"({hex_code}) "
-                        f"{coverage:.1f}%"
-                    ),
-                    "hsv": (
-                        h_val,
-                        s_val,
-                        v_val,
-                    ),
-                    "hex": hex_code,
-                    "rgb": (
-                        r,
-                        g,
-                        b,
-                    ),
-                    "coverage": coverage,
-                }
-            )
-
-        detected.sort(
-            key=lambda x: x["coverage"],
-            reverse=True,
-        )
-
-        return detected
-
-    except Exception:
-        return []
-
-
-# ============================================================
-# COLOR MASKING
-# ============================================================
-
-def make_color_mask(image, color):
-    """
-    Build a reasonably tolerant HSV mask around a detected color.
-    """
-
-    hsv = cv2.cvtColor(
+    return cv2.resize(
         image,
-        cv2.COLOR_BGR2HSV,
+        (new_w, new_h),
+        interpolation=cv2.INTER_AREA,
     )
 
-    h0, s0, v0 = color["hsv"]
 
-    hue_width = 18
+def bgr_to_rgb(image):
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    sat_low = max(30, s0 - 90)
-    val_low = max(20, v0 - 100)
 
-    if h0 - hue_width < 0:
+# ============================================================
+# BACKGROUND ESTIMATION
+# ============================================================
 
-        lower1 = np.array(
-            [
-                0,
-                sat_low,
-                val_low,
-            ],
-            dtype=np.uint8,
-        )
+def get_border_pixels(image, border_size=12):
+    """
+    Collect pixels from the outside border of the image.
+    These are assumed to mostly represent the paper/background.
+    """
 
-        upper1 = np.array(
-            [
-                h0 + hue_width,
-                255,
-                255,
-            ],
-            dtype=np.uint8,
-        )
+    h, w = image.shape[:2]
 
-        lower2 = np.array(
-            [
-                180 + h0 - hue_width,
-                sat_low,
-                val_low,
-            ],
-            dtype=np.uint8,
-        )
+    border_size = max(
+        2,
+        min(border_size, h // 4, w // 4)
+    )
 
-        upper2 = np.array(
-            [
-                179,
-                255,
-                255,
-            ],
-            dtype=np.uint8,
-        )
+    top = image[:border_size, :, :]
+    bottom = image[h - border_size:h, :, :]
+    left = image[:, :border_size, :]
+    right = image[:, w - border_size:w, :]
 
-        mask = cv2.bitwise_or(
-            cv2.inRange(hsv, lower1, upper1),
-            cv2.inRange(hsv, lower2, upper2),
-        )
+    pixels = np.concatenate(
+        [
+            top.reshape(-1, 3),
+            bottom.reshape(-1, 3),
+            left.reshape(-1, 3),
+            right.reshape(-1, 3),
+        ],
+        axis=0,
+    )
 
-    elif h0 + hue_width > 179:
+    return pixels
 
-        lower1 = np.array(
-            [
-                h0 - hue_width,
-                sat_low,
-                val_low,
-            ],
-            dtype=np.uint8,
-        )
 
-        upper1 = np.array(
-            [
-                179,
-                255,
-                255,
-            ],
-            dtype=np.uint8,
-        )
+def estimate_background_lab(image):
+    """
+    Estimate background color using the image border.
+    """
 
-        lower2 = np.array(
-            [
-                0,
-                sat_low,
-                val_low,
-            ],
-            dtype=np.uint8,
-        )
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
 
-        upper2 = np.array(
-            [
-                (h0 + hue_width) - 180,
-                255,
-                255,
-            ],
-            dtype=np.uint8,
-        )
+    border = get_border_pixels(image)
 
-        mask = cv2.bitwise_or(
-            cv2.inRange(hsv, lower1, upper1),
-            cv2.inRange(hsv, lower2, upper2),
-        )
+    border_lab = cv2.cvtColor(
+        border.reshape(-1, 1, 3),
+        cv2.COLOR_BGR2LAB
+    ).reshape(-1, 3)
 
+    median_lab = np.median(
+        border_lab,
+        axis=0
+    ).astype(np.float32)
+
+    return median_lab
+
+
+# ============================================================
+# FOREGROUND EXTRACTION
+# ============================================================
+
+def normalize_map(values):
+    values = values.astype(np.float32)
+
+    mn = float(np.min(values))
+    mx = float(np.max(values))
+
+    if mx - mn < 1e-6:
+        return np.zeros_like(values)
+
+    result = (values - mn) / (mx - mn)
+
+    return np.clip(result, 0.0, 1.0)
+
+
+def build_foreground_mask(
+    image,
+    sensitivity=50,
+    background_mode="White / Light Paper",
+):
+    """
+    Extract the complete hand-drawn character.
+
+    This combines:
+
+    - difference from estimated paper color
+    - luminance difference
+    - black-hat morphology
+    - local contrast
+    - edges
+    """
+
+    h, w = image.shape[:2]
+
+    # --------------------------------------------------------
+    # LAB COLOR DIFFERENCE
+    # --------------------------------------------------------
+
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+
+    bg_lab = estimate_background_lab(image)
+
+    diff = lab.astype(np.float32) - bg_lab.reshape(1, 1, 3)
+
+    color_distance = np.sqrt(
+        np.sum(diff * diff, axis=2)
+    )
+
+    color_distance = normalize_map(color_distance)
+
+    # --------------------------------------------------------
+    # GRAYSCALE / DARKNESS
+    # --------------------------------------------------------
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    border = get_border_pixels(image)
+
+    border_gray = cv2.cvtColor(
+        border.reshape(-1, 1, 3),
+        cv2.COLOR_BGR2GRAY
+    ).reshape(-1)
+
+    bg_gray = float(np.median(border_gray))
+
+    if background_mode == "Dark Background":
+        darkness = gray.astype(np.float32) - bg_gray
     else:
+        darkness = bg_gray - gray.astype(np.float32)
 
-        lower = np.array(
-            [
-                max(0, h0 - hue_width),
-                sat_low,
-                val_low,
-            ],
-            dtype=np.uint8,
-        )
-
-        upper = np.array(
-            [
-                min(179, h0 + hue_width),
-                255,
-                255,
-            ],
-            dtype=np.uint8,
-        )
-
-        mask = cv2.inRange(
-            hsv,
-            lower,
-            upper,
-        )
-
-    kernel_small = np.ones(
-        (3, 3),
-        np.uint8,
+    darkness = np.clip(
+        darkness,
+        0,
+        None
     )
 
-    kernel_medium = np.ones(
+    darkness = normalize_map(darkness)
+
+    # --------------------------------------------------------
+    # LOCAL CONTRAST
+    # --------------------------------------------------------
+
+    local_background = cv2.GaussianBlur(
+        gray,
+        (0, 0),
+        sigmaX=max(5, min(h, w) / 80)
+    )
+
+    if background_mode == "Dark Background":
+        local_difference = (
+            gray.astype(np.float32)
+            - local_background.astype(np.float32)
+        )
+    else:
+        local_difference = (
+            local_background.astype(np.float32)
+            - gray.astype(np.float32)
+        )
+
+    local_difference = np.clip(
+        local_difference,
+        0,
+        None
+    )
+
+    local_difference = normalize_map(
+        local_difference
+    )
+
+    # --------------------------------------------------------
+    # BLACK HAT
+    # --------------------------------------------------------
+
+    kernel_size = max(
+        9,
+        int(min(h, w) * 0.025)
+    )
+
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    blackhat_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size)
+    )
+
+    blackhat = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_BLACKHAT,
+        blackhat_kernel
+    )
+
+    blackhat = normalize_map(blackhat)
+
+    # --------------------------------------------------------
+    # EDGE STRUCTURE
+    # --------------------------------------------------------
+
+    blurred = cv2.GaussianBlur(
+        gray,
         (5, 5),
-        np.uint8,
+        0
     )
 
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel_small,
+    edges = cv2.Canny(
+        blurred,
+        30,
+        100
+    )
+
+    edges = cv2.dilate(
+        edges,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    edges = edges.astype(np.float32) / 255.0
+
+    # --------------------------------------------------------
+    # COMBINE SIGNALS
+    # --------------------------------------------------------
+
+    score = (
+        color_distance * 0.40
+        + darkness * 0.28
+        + local_difference * 0.12
+        + blackhat * 0.15
+        + edges * 0.05
+    )
+
+    score = cv2.GaussianBlur(
+        score,
+        (5, 5),
+        0
+    )
+
+    # --------------------------------------------------------
+    # THRESHOLD
+    # --------------------------------------------------------
+
+    # Lower sensitivity = easier extraction
+    # Higher sensitivity = more selective
+    percentile = np.clip(
+        88 - sensitivity * 0.35,
+        65,
+        90
+    )
+
+    threshold = np.percentile(
+        score,
+        percentile
+    )
+
+    mask = (
+        score >= threshold
+    ).astype(np.uint8) * 255
+
+    # --------------------------------------------------------
+    # RECOVER STRONG DARK/COLORED PIXELS
+    # --------------------------------------------------------
+
+    strong_signal = (
+        color_distance > 0.22
+    ) | (
+        darkness > 0.20
+    ) | (
+        blackhat > 0.30
+    )
+
+    mask[
+        strong_signal
+        & (score > threshold * 0.55)
+    ] = 255
+
+    # --------------------------------------------------------
+    # MORPHOLOGY
+    # --------------------------------------------------------
+
+    close_kernel = np.ones(
+        (5, 5),
+        np.uint8
+    )
+
+    open_kernel = np.ones(
+        (3, 3),
+        np.uint8
     )
 
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
-        kernel_medium,
+        close_kernel,
+        iterations=2
     )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        open_kernel,
+        iterations=1
+    )
+
+    # --------------------------------------------------------
+    # CONNECTED COMPONENT FILTERING
+    # --------------------------------------------------------
+
+    num_labels, labels, stats, centroids = (
+        cv2.connectedComponentsWithStats(
+            mask,
+            connectivity=8
+        )
+    )
+
+    if num_labels <= 1:
+        return mask
+
+    total_area = h * w
+
+    components = []
+
+    for i in range(1, num_labels):
+
+        area = int(
+            stats[i, cv2.CC_STAT_AREA]
+        )
+
+        if area < max(
+            20,
+            int(total_area * 0.00003)
+        ):
+            continue
+
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        cx, cy = centroids[i]
+
+        components.append(
+            {
+                "label": i,
+                "area": area,
+                "x": x,
+                "y": y,
+                "w": cw,
+                "h": ch,
+                "cx": cx,
+                "cy": cy,
+            }
+        )
+
+    if not components:
+        return mask
+
+    components.sort(
+        key=lambda x: x["area"],
+        reverse=True
+    )
+
+    # --------------------------------------------------------
+    # CHARACTER COMPONENT SELECTION
+    # --------------------------------------------------------
+
+    largest_area = components[0]["area"]
+
+    selected = []
+
+    center_x = w / 2
+    center_y = h / 2
+
+    for comp in components:
+
+        area_ratio = (
+            comp["area"]
+            / max(1, largest_area)
+        )
+
+        distance = math.sqrt(
+            (
+                comp["cx"] - center_x
+            ) ** 2
+            +
+            (
+                comp["cy"] - center_y
+            ) ** 2
+        )
+
+        normalized_distance = (
+            distance
+            /
+            max(1, math.sqrt(w * w + h * h))
+        )
+
+        # Keep large components.
+        if area_ratio >= 0.08:
+            selected.append(comp["label"])
+            continue
+
+        # Keep reasonably large components close
+        # to the main character.
+        if (
+            area_ratio >= 0.015
+            and normalized_distance < 0.35
+        ):
+            selected.append(comp["label"])
+
+    if not selected:
+        selected = [
+            components[0]["label"]
+        ]
+
+    clean_mask = np.zeros_like(mask)
+
+    for label in selected:
+        clean_mask[
+            labels == label
+        ] = 255
+
+    # --------------------------------------------------------
+    # CONTOUR FILL
+    # --------------------------------------------------------
+
+    contours, _ = cv2.findContours(
+        clean_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    filled = np.zeros_like(
+        clean_mask
+    )
+
+    for contour in contours:
+
+        area = cv2.contourArea(
+            contour
+        )
+
+        if area < 20:
+            continue
+
+        cv2.drawContours(
+            filled,
+            [contour],
+            -1,
+            255,
+            thickness=cv2.FILLED
+        )
+
+    # Combine original fine details with filled body.
+    combined = cv2.bitwise_or(
+        clean_mask,
+        filled
+    )
+
+    # --------------------------------------------------------
+    # FINAL SMOOTHING
+    # --------------------------------------------------------
+
+    combined = cv2.morphologyEx(
+        combined,
+        cv2.MORPH_CLOSE,
+        np.ones((5, 5), np.uint8),
+        iterations=1
+    )
+
+    return combined
+
+
+# ============================================================
+# MASK REFINEMENT
+# ============================================================
+
+def refine_mask(mask, feather=2):
+    mask = mask.astype(np.uint8)
+
+    # Remove tiny holes.
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        np.ones((5, 5), np.uint8),
+        iterations=1
+    )
+
+    # Small dilation prevents cutting off outlines.
+    mask = cv2.dilate(
+        mask,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    # Feather edge.
+    if feather > 0:
+        kernel = feather * 2 + 1
+
+        mask = cv2.GaussianBlur(
+            mask,
+            (kernel, kernel),
+            0
+        )
 
     return mask
 
 
 # ============================================================
-# GEOMETRY UTILITIES
+# CHARACTER EXTRACTION
 # ============================================================
 
-def component_boundary(mask):
-
-    if mask.dtype == bool:
-        mask = mask.astype(np.uint8) * 255
-
-    elif mask.dtype != np.uint8:
-        mask = mask.astype(np.uint8)
-
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
-
-    if not contours:
-        return np.empty(
-            (0, 2),
-            dtype=np.float32,
-        )
-
-    points = np.vstack(
-        [
-            c.reshape(-1, 2)
-            for c in contours
-        ]
-    )
-
-    return points.astype(
-        np.float32
-    )
-
-
-def farthest_point(points, origin):
-
-    if len(points) == 0:
-        return origin
-
-    origin = np.array(
-        origin,
-        dtype=np.float32,
-    )
-
-    diff = points - origin
-
-    dist = np.sum(
-        diff * diff,
-        axis=1,
-    )
-
-    return tuple(
-        points[np.argmax(dist)]
-    )
-
-
-def closest_points_between_masks(mask_a, mask_b):
-
-    pts_a = component_boundary(mask_a)
-    pts_b = component_boundary(mask_b)
-
-    if (
-        len(pts_a) == 0
-        or len(pts_b) == 0
-    ):
-        return (
-            None,
-            None,
-            float("inf"),
-        )
-
-    max_points = 350
-
-    if len(pts_a) > max_points:
-        indices = np.linspace(
-            0,
-            len(pts_a) - 1,
-            max_points,
-        ).astype(int)
-
-        pts_a = pts_a[indices]
-
-    if len(pts_b) > max_points:
-        indices = np.linspace(
-            0,
-            len(pts_b) - 1,
-            max_points,
-        ).astype(int)
-
-        pts_b = pts_b[indices]
-
-    diff = (
-        pts_a[:, None, :]
-        -
-        pts_b[None, :, :]
-    )
-
-    dist2 = np.sum(
-        diff * diff,
-        axis=2,
-    )
-
-    ia, ib = np.unravel_index(
-        np.argmin(dist2),
-        dist2.shape,
-    )
-
-    return (
-        tuple(pts_a[ia]),
-        tuple(pts_b[ib]),
-        float(
-            math.sqrt(
-                dist2[ia, ib]
-            )
-        ),
-    )
-
-
-# ============================================================
-# PART EXTRACTION
-# ============================================================
-
-def detect_parts(
+def extract_character(
     image,
-    selected_colors,
+    mask,
+    margin=20
 ):
     """
-    Detect connected colored components.
-
-    Each component becomes an independent animation part.
+    Return cropped BGR image + alpha mask.
     """
 
-    h, w = image.shape[:2]
-
-    all_parts = []
-
-    for color_index, color in enumerate(
-        selected_colors
-    ):
-
-        mask = make_color_mask(
-            image,
-            color,
-        )
-
-        num_labels, labels, stats, centroids = (
-            cv2.connectedComponentsWithStats(
-                mask,
-                connectivity=8,
-            )
-        )
-
-        min_area = max(
-            180,
-            int(
-                h * w * 0.00018
-            ),
-        )
-
-        for i in range(
-            1,
-            num_labels,
-        ):
-
-            area = int(
-                stats[
-                    i,
-                    cv2.CC_STAT_AREA
-                ]
-            )
-
-            if area < min_area:
-                continue
-
-            component_mask = (
-                labels == i
-            ).astype(np.uint8) * 255
-
-            ys, xs = np.where(
-                component_mask > 0
-            )
-
-            if len(xs) < 20:
-                continue
-
-            x, y, cw, ch = [
-                int(v)
-                for v in stats[i, :4]
-            ]
-
-            cx, cy = centroids[i]
-
-            boundary = component_boundary(
-                component_mask
-            )
-
-            if len(boundary) == 0:
-                continue
-
-            pts = boundary.astype(
-                np.float32
-            )
-
-            if len(pts) > 1000:
-                indices = np.linspace(
-                    0,
-                    len(pts) - 1,
-                    1000,
-                ).astype(int)
-
-                pts_for_pca = pts[indices]
-
-            else:
-                pts_for_pca = pts
-
-            centered = (
-                pts_for_pca
-                -
-                np.mean(
-                    pts_for_pca,
-                    axis=0,
-                )
-            )
-
-            if len(centered) > 2:
-
-                covariance = np.cov(
-                    centered.T
-                )
-
-                eigenvalues, eigenvectors = (
-                    np.linalg.eigh(
-                        covariance
-                    )
-                )
-
-                axis = eigenvectors[
-                    :,
-                    np.argmax(
-                        eigenvalues
-                    ),
-                ]
-
-                projections = centered @ axis
-
-                p_min = tuple(
-                    pts_for_pca[
-                        np.argmin(
-                            projections
-                        )
-                    ]
-                )
-
-                p_max = tuple(
-                    pts_for_pca[
-                        np.argmax(
-                            projections
-                        )
-                    ]
-                )
-
-            else:
-
-                p_min = (
-                    float(cx),
-                    float(cy),
-                )
-
-                p_max = (
-                    float(cx),
-                    float(cy),
-                )
-
-            length = float(
-                np.linalg.norm(
-                    np.array(p_max)
-                    -
-                    np.array(p_min)
-                )
-            )
-
-            all_parts.append(
-                {
-                    "id": len(all_parts),
-                    "color_index": color_index,
-                    "color_name": color["label"],
-                    "mask": component_mask > 0,
-                    "area": area,
-                    "center": (
-                        float(cx),
-                        float(cy),
-                    ),
-                    "bbox": (
-                        x,
-                        y,
-                        cw,
-                        ch,
-                    ),
-                    "base": (
-                        float(cx),
-                        float(cy),
-                    ),
-                    "tip": p_max,
-                    "parent": None,
-                    "depth": 0,
-                    "length": length,
-                }
-            )
-
-    if not all_parts:
-        return []
-
-    # --------------------------------------------------------
-    # HIERARCHY DETECTION
-    # --------------------------------------------------------
-
-    for part in all_parts:
-
-        best_parent = None
-        best_distance = float("inf")
-        best_p1 = None
-
-        for candidate in all_parts:
-
-            if (
-                candidate["id"]
-                ==
-                part["id"]
-            ):
-                continue
-
-            if (
-                candidate["area"]
-                <
-                part["area"] * 0.30
-            ):
-                continue
-
-            p1, p2, distance = (
-                closest_points_between_masks(
-                    part["mask"],
-                    candidate["mask"],
-                )
-            )
-
-            if p1 is None:
-                continue
-
-            tolerance = max(
-                70,
-                min(w, h) * 0.12,
-            )
-
-            if (
-                distance < tolerance
-                and distance < best_distance
-            ):
-
-                best_distance = distance
-                best_parent = candidate
-                best_p1 = p1
-
-        if best_parent is not None:
-
-            part["parent"] = (
-                best_parent["id"]
-            )
-
-            part["base"] = (
-                float(best_p1[0]),
-                float(best_p1[1]),
-            )
-
-            child_boundary = (
-                component_boundary(
-                    part["mask"].astype(
-                        np.uint8
-                    ) * 255
-                )
-            )
-
-            part["tip"] = farthest_point(
-                child_boundary,
-                part["base"],
-            )
-
-        else:
-
-            part["parent"] = None
-
-            part["base"] = (
-                part["center"]
-            )
-
-            part["tip"] = farthest_point(
-                component_boundary(
-                    part["mask"].astype(
-                        np.uint8
-                    ) * 255
-                ),
-                part["center"],
-            )
-
-    # --------------------------------------------------------
-    # DEPTH
-    # --------------------------------------------------------
-
-    def get_depth(part):
-
-        visited = set()
-
-        current = part
-        depth = 0
-
-        while (
-            current["parent"]
-            is not None
-            and depth < 20
-        ):
-
-            if current["id"] in visited:
-                break
-
-            visited.add(
-                current["id"]
-            )
-
-            parent = next(
-                (
-                    p
-                    for p in all_parts
-                    if p["id"]
-                    ==
-                    current["parent"]
-                ),
-                None,
-            )
-
-            if parent is None:
-                break
-
-            current = parent
-            depth += 1
-
-        return depth
-
-    for part in all_parts:
-        part["depth"] = get_depth(
-            part
-        )
-
-    # Parent first
-    all_parts.sort(
-        key=lambda p: p["depth"]
+    ys, xs = np.where(
+        mask > 20
     )
 
-    return all_parts
+    if len(xs) == 0:
+        return None, None, None
+
+    x1 = max(
+        0,
+        int(np.min(xs)) - margin
+    )
+
+    y1 = max(
+        0,
+        int(np.min(ys)) - margin
+    )
+
+    x2 = min(
+        image.shape[1],
+        int(np.max(xs)) + margin + 1
+    )
+
+    y2 = min(
+        image.shape[0],
+        int(np.max(ys)) + margin + 1
+    )
+
+    crop = image[
+        y1:y2,
+        x1:x2
+    ].copy()
+
+    alpha = mask[
+        y1:y2,
+        x1:x2
+    ].copy()
+
+    return crop, alpha, (
+        x1,
+        y1,
+        x2,
+        y2
+    )
 
 
 # ============================================================
-# BACKGROUND EXTRACTION
+# BACKGROUND RECONSTRUCTION
 # ============================================================
 
-def prepare_background(
-    original,
-    parts,
+def reconstruct_background(
+    image,
+    mask,
+    strength=7
 ):
     """
-    Remove movable parts from the original image and
-    reconstruct the background.
+    Remove the character from its original location
+    using OpenCV inpainting.
     """
 
-    if not parts:
-        return original.copy()
+    inpaint_mask = mask.copy()
 
-    combined = np.zeros(
-        original.shape[:2],
-        dtype=np.uint8,
+    inpaint_mask = cv2.dilate(
+        inpaint_mask,
+        np.ones((7, 7), np.uint8),
+        iterations=2
     )
 
-    for part in parts:
-
-        mask = (
-            part["mask"]
-            .astype(np.uint8)
-            * 255
-        )
-
-        # Slightly enlarge the removed area so that
-        # old pixels do not remain around moving objects.
-        mask = cv2.dilate(
-            mask,
-            np.ones(
-                (5, 5),
-                np.uint8,
-            ),
-            iterations=2,
-        )
-
-        combined = cv2.bitwise_or(
-            combined,
-            mask,
-        )
-
+    # Don't attempt absurdly large inpainting areas.
     coverage = (
-        np.count_nonzero(combined)
+        np.count_nonzero(inpaint_mask)
         /
-        float(combined.size)
+        float(inpaint_mask.size)
     )
 
-    # If nearly the whole image was selected,
-    # don't destroy the original background.
-    if coverage > 0.55:
-        return original.copy()
+    if coverage > 0.65:
+        return image.copy()
 
-    try:
+    background = cv2.inpaint(
+        image,
+        inpaint_mask,
+        strength,
+        cv2.INPAINT_TELEA
+    )
 
-        background = cv2.inpaint(
-            original,
-            combined,
-            7,
-            cv2.INPAINT_TELEA,
-        )
-
-        return background
-
-    except Exception:
-
-        return original.copy()
+    return background
 
 
 # ============================================================
-# AFFINE TRANSFORM
+# TRANSPARENT CHARACTER PREVIEW
 # ============================================================
 
-def get_affine_matrix(
-    angle_deg,
-    tx,
-    ty,
-    pivot,
+def checkerboard(
+    width,
+    height,
+    square=20
 ):
-    """
-    Rotation around a specific pivot plus translation.
-    """
-
-    rad = math.radians(
-        angle_deg
+    result = np.zeros(
+        (height, width, 3),
+        dtype=np.uint8
     )
 
-    cos_a = math.cos(rad)
-    sin_a = math.sin(rad)
+    for y in range(0, height, square):
+        for x in range(0, width, square):
 
-    px, py = pivot
+            if (
+                (x // square + y // square)
+                % 2
+                == 0
+            ):
+                value = 225
+            else:
+                value = 245
 
-    M = np.array(
-        [
-            [
-                cos_a,
-                -sin_a,
-                px
-                -
-                px * cos_a
-                +
-                py * sin_a
-                +
-                tx,
-            ],
-            [
-                sin_a,
-                cos_a,
-                py
-                -
-                px * sin_a
-                -
-                py * cos_a
-                +
-                ty,
-            ],
-            [
-                0,
-                0,
-                1,
-            ],
-        ],
-        dtype=np.float32,
+            result[
+                y:min(y + square, height),
+                x:min(x + square, width)
+            ] = value
+
+    return result
+
+
+def composite_character_preview(
+    character,
+    alpha
+):
+    h, w = character.shape[:2]
+
+    bg = checkerboard(
+        w,
+        h
     )
 
-    return M
+    a = (
+        alpha.astype(np.float32)
+        / 255.0
+    )
+
+    a = a[:, :, None]
+
+    result = (
+        character.astype(np.float32)
+        * a
+        +
+        bg.astype(np.float32)
+        * (1 - a)
+    )
+
+    return np.clip(
+        result,
+        0,
+        255
+    ).astype(np.uint8)
 
 
 # ============================================================
@@ -957,1060 +764,546 @@ def get_affine_matrix(
 # ============================================================
 
 def smoothstep(t):
-    """
-    Smooth acceleration/deceleration.
-    """
-
-    t = max(
+    t = np.clip(
+        t,
         0.0,
-        min(1.0, t),
+        1.0
     )
 
     return (
-        t
-        *
-        t
-        *
-        (
-            3.0
-            -
-            2.0 * t
-        )
+        t * t * (3 - 2 * t)
     )
 
 
-def sine_ease(t):
-    """
-    Smooth looping motion.
-    """
+def ease_in_out(t):
+    t = np.clip(
+        t,
+        0.0,
+        1.0
+    )
 
     return (
         0.5
         -
         0.5
         *
-        math.cos(
-            2.0
-            *
-            math.pi
-            *
-            t
-        )
+        math.cos(math.pi * t)
     )
 
 
 # ============================================================
-# MOTION ENGINE
+# WALK TRAJECTORY
 # ============================================================
 
-def motion_for_part(
-    motion,
-    part,
-    normalized_time,
-    intensity,
-    canvas_width,
-    canvas_height,
+def get_start_center(
+    bbox,
+    canvas_w,
+    canvas_h
 ):
-    """
-    Calculates tiny per-frame movement.
+    x1, y1, x2, y2 = bbox
 
-    The important difference from the original version is that
-    the transformation is applied to the extracted artwork itself,
-    rather than repeatedly transforming the entire source image.
-    """
-
-    t = max(
-        0.0,
-        min(
-            0.999999,
-            normalized_time,
-        ),
+    return (
+        (x1 + x2) / 2,
+        (y1 + y2) / 2
     )
 
-    phase = (
-        2.0
-        *
-        math.pi
-        *
-        t
-    )
 
-    sine = math.sin(phase)
-    cosine = math.cos(phase)
+def get_exit_center(
+    start_x,
+    start_y,
+    char_w,
+    char_h,
+    canvas_w,
+    canvas_h,
+    direction
+):
+    margin_x = char_w * 1.4
+    margin_y = char_h * 1.4
 
-    side = (
-        1
-        if part["id"] % 2 == 0
-        else -1
-    )
-
-    depth = part.get(
-        "depth",
-        0,
-    )
-
-    # Lower values prevent very small parts from
-    # flying around too much.
-    strength = (
-        intensity
-        *
-        (
-            0.55
-            +
-            min(depth, 3)
-            *
-            0.12
-        )
-    )
-
-    angle = 0.0
-    tx = 0.0
-    ty = 0.0
-
-    # --------------------------------------------------------
-    # IDLE BREATHING
-    # --------------------------------------------------------
-
-    if motion == "Idle Breathing":
-
-        body_factor = (
-            0.18
-            if depth == 0
-            else 0.35
+    if direction == "Right":
+        return (
+            canvas_w + margin_x,
+            start_y
         )
 
-        angle = (
-            sine
-            *
-            strength
-            *
-            body_factor
+    if direction == "Left":
+        return (
+            -margin_x,
+            start_y
         )
 
-        if depth == 0:
-            ty = (
-                sine
-                *
-                strength
-                *
-                0.12
-            )
-
-    # --------------------------------------------------------
-    # WAVE
-    # --------------------------------------------------------
-
-    elif motion == "Wave":
-
-        wave = math.sin(
-            2
-            *
-            math.pi
-            *
-            t
-            +
-            depth
-            *
-            0.30
+    if direction == "Down":
+        return (
+            start_x,
+            canvas_h + margin_y
         )
 
-        angle = (
-            wave
-            *
-            strength
-            *
-            (
-                1.2
-                if depth >= 1
-                else 0.25
-            )
+    if direction == "Up":
+        return (
+            start_x,
+            -margin_y
         )
 
-        tx = (
-            wave
-            *
-            strength
-            *
-            0.08
+    if direction == "Diagonal Down-Right":
+        return (
+            canvas_w + margin_x,
+            canvas_h + margin_y
         )
 
-    # --------------------------------------------------------
-    # WALK
-    # --------------------------------------------------------
-
-    elif motion == "Walk":
-
-        walk_phase = (
-            2
-            *
-            math.pi
-            *
-            t
-            +
-            (
-                math.pi
-                if side < 0
-                else 0
-            )
+    if direction == "Diagonal Down-Left":
+        return (
+            -margin_x,
+            canvas_h + margin_y
         )
 
-        if depth > 0:
-
-            angle = (
-                math.sin(
-                    walk_phase
-                )
-                *
-                strength
-                *
-                1.15
-            )
-
-            ty = (
-                max(
-                    0,
-                    -math.cos(
-                        walk_phase
-                    ),
-                )
-                *
-                strength
-                *
-                0.15
-            )
-
-        else:
-
-            angle = (
-                sine
-                *
-                strength
-                *
-                0.10
-            )
-
-            ty = (
-                abs(sine)
-                *
-                strength
-                *
-                0.12
-            )
-
-    # --------------------------------------------------------
-    # RUN
-    # --------------------------------------------------------
-
-    elif motion == "Run":
-
-        run_phase = (
-            4
-            *
-            math.pi
-            *
-            t
-            +
-            (
-                math.pi
-                if side < 0
-                else 0
-            )
+    if direction == "Diagonal Up-Right":
+        return (
+            canvas_w + margin_x,
+            -margin_y
         )
 
-        if depth > 0:
-
-            angle = (
-                math.sin(
-                    run_phase
-                )
-                *
-                strength
-                *
-                1.7
-            )
-
-        else:
-
-            angle = (
-                sine
-                *
-                strength
-                *
-                0.22
-            )
-
-        ty = (
-            abs(
-                math.sin(
-                    4
-                    *
-                    math.pi
-                    *
-                    t
-                )
-            )
-            *
-            strength
-            *
-            0.28
-        )
-
-    # --------------------------------------------------------
-    # JUMP
-    # --------------------------------------------------------
-
-    elif motion == "Jump":
-
-        jump = math.sin(
-            math.pi
-            *
-            t
-        )
-
-        ty = (
-            -jump
-            *
-            strength
-            *
-            1.6
-        )
-
-        if depth > 0:
-
-            angle = (
-                sine
-                *
-                strength
-                *
-                0.25
-            )
-
-    # --------------------------------------------------------
-    # DANCE
-    # --------------------------------------------------------
-
-    elif motion == "Dance":
-
-        angle = (
-            math.sin(
-                4
-                *
-                math.pi
-                *
-                t
-                +
-                depth
-                *
-                0.5
-            )
-            *
-            strength
-            *
-            1.15
-        )
-
-        tx = (
-            math.sin(
-                2
-                *
-                math.pi
-                *
-                t
-                +
-                depth
-            )
-            *
-            strength
-            *
-            0.25
-        )
-
-        ty = (
-            math.cos(
-                4
-                *
-                math.pi
-                *
-                t
-            )
-            *
-            strength
-            *
-            0.18
-        )
-
-    # --------------------------------------------------------
-    # BOUNCE
-    # --------------------------------------------------------
-
-    elif motion == "Bounce":
-
-        bounce = abs(
-            math.sin(
-                math.pi
-                *
-                t
-            )
-        )
-
-        ty = (
-            -bounce
-            *
-            strength
-            *
-            1.15
-        )
-
-        angle = (
-            sine
-            *
-            strength
-            *
-            0.30
-        )
-
-    # --------------------------------------------------------
-    # SHAKE
-    # --------------------------------------------------------
-
-    elif motion == "Shake":
-
-        angle = (
-            math.sin(
-                10
-                *
-                math.pi
-                *
-                t
-            )
-            *
-            strength
-            *
-            0.50
-        )
-
-        tx = (
-            math.sin(
-                14
-                *
-                math.pi
-                *
-                t
-            )
-            *
-            strength
-            *
-            0.25
-        )
-
-    # --------------------------------------------------------
-    # FLOAT
-    # --------------------------------------------------------
-
-    elif motion == "Float":
-
-        ty = (
-            sine
-            *
-            strength
-            *
-            0.60
-        )
-
-        tx = (
-            cosine
-            *
-            strength
-            *
-            0.25
-        )
-
-        angle = (
-            sine
-            *
-            strength
-            *
-            0.25
-        )
-
-    # --------------------------------------------------------
-    # CELEBRATE
-    # --------------------------------------------------------
-
-    elif motion == "Celebrate":
-
-        angle = (
-            sine
-            *
-            strength
-            *
-            1.25
-        )
-
-        ty = (
-            -abs(sine)
-            *
-            strength
-            *
-            0.42
-        )
-
-        if depth > 0:
-
-            tx = (
-                math.sin(
-                    4
-                    *
-                    math.pi
-                    *
-                    t
-                )
-                *
-                strength
-                *
-                0.35
-            )
-
-    # --------------------------------------------------------
-    # MOVE ACROSS CANVAS
-    # --------------------------------------------------------
-
-    elif motion == "Move Across Canvas":
-
-        travel = (
-            -canvas_width * 0.35
-            +
-            t
-            *
-            canvas_width
-            *
-            0.70
-        )
-
-        tx = (
-            travel
-            *
-            (
-                1.0
-                if depth == 0
-                else 0.02
-            )
-        )
-
-        # tiny natural bobbing
-        ty = (
-            math.sin(
-                phase * 2
-            )
-            *
-            strength
-            *
-            0.12
-        )
-
-    # --------------------------------------------------------
-    # EXIT RIGHT
-    # --------------------------------------------------------
-
-    elif motion == "Exit Right":
-
-        eased = smoothstep(t)
-
-        tx = (
-            eased
-            *
-            canvas_width
-            *
-            1.20
-        )
-
-        ty = (
-            math.sin(
-                phase * 2
-            )
-            *
-            strength
-            *
-            0.10
-        )
-
-    # --------------------------------------------------------
-    # EXIT LEFT
-    # --------------------------------------------------------
-
-    elif motion == "Exit Left":
-
-        eased = smoothstep(t)
-
-        tx = (
-            -eased
-            *
-            canvas_width
-            *
-            1.20
-        )
-
-        ty = (
-            math.sin(
-                phase * 2
-            )
-            *
-            strength
-            *
-            0.10
+    if direction == "Diagonal Up-Left":
+        return (
+            -margin_x,
+            -margin_y
         )
 
     return (
-        angle,
-        tx,
-        ty,
+        canvas_w + margin_x,
+        start_y
     )
 
 
-# ============================================================
-# WORLD TRANSFORMS
-# ============================================================
-
-def compute_world_transforms(
-    parts,
-    motion,
+def walking_position(
     t,
-    intensity,
-    canvas_width,
-    canvas_height,
+    start,
+    exit_pos,
+    bob_amount,
+    sway_amount,
+    cycles
 ):
     """
-    Parent transforms are inherited by children.
-
-    Example:
-
-        body
-          |
-          arm
-           |
-          hand
-
-    Moving the body therefore moves the arm and hand too.
+    Calculate character center for a frame.
     """
 
-    transforms = {}
+    motion_t = ease_in_out(t)
 
-    for part in parts:
+    sx, sy = start
+    ex, ey = exit_pos
 
-        angle, tx, ty = motion_for_part(
-            motion,
-            part,
-            t,
-            intensity,
-            canvas_width,
-            canvas_height,
-        )
-
-        pivot = part["base"]
-
-        local_M = get_affine_matrix(
-            angle,
-            tx,
-            ty,
-            pivot,
-        )
-
-        parent_id = part["parent"]
-
-        if (
-            parent_id is not None
-            and parent_id in transforms
-        ):
-
-            world_M = (
-                transforms[parent_id]
-                @
-                local_M
-            )
-
-        else:
-
-            world_M = local_M
-
-        transforms[
-            part["id"]
-        ] = world_M
-
-    return transforms
-
-
-# ============================================================
-# PART LAYER PREPARATION
-# ============================================================
-
-def prepare_part_layers(
-    original,
-    parts,
-):
-    """
-    Store each part's original pixels and alpha mask.
-
-    This is the important frame-by-frame change.
-
-    We don't repeatedly transform the whole original image.
-    We transform only the pixels belonging to the part.
-    """
-
-    layers = {}
-
-    for part in parts:
-
-        mask = (
-            part["mask"]
-            .astype(np.uint8)
-            * 255
-        )
-
-        # Slight feathering prevents jagged edges.
-        alpha = cv2.GaussianBlur(
-            mask,
-            (3, 3),
-            0,
-        )
-
-        layer = original.copy()
-
-        layers[
-            part["id"]
-        ] = {
-            "image": layer,
-            "mask": alpha,
-        }
-
-    return layers
-
-
-# ============================================================
-# ALPHA COMPOSITING
-# ============================================================
-
-def alpha_composite(
-    canvas,
-    layer,
-    alpha,
-):
-    """
-    Standard alpha compositing.
-    """
-
-    alpha_f = (
-        alpha.astype(
-            np.float32
-        )
-        /
-        255.0
+    x = (
+        sx
+        +
+        (ex - sx)
+        * motion_t
     )
 
-    alpha_f = alpha_f[:, :, None]
+    y = (
+        sy
+        +
+        (ey - sy)
+        * motion_t
+    )
+
+    # Walking bob.
+    # It gradually becomes less noticeable near the end.
+    bob_fade = 1.0 - smoothstep(
+        max(0.0, (t - 0.75) / 0.25)
+    )
+
+    bob = (
+        math.sin(
+            2
+            * math.pi
+            * cycles
+            * t
+        )
+        * bob_amount
+        * bob_fade
+    )
+
+    y += bob
+
+    # Small body sway.
+    sway = (
+        math.sin(
+            2
+            * math.pi
+            * cycles
+            * t
+            +
+            math.pi / 2
+        )
+        *
+        sway_amount
+        *
+        bob_fade
+    )
+
+    return x, y, sway
+
+
+# ============================================================
+# CHARACTER TRANSFORMATION
+# ============================================================
+
+def transform_character(
+    character,
+    alpha,
+    scale,
+    angle
+):
+    h, w = character.shape[:2]
+
+    new_w = max(
+        2,
+        int(w * scale)
+    )
+
+    new_h = max(
+        2,
+        int(h * scale)
+    )
+
+    resized = cv2.resize(
+        character,
+        (new_w, new_h),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    resized_alpha = cv2.resize(
+        alpha,
+        (new_w, new_h),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    center = (
+        new_w / 2,
+        new_h / 2
+    )
+
+    matrix = cv2.getRotationMatrix2D(
+        center,
+        angle,
+        1.0
+    )
+
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+
+    bound_w = int(
+        new_h * sin
+        +
+        new_w * cos
+    )
+
+    bound_h = int(
+        new_h * cos
+        +
+        new_w * sin
+    )
+
+    matrix[0, 2] += (
+        bound_w / 2
+        -
+        center[0]
+    )
+
+    matrix[1, 2] += (
+        bound_h / 2
+        -
+        center[1]
+    )
+
+    rotated = cv2.warpAffine(
+        resized,
+        matrix,
+        (bound_w, bound_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255)
+    )
+
+    rotated_alpha = cv2.warpAffine(
+        resized_alpha,
+        matrix,
+        (bound_w, bound_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+
+    return rotated, rotated_alpha
+
+
+# ============================================================
+# COMPOSITING
+# ============================================================
+
+def paste_character(
+    background,
+    character,
+    alpha,
+    center_x,
+    center_y,
+    fade=1.0
+):
+    canvas = background.copy()
+
+    h, w = character.shape[:2]
+
+    x1 = int(
+        round(center_x - w / 2)
+    )
+
+    y1 = int(
+        round(center_y - h / 2)
+    )
+
+    x2 = x1 + w
+    y2 = y1 + h
+
+    canvas_h, canvas_w = canvas.shape[:2]
+
+    # Completely outside.
+    if (
+        x2 <= 0
+        or
+        y2 <= 0
+        or
+        x1 >= canvas_w
+        or
+        y1 >= canvas_h
+    ):
+        return canvas
+
+    # Clip to canvas.
+    cx1 = max(0, x1)
+    cy1 = max(0, y1)
+    cx2 = min(canvas_w, x2)
+    cy2 = min(canvas_h, y2)
+
+    src_x1 = cx1 - x1
+    src_y1 = cy1 - y1
+    src_x2 = src_x1 + (cx2 - cx1)
+    src_y2 = src_y1 + (cy2 - cy1)
+
+    char_crop = character[
+        src_y1:src_y2,
+        src_x1:src_x2
+    ]
+
+    alpha_crop = alpha[
+        src_y1:src_y2,
+        src_x1:src_x2
+    ]
+
+    a = (
+        alpha_crop.astype(np.float32)
+        / 255.0
+    )
+
+    a *= float(
+        np.clip(
+            fade,
+            0,
+            1
+        )
+    )
+
+    a = a[:, :, None]
+
+    background_crop = canvas[
+        cy1:cy2,
+        cx1:cx2
+    ].astype(np.float32)
+
+    foreground = (
+        char_crop.astype(np.float32)
+        * a
+    )
 
     result = (
-        layer.astype(
-            np.float32
-        )
-        *
-        alpha_f
+        foreground
         +
-        canvas.astype(
-            np.float32
-        )
+        background_crop
         *
-        (
-            1.0
-            -
-            alpha_f
-        )
+        (1 - a)
     )
 
-    return np.clip(
+    canvas[
+        cy1:cy2,
+        cx1:cx2
+    ] = np.clip(
         result,
         0,
-        255,
-    ).astype(
-        np.uint8
-    )
+        255
+    ).astype(np.uint8)
+
+    return canvas
 
 
 # ============================================================
 # RENDER ONE FRAME
 # ============================================================
 
-def render_frame(
-    original,
+def render_walk_frame(
     background,
-    parts,
-    part_layers,
-    motion,
+    character,
+    alpha,
     t,
-    intensity,
+    start,
+    exit_pos,
+    end_scale,
+    bob_amount,
+    sway_amount,
+    cycles,
+    fade_at_end,
 ):
-    """
-    Render exactly ONE animation frame.
+    canvas_h, canvas_w = background.shape[:2]
 
-    Every frame is a fresh image.
-
-    This is effectively:
-
-        original drawing
-             ↓
-        extracted parts
-             ↓
-        tiny movement
-             ↓
-        frame N
-
-    Then frame N+1 gets a slightly different movement.
-    """
-
-    canvas = background.copy()
-
-    h, w = original.shape[:2]
-
-    transforms = compute_world_transforms(
-        parts,
-        motion,
+    x, y, walking_sway = walking_position(
         t,
-        intensity,
-        w,
-        h,
+        start,
+        exit_pos,
+        bob_amount,
+        sway_amount,
+        cycles
     )
 
-    # Parents first, children afterward.
-    ordered_parts = sorted(
-        parts,
-        key=lambda p: p["depth"],
+    # Scale changes from 100% to user-selected end scale.
+    scale = (
+        1.0
+        +
+        (
+            end_scale
+            - 1.0
+        )
+        * ease_in_out(t)
     )
 
-    for part in ordered_parts:
+    # Slight walking rotation.
+    angle = walking_sway
 
-        part_id = part["id"]
-
-        layer_data = part_layers[
-            part_id
-        ]
-
-        source_image = (
-            layer_data["image"]
+    transformed_character, transformed_alpha = (
+        transform_character(
+            character,
+            alpha,
+            scale,
+            angle
         )
+    )
 
-        source_mask = (
-            layer_data["mask"]
+    # Optional disappearance fade.
+    if fade_at_end and t > 0.82:
+        fade = 1.0 - (
+            (t - 0.82)
+            / 0.18
         )
+    else:
+        fade = 1.0
 
-        affine = (
-            transforms[part_id]
-            [:2, :]
-        )
-
-        warped_image = cv2.warpAffine(
-            source_image,
-            affine,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(
-                0,
-                0,
-                0,
-            ),
-        )
-
-        warped_mask = cv2.warpAffine(
-            source_mask,
-            affine,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-
-        # Prevent extremely faint interpolation ghosts.
-        warped_mask = np.where(
-            warped_mask < 5,
-            0,
-            warped_mask,
-        ).astype(
-            np.uint8
-        )
-
-        canvas = alpha_composite(
-            canvas,
-            warped_image,
-            warped_mask,
-        )
-
-    return canvas
+    return paste_character(
+        background,
+        transformed_character,
+        transformed_alpha,
+        x,
+        y,
+        fade
+    )
 
 
 # ============================================================
-# RIG VISUALIZATION
+# CONTACT SHEET
 # ============================================================
 
-def draw_rig(
-    image,
-    parts,
-):
-    preview = image.copy()
-
-    colors = [
-        (0, 0, 255),
-        (0, 180, 0),
-        (255, 0, 0),
-        (0, 180, 180),
-        (180, 0, 180),
-        (255, 120, 0),
-    ]
-
-    for index, part in enumerate(parts):
-
-        color = colors[
-            index
-            %
-            len(colors)
-        ]
-
-        base = (
-            int(part["base"][0]),
-            int(part["base"][1]),
-        )
-
-        tip = (
-            int(part["tip"][0]),
-            int(part["tip"][1]),
-        )
-
-        center = (
-            int(part["center"][0]),
-            int(part["center"][1]),
-        )
-
-        cv2.line(
-            preview,
-            base,
-            tip,
-            color,
-            3,
-        )
-
-        cv2.circle(
-            preview,
-            base,
-            8,
-            (0, 0, 255),
-            -1,
-        )
-
-        cv2.circle(
-            preview,
-            tip,
-            6,
-            (0, 255, 0),
-            -1,
-        )
-
-        cv2.circle(
-            preview,
-            center,
-            4,
-            color,
-            -1,
-        )
-
-        cv2.putText(
-            preview,
-            str(index + 1),
-            (
-                center[0] + 8,
-                center[1] - 8,
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return preview
-
-
-# ============================================================
-# FRAME DIFFERENCE PREVIEW
-# ============================================================
-
-def make_motion_sheet(
+def make_contact_sheet(
     frames,
+    columns=4,
+    max_width=1000
 ):
-    """
-    Create a small contact sheet showing several frames.
-
-    This is useful for checking whether the movement is actually
-    changing gradually rather than jumping.
-    """
-
     if not frames:
         return None
 
-    count = min(
-        6,
-        len(frames),
-    )
+    thumbs = []
 
-    indices = np.linspace(
-        0,
-        len(frames) - 1,
-        count,
-    ).astype(int)
+    for frame in frames:
+        h, w = frame.shape[:2]
 
-    selected = [
-        frames[i]
-        for i in indices
-    ]
-
-    thumbnails = []
-
-    for frame in selected:
+        thumb_w = 260
+        thumb_h = max(
+            1,
+            int(
+                h
+                *
+                thumb_w
+                /
+                max(1, w)
+            )
+        )
 
         thumb = cv2.resize(
             frame,
-            (260, 260),
-            interpolation=cv2.INTER_AREA,
+            (thumb_w, thumb_h),
+            interpolation=cv2.INTER_AREA
         )
 
-        thumbnails.append(
-            thumb
+        thumbs.append(thumb)
+
+    rows = math.ceil(
+        len(thumbs) / columns
+    )
+
+    cell_h = max(
+        x.shape[0]
+        for x in thumbs
+    )
+
+    cell_w = max(
+        x.shape[1]
+        for x in thumbs
+    )
+
+    sheet = np.ones(
+        (
+            rows * cell_h,
+            columns * cell_w,
+            3
+        ),
+        dtype=np.uint8
+    ) * 255
+
+    for i, thumb in enumerate(thumbs):
+
+        row = i // columns
+        col = i % columns
+
+        y = row * cell_h
+        x = col * cell_w
+
+        sheet[
+            y:y + thumb.shape[0],
+            x:x + thumb.shape[1]
+        ] = thumb
+
+    if sheet.shape[1] > max_width:
+
+        scale = (
+            max_width
+            /
+            sheet.shape[1]
         )
 
-    rows = []
-
-    for i in range(
-        0,
-        len(thumbnails),
-        3,
-    ):
-
-        row = thumbnails[
-            i:i + 3
-        ]
-
-        while len(row) < 3:
-
-            row.append(
-                np.ones_like(
-                    thumbnails[0]
-                )
-                *
-                255
-            )
-
-        rows.append(
-            np.hstack(row)
+        sheet = cv2.resize(
+            sheet,
+            (
+                int(sheet.shape[1] * scale),
+                int(sheet.shape[0] * scale)
+            ),
+            interpolation=cv2.INTER_AREA
         )
 
-    return np.vstack(rows)
+    return sheet
 
 
 # ============================================================
@@ -2019,7 +1312,7 @@ def make_motion_sheet(
 
 def build_gif(
     frames,
-    duration,
+    fps
 ):
     if not frames:
         return None
@@ -2028,21 +1321,23 @@ def build_gif(
 
     prepared = []
 
+    duration = max(
+        20,
+        int(1000 / fps)
+    )
+
     for frame in frames:
 
         rgb = cv2.cvtColor(
             frame,
-            cv2.COLOR_BGR2RGB,
+            cv2.COLOR_BGR2RGB
         )
 
-        prepared.append(
-            Image.fromarray(
-                rgb
-            ).convert(
-                "P",
-                palette=Image.ADAPTIVE,
-            )
-        )
+        pil = Image.fromarray(
+            rgb
+        ).convert("P", palette=Image.ADAPTIVE)
+
+        prepared.append(pil)
 
     prepared[0].save(
         buffer,
@@ -2063,7 +1358,7 @@ def build_gif(
 
 def build_mp4(
     frames,
-    fps,
+    fps
 ):
     if not frames:
         return None
@@ -2072,20 +1367,22 @@ def build_mp4(
 
     with tempfile.NamedTemporaryFile(
         suffix=".mp4",
-        delete=False,
+        delete=False
     ) as tmp:
 
         temp_path = tmp.name
 
     try:
 
+        fourcc = cv2.VideoWriter_fourcc(
+            *"mp4v"
+        )
+
         writer = cv2.VideoWriter(
             temp_path,
-            cv2.VideoWriter_fourcc(
-                *"mp4v"
-            ),
+            fourcc,
             fps,
-            (w, h),
+            (w, h)
         )
 
         if not writer.isOpened():
@@ -2098,550 +1395,531 @@ def build_mp4(
 
         with open(
             temp_path,
-            "rb",
+            "rb"
         ) as f:
-
             return f.read()
 
     except Exception:
-
         return None
 
     finally:
 
-        if os.path.exists(
-            temp_path
-        ):
-
+        if os.path.exists(temp_path):
             try:
-                os.remove(
-                    temp_path
-                )
+                os.remove(temp_path)
             except Exception:
                 pass
 
 
 # ============================================================
-# MAIN APPLICATION
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("🎬 Animation")
+
+direction = st.sidebar.selectbox(
+    "Walk Direction",
+    DIRECTIONS,
+    index=0
+)
+
+fps = st.sidebar.select_slider(
+    "FPS",
+    options=[
+        8,
+        10,
+        12,
+        15,
+        20,
+        24,
+        30,
+    ],
+    value=12
+)
+
+duration = st.sidebar.slider(
+    "Animation Duration",
+    min_value=1.0,
+    max_value=8.0,
+    value=3.0,
+    step=0.5
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.header("🚶 Walking Motion")
+
+bob_amount = st.sidebar.slider(
+    "Walking Bob",
+    min_value=0,
+    max_value=30,
+    value=5
+)
+
+sway_amount = st.sidebar.slider(
+    "Walking Sway",
+    min_value=0,
+    max_value=15,
+    value=3
+)
+
+cycles = st.sidebar.slider(
+    "Walking Steps",
+    min_value=1,
+    max_value=12,
+    value=5
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.header("📏 Walking Away")
+
+end_scale_percent = st.sidebar.slider(
+    "Final Character Size",
+    min_value=20,
+    max_value=100,
+    value=100,
+    step=5
+)
+
+st.sidebar.caption(
+    "100% = same size while walking out. "
+    "Smaller values create a stronger 'walking away into distance' effect."
+)
+
+fade_at_end = st.sidebar.checkbox(
+    "Fade slightly at the very end",
+    value=False
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.header("🎨 Character Extraction")
+
+background_mode = st.sidebar.selectbox(
+    "Background Type",
+    BACKGROUND_MODES,
+    index=0
+)
+
+sensitivity = st.sidebar.slider(
+    "Foreground Sensitivity",
+    min_value=20,
+    max_value=80,
+    value=50
+)
+
+st.sidebar.caption(
+    "Increase sensitivity if too much background is being selected. "
+    "Decrease it if parts of the character are missing."
+)
+
+
+# ============================================================
+# FILE UPLOAD
 # ============================================================
 
 uploaded = st.file_uploader(
-    "Upload your hand-drawn character sheet",
+    "Upload your hand-drawn character",
     type=[
         "jpg",
         "jpeg",
         "png",
-        "webp",
-    ],
+        "webp"
+    ]
 )
 
+
+# ============================================================
+# MAIN PROCESSING
+# ============================================================
 
 if uploaded is not None:
 
     try:
 
-        # ====================================================
+        # ----------------------------------------------------
         # READ IMAGE
-        # ====================================================
+        # ----------------------------------------------------
 
         file_bytes = np.asarray(
             bytearray(
                 uploaded.read()
             ),
-            dtype=np.uint8,
+            dtype=np.uint8
         )
 
         image = cv2.imdecode(
             file_bytes,
-            cv2.IMREAD_COLOR,
+            cv2.IMREAD_COLOR
         )
 
         if image is None:
-
             st.error(
                 "Could not read the uploaded image."
             )
-
             st.stop()
 
-        original_h, original_w = (
-            image.shape[:2]
-        )
-
-        if max(
-            original_h,
-            original_w,
-        ) > MAX_IMAGE_SIZE:
-
-            scale = (
-                MAX_IMAGE_SIZE
-                /
-                max(
-                    original_h,
-                    original_w,
-                )
-            )
-
-            image = cv2.resize(
-                image,
-                (
-                    int(
-                        original_w
-                        *
-                        scale
-                    ),
-                    int(
-                        original_h
-                        *
-                        scale
-                    ),
-                ),
-                interpolation=cv2.INTER_AREA,
-            )
-
-        # ====================================================
-        # SIDEBAR
-        # ====================================================
-
-        st.sidebar.header(
-            "🎨 Part Detection"
-        )
-
-        detected_colors = (
-            extract_dominant_colors(
-                image
-            )
-        )
-
-        if not detected_colors:
-
-            st.warning(
-                "No clear colored regions were detected."
-            )
-
-            st.image(
-                cv2.cvtColor(
-                    image,
-                    cv2.COLOR_BGR2RGB,
-                ),
-                use_container_width=True,
-            )
-
-            st.stop()
-
-        color_dict = {
-            c["label"]: c
-            for c in detected_colors
-        }
-
-        default_count = min(
-            3,
-            len(color_dict),
-        )
-
-        selected_labels = (
-            st.sidebar.multiselect(
-                "Select body/part colors",
-                list(
-                    color_dict.keys()
-                ),
-                default=list(
-                    color_dict.keys()
-                )[:default_count],
-            )
-        )
-
-        selected_colors = [
-            color_dict[label]
-            for label in selected_labels
-        ]
-
-        st.sidebar.header(
-            "🎬 Animation"
-        )
-
-        motion = st.sidebar.selectbox(
-            "Animation Style",
-            MOTIONS,
-        )
-
-        intensity = st.sidebar.slider(
-            "Motion Strength",
-            1,
-            40,
-            12,
-        )
-
-        fps = st.sidebar.select_slider(
-            "Playback FPS",
-            options=[
-                8,
-                10,
-                12,
-                15,
-                20,
-                24,
-                30,
-            ],
-            value=12,
-        )
-
-        duration_seconds = (
-            st.sidebar.slider(
-                "Animation Duration",
-                1.0,
-                8.0,
-                2.5,
-                0.5,
-            )
-        )
-
-        st.sidebar.header(
-            "🎞️ Frame Generation"
-        )
-
-        frame_multiplier = (
-            st.sidebar.select_slider(
-                "Frame Density",
-                options=[
-                    1,
-                    2,
-                    3,
-                ],
-                value=1,
-                help=(
-                    "1 = normal frame count. "
-                    "2 = twice as many generated frames. "
-                    "3 = very smooth but slower."
-                ),
-            )
-        )
-
-        # Actual frames shown in the final video.
-        frame_count = max(
-            8,
-            int(
-                fps
-                *
-                duration_seconds
-            ),
-        )
-
-        # Extra generated frames can be useful for
-        # smoother GIF motion.
-        render_frame_count = (
-            frame_count
-            *
-            frame_multiplier
-        )
-
-        parts = detect_parts(
+        image = resize_image(
             image,
-            selected_colors,
+            MAX_IMAGE_SIZE
         )
 
-        # ====================================================
-        # PREVIEWS
-        # ====================================================
+        h, w = image.shape[:2]
 
-        col1, col2 = st.columns(2)
+        # ----------------------------------------------------
+        # EXTRACT CHARACTER
+        # ----------------------------------------------------
 
-        with col1:
+        with st.spinner(
+            "🔍 Separating character from background..."
+        ):
 
-            st.subheader(
-                "🖼️ Original Drawing"
+            mask = build_foreground_mask(
+                image,
+                sensitivity=sensitivity,
+                background_mode=background_mode
             )
 
-            st.image(
-                cv2.cvtColor(
+            mask = refine_mask(
+                mask,
+                feather=2
+            )
+
+            character, alpha, bbox = (
+                extract_character(
                     image,
-                    cv2.COLOR_BGR2RGB,
-                ),
-                use_container_width=True,
+                    mask,
+                    margin=20
+                )
             )
 
-        with col2:
+        if character is None:
 
-            st.subheader(
-                f"🦴 Detected Rig ({len(parts)} Parts)"
+            st.error(
+                "❌ I could not detect a character in this image."
             )
-
-            if parts:
-
-                rig = draw_rig(
-                    image,
-                    parts,
-                )
-
-                st.image(
-                    cv2.cvtColor(
-                        rig,
-                        cv2.COLOR_BGR2RGB,
-                    ),
-                    use_container_width=True,
-                )
-
-            else:
-
-                st.warning(
-                    "No sufficiently large parts detected."
-                )
-
-        # ====================================================
-        # INFORMATION
-        # ====================================================
-
-        if parts:
 
             st.info(
-                f"""
-**Frame-by-frame engine ready**
-
-Detected: **{len(parts)} parts**
-
-Output playback: **{fps} FPS**
-
-Duration: **{duration_seconds:.1f} seconds**
-
-Generated frames: **{render_frame_count}**
-
-The program will create a new slightly different pose
-for every frame instead of simply moving one image.
-"""
+                "Try lowering Foreground Sensitivity or "
+                "using a clearer image with a light background."
             )
 
-        # ====================================================
-        # GENERATE
-        # ====================================================
+            st.image(
+                bgr_to_rgb(image),
+                use_container_width=True
+            )
 
-        generate = st.button(
-            "✨ Generate Frame-by-Frame Animation",
-            type="primary",
-            use_container_width=True,
+            st.stop()
+
+        # ----------------------------------------------------
+        # CHARACTER SIZE CHECK
+        # ----------------------------------------------------
+
+        char_h, char_w = character.shape[:2]
+
+        character_area = (
+            char_w
+            *
+            char_h
         )
 
-        if (
-            generate
-            and parts
+        image_area = (
+            w
+            *
+            h
+        )
+
+        if character_area > image_area * 0.95:
+
+            st.warning(
+                "⚠️ The detected character occupies almost "
+                "the entire image. Background separation "
+                "may need adjustment."
+            )
+
+        # ----------------------------------------------------
+        # BACKGROUND RECONSTRUCTION
+        # ----------------------------------------------------
+
+        with st.spinner(
+            "🧹 Reconstructing background..."
         ):
+
+            background = reconstruct_background(
+                image,
+                mask,
+                strength=7
+            )
+
+        # ----------------------------------------------------
+        # PREVIEWS
+        # ----------------------------------------------------
+
+        st.subheader(
+            "🔍 Extraction Preview"
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+
+            st.markdown(
+                "**Original**"
+            )
+
+            st.image(
+                bgr_to_rgb(image),
+                use_container_width=True
+            )
+
+        with c2:
+
+            st.markdown(
+                "**Detected Character**"
+            )
+
+            preview = composite_character_preview(
+                character,
+                alpha
+            )
+
+            st.image(
+                bgr_to_rgb(preview),
+                use_container_width=True
+            )
+
+        with c3:
+
+            st.markdown(
+                "**Clean Background**"
+            )
+
+            st.image(
+                bgr_to_rgb(background),
+                use_container_width=True
+            )
+
+        # ----------------------------------------------------
+        # EXTRACTION QUALITY INFORMATION
+        # ----------------------------------------------------
+
+        st.markdown("---")
+
+        info1, info2, info3, info4 = st.columns(4)
+
+        with info1:
+            st.metric(
+                "Canvas",
+                f"{w} × {h}"
+            )
+
+        with info2:
+            st.metric(
+                "Character",
+                f"{char_w} × {char_h}"
+            )
+
+        with info3:
+            frame_count = max(
+                8,
+                int(
+                    fps * duration
+                )
+            )
+
+            st.metric(
+                "Frames",
+                frame_count
+            )
+
+        with info4:
+            st.metric(
+                "FPS",
+                fps
+            )
+
+        # ----------------------------------------------------
+        # GENERATE
+        # ----------------------------------------------------
+
+        generate = st.button(
+            "✨ Generate Walk-Away Animation",
+            type="primary",
+            use_container_width=True
+        )
+
+        if generate:
 
             progress = st.progress(
                 0,
-                text="Preparing artwork...",
+                text="Preparing animation..."
             )
 
-            # =================================================
-            # BACKGROUND CACHE
-            # =================================================
+            # ------------------------------------------------
+            # START / EXIT POSITIONS
+            # ------------------------------------------------
 
-            bg_key = (
-                "background_"
-                + str(
-                    hash(
-                        uploaded.name
-                        +
-                        str(
-                            len(parts)
-                        )
-                        +
-                        str(
-                            image.shape
-                        )
-                    )
+            start_x, start_y = (
+                get_start_center(
+                    bbox,
+                    w,
+                    h
                 )
             )
 
-            if (
-                bg_key
-                not in st.session_state
-            ):
-
-                st.session_state[
-                    bg_key
-                ] = prepare_background(
-                    image,
-                    parts,
-                )
-
-            background = (
-                st.session_state[
-                    bg_key
-                ]
-            )
-
-            progress.progress(
-                15,
-                text="Preparing original drawing layers...",
-            )
-
-            # =================================================
-            # PREPARE ORIGINAL PARTS
-            # =================================================
-
-            part_layers = (
-                prepare_part_layers(
-                    image,
-                    parts,
+            exit_x, exit_y = (
+                get_exit_center(
+                    start_x,
+                    start_y,
+                    char_w,
+                    char_h,
+                    w,
+                    h,
+                    direction
                 )
             )
 
-            # =================================================
+            start = (
+                start_x,
+                start_y
+            )
+
+            exit_pos = (
+                exit_x,
+                exit_y
+            )
+
+            end_scale = (
+                end_scale_percent
+                /
+                100.0
+            )
+
+            # ------------------------------------------------
             # RENDER FRAMES
-            # =================================================
+            # ------------------------------------------------
 
             frames = []
 
             for i in range(
-                render_frame_count
+                frame_count
             ):
 
-                if render_frame_count <= 1:
-
-                    t = 0.0
-
+                if frame_count <= 1:
+                    t = 1.0
                 else:
-
                     t = (
                         i
                         /
                         (
-                            render_frame_count
-                            -
-                            1
+                            frame_count - 1
                         )
                     )
 
-                frame = render_frame(
-                    image,
-                    background,
-                    parts,
-                    part_layers,
-                    motion,
-                    t,
-                    intensity,
+                frame = render_walk_frame(
+                    background=background,
+                    character=character,
+                    alpha=alpha,
+                    t=t,
+                    start=start,
+                    exit_pos=exit_pos,
+                    end_scale=end_scale,
+                    bob_amount=bob_amount,
+                    sway_amount=sway_amount,
+                    cycles=cycles,
+                    fade_at_end=fade_at_end,
                 )
 
                 frames.append(
                     frame
                 )
 
-                percent = (
-                    20
-                    +
-                    int(
-                        70
-                        *
-                        (
-                            i + 1
-                        )
-                        /
-                        render_frame_count
-                    )
-                )
-
                 progress.progress(
-                    percent,
-                    text=(
-                        f"Drawing Frame "
-                        f"{i + 1}/"
-                        f"{render_frame_count}"
-                    ),
-                )
-
-            progress.progress(
-                92,
-                text="Building animation...",
-            )
-
-            # =================================================
-            # EXPORT
-            # =================================================
-
-            # If frame density > 1, keep the actual playback
-            # duration approximately correct by using the
-            # corresponding GIF duration.
-            gif_duration = max(
-                1,
-                int(
-                    1000
+                    (i + 1)
                     /
-                    (
-                        fps
-                        *
-                        frame_multiplier
+                    frame_count,
+                    text=(
+                        f"Rendering frame "
+                        f"{i + 1}/{frame_count}"
                     )
-                ),
-            )
-
-            gif_data = build_gif(
-                frames,
-                gif_duration,
-            )
-
-            progress.progress(
-                100,
-                text="Animation complete!",
-            )
+                )
 
             progress.empty()
 
-            # =================================================
-            # MOTION PREVIEW
-            # =================================================
+            # ------------------------------------------------
+            # CONTACT SHEET
+            # ------------------------------------------------
 
             st.subheader(
-                "🎬 Generated Animation"
+                "🎞️ Frame-by-Frame Movement"
+            )
+
+            contact = make_contact_sheet(
+                frames,
+                columns=4
+            )
+
+            if contact is not None:
+
+                st.image(
+                    bgr_to_rgb(contact),
+                    use_container_width=True
+                )
+
+            # ------------------------------------------------
+            # GIF
+            # ------------------------------------------------
+
+            with st.spinner(
+                "🎬 Creating GIF..."
+            ):
+
+                gif_data = build_gif(
+                    frames,
+                    fps
+                )
+
+            # ------------------------------------------------
+            # MP4
+            # ------------------------------------------------
+
+            with st.spinner(
+                "🎥 Creating MP4..."
+            ):
+
+                mp4_data = build_mp4(
+                    frames,
+                    fps
+                )
+
+            # ------------------------------------------------
+            # PREVIEW
+            # ------------------------------------------------
+
+            st.subheader(
+                "🎬 Final Animation"
             )
 
             if gif_data:
 
                 st.image(
                     gif_data,
-                    use_container_width=True,
+                    use_container_width=True
                 )
 
-            # =================================================
-            # FRAME CONTACT SHEET
-            # =================================================
-
-            with st.expander(
-                "🔍 Inspect Individual Generated Frames"
-            ):
-
-                motion_sheet = (
-                    make_motion_sheet(
-                        frames
-                    )
-                )
-
-                if motion_sheet is not None:
-
-                    st.image(
-                        cv2.cvtColor(
-                            motion_sheet,
-                            cv2.COLOR_BGR2RGB,
-                        ),
-                        caption=(
-                            "The animation is made from "
-                            "many small changes between frames."
-                        ),
-                        use_container_width=True,
-                    )
-
-            # =================================================
+            # ------------------------------------------------
             # DOWNLOADS
-            # =================================================
-
-            safe_name = (
-                motion
-                .lower()
-                .replace(
-                    " ",
-                    "_",
-                )
-            )
+            # ------------------------------------------------
 
             d1, d2 = st.columns(2)
+
+            safe_direction = (
+                direction
+                .lower()
+                .replace(" ", "_")
+                .replace("-", "_")
+            )
 
             with d1:
 
@@ -2651,20 +1929,14 @@ for every frame instead of simply moving one image.
                         "⬇️ Download GIF",
                         data=gif_data,
                         file_name=(
-                            f"{safe_name}.gif"
+                            f"character_walk_"
+                            f"{safe_direction}.gif"
                         ),
                         mime="image/gif",
-                        use_container_width=True,
+                        use_container_width=True
                     )
 
             with d2:
-
-                mp4_data = build_mp4(
-                    frames,
-                    fps
-                    *
-                    frame_multiplier,
-                )
 
                 if mp4_data:
 
@@ -2672,31 +1944,27 @@ for every frame instead of simply moving one image.
                         "🎞️ Download MP4",
                         data=mp4_data,
                         file_name=(
-                            f"{safe_name}.mp4"
+                            f"character_walk_"
+                            f"{safe_direction}.mp4"
                         ),
                         mime="video/mp4",
-                        use_container_width=True,
+                        use_container_width=True
                     )
 
-            # =================================================
-            # TECHNICAL INFORMATION
-            # =================================================
+            # ------------------------------------------------
+            # FINAL INFORMATION
+            # ------------------------------------------------
 
             st.success(
-                f"""
-Animation generated successfully.
+                "✅ Animation generated! "
+                "The character progressively leaves the canvas, "
+                "while the reconstructed background remains behind."
+            )
 
-**Parts:** {len(parts)}
-
-**Frames:** {len(frames)}
-
-**Playback FPS:** {fps}
-
-**Duration:** approximately {duration_seconds:.1f} seconds
-
-**Technique:** original-pixel part extraction + incremental
-frame-by-frame transformations + alpha compositing.
-"""
+            st.info(
+                "💡 For a stronger 'walking away into the distance' "
+                "effect, try Final Character Size = 50–70%. "
+                "For simply walking out of the scene, keep it at 100%."
             )
 
     except Exception as e:
