@@ -13,42 +13,39 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Multi-Style Character Animator",
-    page_icon="🎨",
+    page_title="Hand-Drawn Storytelling Character Animator",
+    page_icon="🎭",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Multi-Style Character Animator")
+st.title("🎭 Storytelling & Dialogue Character Animator")
 
 st.markdown(
     """
-Upload one or more hand-drawn artwork files. The app automatically detects orientation, 
-orients characters vertically, extracts the main character, and applies your chosen animation style!
+Animate your hand-drawn character with natural **speech dynamics, conversational leaning, head-nodding, and rhythmic storytelling gestures**!
 """
 )
 
 MAX_IMAGE_SIZE = 1000
-ANIMATION_STYLES = [
-    "Walk-In & Settle",
-    "Puppet Joint Tilt",
-    "Pop-In Scale (Bounce)",
-    "Float & Glide",
+
+STORY_STYLES = [
+    "Expressive Storyteller (Nod & Sway)",
+    "Excited Explainer (Speech Pulses)",
+    "Thoughtful Ponderer (Lean & Pause)",
+    "Conversational Bounce (Lively Talk)",
 ]
 
 
 # ============================================================
-# AUTOMATIC ROTATION & IMAGE PREPROCESSING
+# UTILITIES & EXTRACTION
 # ============================================================
 
 def auto_rotate_vertical(image):
-    """Detects horizontal orientation via aspect ratio and rotates to vertical."""
+    """Rotates horizontal drawings vertically."""
     h, w = image.shape[:2]
-    
-    # If wider than tall, rotate 90 degrees
     if w > h:
         image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        
     return image
 
 
@@ -61,7 +58,6 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 
 def extract_paper_background(image):
-    """Samples edge pixels to build a uniform background canvas."""
     h, w = image.shape[:2]
     border_pixels = np.concatenate([
         image[:15, :].reshape(-1, 3),
@@ -74,17 +70,11 @@ def extract_paper_background(image):
 
 
 def extract_character_interactive(image, bbox_pct):
-    """Extracts the main character inside percentage bounding box coordinates using GrabCut."""
     h, w = image.shape[:2]
+    xmin, ymin = int((bbox_pct[0] / 100.0) * w), int((bbox_pct[1] / 100.0) * h)
+    xmax, ymax = int((bbox_pct[2] / 100.0) * w), int((bbox_pct[3] / 100.0) * h)
     
-    xmin = int((bbox_pct[0] / 100.0) * w)
-    ymin = int((bbox_pct[1] / 100.0) * h)
-    xmax = int((bbox_pct[2] / 100.0) * w)
-    ymax = int((bbox_pct[3] / 100.0) * h)
-    
-    rect_w = max(10, xmax - xmin)
-    rect_h = max(10, ymax - ymin)
-    rect = (xmin, ymin, rect_w, rect_h)
+    rect = (xmin, ymin, max(10, xmax - xmin), max(10, ymax - ymin))
     
     gc_mask = np.zeros((h, w), np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
@@ -111,32 +101,24 @@ def extract_character_interactive(image, bbox_pct):
     char_crop = image[y1:y2, x1:x2].copy()
     alpha_crop = char_mask[y1:y2, x1:x2].copy()
 
-    center_x = (x1 + x2) / 2.0
-    center_y = (y1 + y2) / 2.0
-
-    return char_crop, alpha_crop, (center_x, center_y)
+    return char_crop, alpha_crop, ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
 
 # ============================================================
-# ANIMATION STYLES & TRANSFORMS
+# STORYTELLING MOTION ENGINE
 # ============================================================
 
-def transform_crop(crop, alpha, scale, angle, pivot_bottom=False):
-    """Transforms image with scaling and rotation around center or bottom pivot point."""
+def transform_crop(crop, alpha, scale_x, scale_y, angle, pivot_bottom=True):
+    """Applies non-uniform scaling (squash & stretch) and rotation around a base joint pivot."""
     h, w = crop.shape[:2]
     
-    if pivot_bottom:
-        center = (w / 2.0, float(h))
-    else:
-        center = (w / 2.0, h / 2.0)
-        
-    scale = max(0.05, float(scale))
-    new_w, new_h = max(2, int(w * scale)), max(2, int(h * scale))
+    new_w = max(2, int(w * max(0.05, float(scale_x))))
+    new_h = max(2, int(h * max(0.05, float(scale_y))))
     
     resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     resized_alpha = cv2.resize(alpha, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-    pivot = (new_w / 2.0, new_h if pivot_bottom else new_h / 2.0)
+    pivot = (new_w / 2.0, float(new_h) if pivot_bottom else new_h / 2.0)
     M = cv2.getRotationMatrix2D(pivot, angle, 1.0)
     
     cos, sin = abs(M[0, 0]), abs(M[0, 1])
@@ -174,88 +156,87 @@ def paste_crop(canvas, crop, alpha, cx, cy):
     return canvas
 
 
-def ease_in_out(t):
-    t = np.clip(t, 0.0, 1.0)
-    return 0.5 - 0.5 * math.cos(math.pi * t)
-
-
-def render_styled_frame(
-    original_img, paper_bg, char_crop, alpha_crop, home_center, global_t, style, bob_amt, sway_amt, cycles
+def render_storytelling_frame(
+    paper_bg, char_crop, alpha_crop, home_center, global_t, style, talk_speed, tilt_intensity, gesture_intensity
 ):
     canvas = paper_bg.copy()
     target_x, target_y = home_center
+    
+    phase = global_t * talk_speed * math.pi * 2
 
-    if style == "Walk-In & Settle":
-        walk_frac = 0.65
-        if global_t < walk_frac:
-            local_t = global_t / walk_frac
-            movement = ease_in_out(local_t)
-            cur_x = -char_crop.shape[1] + (target_x - (-char_crop.shape[1])) * movement
-            phase = local_t * cycles * math.pi * 2
-            bob = math.sin(phase) * bob_amt
-            sway = math.sin(phase + math.pi / 2) * sway_amt
-            warped_c, warped_a = transform_crop(char_crop, alpha_crop, 1.0, sway)
-            return paste_crop(canvas, warped_c, warped_a, cur_x, target_y + bob)
-        else:
-            local_t = (global_t - walk_frac) / (1.0 - walk_frac)
-            fade_alpha = ease_in_out(local_t)
-            canvas = paste_crop(canvas, char_crop, alpha_crop, target_x, target_y)
-            return np.clip(canvas.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha, 0, 255).astype(np.uint8)
+    if style == "Expressive Storyteller (Nod & Sway)":
+        # Slow torso lean combined with rapid conversational head-nods
+        body_angle = math.sin(phase * 0.3) * tilt_intensity
+        head_nod = abs(math.sin(phase * 2.0)) * (gesture_intensity * 0.8)
+        
+        # Subtle speech-based squash & stretch
+        scale_y = 1.0 + math.sin(phase * 3.0) * 0.03
+        scale_x = 1.0 - math.sin(phase * 3.0) * 0.02
+        
+        warped_c, warped_a = transform_crop(char_crop, alpha_crop, scale_x, scale_y, body_angle, pivot_bottom=True)
+        return paste_crop(canvas, warped_c, warped_a, target_x, target_y - head_nod)
 
-    elif style == "Puppet Joint Tilt":
-        # Tilts back and forth from bottom pivot point
-        angle = math.sin(global_t * cycles * math.pi * 2) * (sway_amt * 2.5)
-        bob = abs(math.sin(global_t * cycles * math.pi * 2)) * bob_amt
-        warped_c, warped_a = transform_crop(char_crop, alpha_crop, 1.0, angle, pivot_bottom=True)
-        canvas = paste_crop(canvas, warped_c, warped_a, target_x, target_y - bob)
-        return canvas
+    elif style == "Excited Explainer (Speech Pulses)":
+        # High energy storytelling with speech accent pops
+        accent_pulse = max(0.0, math.sin(phase * 2.5)) ** 3
+        scale_y = 1.0 + accent_pulse * (gesture_intensity * 0.03)
+        scale_x = 1.0 - accent_pulse * (gesture_intensity * 0.015)
+        
+        angle = math.sin(phase * 1.2) * (tilt_intensity * 1.5)
+        bob = accent_pulse * gesture_intensity * 1.5
+        
+        warped_c, warped_a = transform_crop(char_crop, alpha_crop, scale_x, scale_y, angle, pivot_bottom=True)
+        return paste_crop(canvas, warped_c, warped_a, target_x, target_y - bob)
 
-    elif style == "Pop-In Scale (Bounce)":
-        # Character pops up from size 0 to oversized, then settles
-        pop_frac = 0.5
-        if global_t < pop_frac:
-            local_t = global_t / pop_frac
-            scale = math.sin(local_t * math.pi * 0.8) * 1.25
-        else:
-            scale = 1.0
-        angle = math.sin(global_t * math.pi * 2) * sway_amt
-        warped_c, warped_a = transform_crop(char_crop, alpha_crop, scale, angle)
+    elif style == "Thoughtful Ponderer (Lean & Pause)":
+        # Slow deliberate leaning with dramatic pauses
+        raw_tilt = math.sin(phase * 0.5)
+        angle = math.copysign(abs(raw_tilt) ** 0.5, raw_tilt) * tilt_intensity
+        
+        scale_y = 1.0 + math.cos(phase * 0.5) * 0.02
+        scale_x = 1.0
+        
+        warped_c, warped_a = transform_crop(char_crop, alpha_crop, scale_x, scale_y, angle, pivot_bottom=True)
         return paste_crop(canvas, warped_c, warped_a, target_x, target_y)
 
-    elif style == "Float & Glide":
-        # Floating motion with subtle tilt
-        ty = math.sin(global_t * math.pi * 2) * (bob_amt * 2.0)
-        tx = math.cos(global_t * math.pi * 2) * (sway_amt * 1.5)
-        angle = math.sin(global_t * math.pi * 2) * sway_amt
-        warped_c, warped_a = transform_crop(char_crop, alpha_crop, 1.0, angle)
-        return paste_crop(canvas, warped_c, warped_a, target_x + tx, target_y + ty)
+    elif style == "Conversational Bounce (Lively Talk)":
+        # Continuous jaw/body hop mixed with side-to-side speech swaying
+        angle = math.sin(phase * 1.5) * tilt_intensity
+        talk_hop = abs(math.sin(phase * 3.0)) * gesture_intensity
+        
+        # Quick vertical speech stretching
+        scale_y = 1.0 + math.sin(phase * 3.0) * 0.04
+        scale_x = 1.0 - math.sin(phase * 3.0) * 0.02
+        
+        warped_c, warped_a = transform_crop(char_crop, alpha_crop, scale_x, scale_y, angle, pivot_bottom=True)
+        return paste_crop(canvas, warped_c, warped_a, target_x, target_y - talk_hop)
 
     return canvas
 
 
 # ============================================================
-# STREAMLIT UI & BATCH PROCESSOR
+# STREAMLIT UI
 # ============================================================
 
-st.sidebar.header("🎬 Global Animation Controls")
-style = st.sidebar.selectbox("Animation Style", ANIMATION_STYLES)
+st.sidebar.header("🗣️ Storytelling & Dialogue Controls")
+style = st.sidebar.selectbox("Dialogue Style", STORY_STYLES)
 fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
-duration = st.sidebar.slider("Duration (sec)", 3.0, 10.0, 5.0, 0.5)
+duration = st.sidebar.slider("Story Duration (sec)", 3.0, 12.0, 6.0, 0.5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Fine Motion Adjustments")
-bob_amount = st.sidebar.slider("Vertical Motion / Bobbing", 0, 25, 8)
-sway_amount = st.sidebar.slider("Tilt / Sway Angle", 0, 20, 5)
-cycles = st.sidebar.slider("Animation Loops / Steps", 1, 10, 3)
+st.sidebar.header("🎙️ Speech Expressiveness")
+talk_speed = st.sidebar.slider("Speaking Cadence / Speed", 1, 8, 4)
+tilt_intensity = st.sidebar.slider("Body Lean & Tilt Angle", 0, 20, 6)
+gesture_intensity = st.sidebar.slider("Nod / Bounce Height", 0, 25, 10)
 
 uploaded_files = st.file_uploader(
-    "Upload Hand-Drawn Artwork (Multiple Files Supported)", 
+    "Upload Drawings (Multiple Supported)", 
     type=["jpg", "jpeg", "png", "webp"], 
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Adjust bounding box region below:")
+    st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Adjust bounding region below:")
 
     col_box1, col_box2 = st.columns(2)
     with col_box1:
@@ -265,20 +246,19 @@ if uploaded_files:
 
     bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
 
-    if st.button("✨ Animate All Uploaded Images", type="primary", use_container_width=True):
+    if st.button("✨ Animate Storytelling Dialogue", type="primary", use_container_width=True):
         
         for idx, uploaded_file in enumerate(uploaded_files):
-            st.markdown(f"---")
-            st.subheader(f"🖼️ File {idx + 1}: {uploaded_file.name}")
+            st.markdown("---")
+            st.subheader(f"📖 Character {idx + 1}: {uploaded_file.name}")
 
             file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
             raw_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-            # Auto-rotate to vertical if needed
             image = auto_rotate_vertical(raw_image)
             image = resize_image(image)
 
-            with st.spinner("Extracting character..."):
+            with st.spinner("Isolating character..."):
                 char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
                 paper_bg = extract_paper_background(image)
 
@@ -287,37 +267,36 @@ if uploaded_files:
                 continue
 
             frame_count = max(8, int(fps * duration))
-            progress = st.progress(0, text=f"Rendering {style} frames...")
+            progress = st.progress(0, text=f"Rendering {style}...")
             frames = []
 
             for i in range(frame_count):
                 t = i / max(1, frame_count - 1)
-                frame = render_styled_frame(
-                    image, paper_bg, char_crop, alpha_crop, home_center, t, style, bob_amount, sway_amount, cycles
+                frame = render_storytelling_frame(
+                    paper_bg, char_crop, alpha_crop, home_center, t, style, talk_speed, tilt_intensity, gesture_intensity
                 )
                 frames.append(frame)
                 progress.progress((i + 1) / frame_count)
 
             progress.empty()
 
-            # Compile GIF
             buffer = io.BytesIO()
             pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE) for f in frames]
             pil_frames[0].save(buffer, format="GIF", save_all=True, append_images=pil_frames[1:], duration=int(1000 / fps), loop=0)
 
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**Processed Vertical Image**")
+                st.markdown("**Character Cutout**")
                 st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
 
             with c2:
-                st.markdown(f"**{style} Preview**")
+                st.markdown(f"**{style} Dialogue Animation**")
                 st.image(buffer.getvalue(), use_container_width=True)
 
             st.download_button(
-                f"⬇️ Download GIF ({uploaded_file.name})",
+                f"⬇️ Download Story Animation ({uploaded_file.name})",
                 data=buffer.getvalue(),
-                file_name=f"animated_{uploaded_file.name}.gif",
+                file_name=f"story_dialogue_{uploaded_file.name}.gif",
                 mime="image/gif",
                 use_container_width=True,
             )
