@@ -1,6 +1,7 @@
 import io
 import math
 import os
+import zipfile
 
 import cv2
 import numpy as np
@@ -13,30 +14,37 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Multi-Image Character Separator & Animator",
+    page_title="Advanced Hand-Drawn Color & Scene Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Multi-Image Character Separator & Animator")
+st.title("🎨 Advanced Hand-Drawn Color & Scene Animator")
 
 st.markdown(
     """
-Upload one or multiple hand-drawn scenes. The script automatically handles orientation, 
-extracts the main character from each drawing, and generates walk-in animations that cross-fade back into the full artwork.
+Select specific colors within your drawing to **wiggle, bounce, zoom, or glow** while staying 
+naturally integrated with the scene. Export animations as standard videos or **transparent alpha GIFs/PNG sequences** for video editors!
 """
 )
 
 MAX_IMAGE_SIZE = 1000
 
+ANIMATION_MODES = [
+    "Seamless Wiggle & Sway",
+    "Rhythmic Bounce & Stretch",
+    "Glowing Zoom In/Out",
+    "Storytelling Speech Cadence",
+    "Walk-In & Merge with Original Scene",
+]
+
 
 # ============================================================
-# HELPER FUNCTIONS
+# IMAGE PREPROCESSING & COLOR UTILITIES
 # ============================================================
 
 def auto_rotate_vertical(image):
-    """Automatically rotates landscape/horizontal images vertically."""
     h, w = image.shape[:2]
     if w > h:
         image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -51,8 +59,79 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
     return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
+def get_color_name(rgb):
+    r, g, b = [int(x) for x in rgb]
+    pixel = np.uint8([[[b, g, r]]])
+    hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
+    hue, sat = int(hsv[0]), int(hsv[1])
+
+    if sat < 30:
+        return "Neutral/White/Gray"
+    if hue < 10 or hue >= 170:
+        return "Red"
+    elif hue < 25:
+        return "Orange"
+    elif hue < 35:
+        return "Yellow"
+    elif hue < 85:
+        return "Green"
+    elif hue < 130:
+        return "Blue"
+    elif hue < 155:
+        return "Purple"
+    else:
+        return "Pink"
+
+
+def extract_dominant_colors(image, max_colors=6):
+    """Identifies major saturated colors inside the artwork."""
+    small = cv2.resize(image, (150, 150), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    
+    # Filter out paper background/desaturated areas
+    valid_pixels = small[hsv[:, :, 1] > 35].reshape(-1, 3)
+    if len(valid_pixels) < 100:
+        valid_pixels = small.reshape(-1, 3)
+
+    pixels = valid_pixels.astype(np.float32)
+    k = min(max_colors, max(2, len(pixels) // 100))
+    
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+    
+    counts = np.bincount(labels.flatten())
+    total = sum(counts)
+
+    detected = []
+    for idx, center in enumerate(centers):
+        b, g, r = [int(x) for x in center]
+        hex_code = f"#{r:02x}{g:02x}{b:02x}"
+        label = f"{get_color_name((r, g, b))} ({hex_code}) — {counts[idx]/total*100:.1f}%"
+        detected.append({
+            "label": label,
+            "rgb": (r, g, b),
+            "bgr": (b, g, r),
+            "hex": hex_code,
+            "coverage": counts[idx] / total
+        })
+
+    detected.sort(key=lambda x: x["coverage"], reverse=True)
+    return detected
+
+
+def make_color_mask(image, target_bgr, tolerance=45):
+    """Creates a soft-edged mask for the selected color region."""
+    diff = np.abs(image.astype(np.int16) - np.array(target_bgr, dtype=np.int16))
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    
+    mask = (dist < tolerance).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.GaussianBlur(mask, (3, 3), 0)
+    return mask
+
+
 def extract_paper_background(image):
-    """Samples edge pixels to create a clean canvas for movement."""
     h, w = image.shape[:2]
     border_pixels = np.concatenate([
         image[:15, :].reshape(-1, 3),
@@ -64,71 +143,34 @@ def extract_paper_background(image):
     return np.full_like(image, bg_color)
 
 
-def extract_character_interactive(image, bbox_pct):
-    """Extracts character using GrabCut inside percentage bounding box coordinates."""
-    h, w = image.shape[:2]
-    
-    xmin = int((bbox_pct[0] / 100.0) * w)
-    ymin = int((bbox_pct[1] / 100.0) * h)
-    xmax = int((bbox_pct[2] / 100.0) * w)
-    ymax = int((bbox_pct[3] / 100.0) * h)
-    
-    rect_w = max(10, xmax - xmin)
-    rect_h = max(10, ymax - ymin)
-    rect = (xmin, ymin, rect_w, rect_h)
-    
-    gc_mask = np.zeros((h, w), np.uint8)
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
-    
-    try:
-        cv2.grabCut(image, gc_mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
-        char_mask = np.where((gc_mask == 2) | (gc_mask == 0), 0, 255).astype(np.uint8)
-    except Exception:
-        char_mask = np.zeros((h, w), np.uint8)
-        char_mask[ymin:ymax, xmin:xmax] = 255
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    char_mask = cv2.morphologyEx(char_mask, cv2.MORPH_CLOSE, kernel)
-    char_mask = cv2.GaussianBlur(char_mask, (3, 3), 0)
-
-    ys, xs = np.where(char_mask > 20)
-    if len(xs) == 0:
-        return None, None, None
-
-    x1, y1 = max(0, np.min(xs) - 5), max(0, np.min(ys) - 5)
-    x2, y2 = min(w, np.max(xs) + 5), min(h, np.max(ys) + 5)
-
-    char_crop = image[y1:y2, x1:x2].copy()
-    alpha_crop = char_mask[y1:y2, x1:x2].copy()
-
-    center_x = (x1 + x2) / 2.0
-    center_y = (y1 + y2) / 2.0
-
-    return char_crop, alpha_crop, (center_x, center_y)
-
-
 # ============================================================
-# RENDERING ENGINE
+# ANIMATION & GLOW RENDERING ENGINE
 # ============================================================
 
-def transform_crop(crop, alpha, angle):
+def transform_layer(crop, alpha, scale_x, scale_y, angle, pivot):
     h, w = crop.shape[:2]
-    center = (w / 2.0, h / 2.0)
-    
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    new_w = max(2, int(w * max(0.05, float(scale_x))))
+    new_h = max(2, int(h * max(0.05, float(scale_y))))
+
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    resized_alpha = cv2.resize(alpha, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    px = (pivot[0] / float(w)) * new_w
+    py = (pivot[1] / float(h)) * new_h
+
+    M = cv2.getRotationMatrix2D((px, py), angle, 1.0)
     cos, sin = abs(M[0, 0]), abs(M[0, 1])
-    
-    bw, bh = max(2, int(h * sin + w * cos)), max(2, int(h * cos + w * sin))
-    M[0, 2] += bw / 2 - center[0]
-    M[1, 2] += bh / 2 - center[1]
-    
-    warped_c = cv2.warpAffine(crop, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    warped_a = cv2.warpAffine(alpha, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    bw, bh = max(2, int(new_h * sin + new_w * cos)), max(2, int(new_h * cos + new_w * sin))
+
+    M[0, 2] += bw / 2 - px
+    M[1, 2] += bh / 2 - py
+
+    warped_c = cv2.warpAffine(resized, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    warped_a = cv2.warpAffine(resized_alpha, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     return warped_c, warped_a
 
 
-def paste_crop(canvas, crop, alpha, cx, cy):
+def paste_layer(canvas, crop, alpha, cx, cy):
     ch, cw = crop.shape[:2]
     x1, y1 = int(round(cx - cw / 2.0)), int(round(cy - ch / 2.0))
     x2, y2 = x1 + cw, y1 + ch
@@ -151,125 +193,180 @@ def paste_crop(canvas, crop, alpha, cx, cy):
     return canvas
 
 
-def ease_in_out(t):
-    t = np.clip(t, 0.0, 1.0)
-    return 0.5 - 0.5 * math.cos(math.pi * t)
+def apply_glow_effect(image, mask, intensity):
+    """Creates an outer glowing aura around the animated region."""
+    glow_mask = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
+    glow_color = np.array([255, 235, 150], dtype=np.float32)  # Soft golden glow
+    
+    glow_layer = np.ones_like(image, dtype=np.float32) * glow_color
+    alpha = (glow_mask * intensity)[:, :, None]
+    
+    result = image.astype(np.float32) * (1.0 - alpha * 0.5) + glow_layer * (alpha * 0.5)
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
-def render_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, global_t, walk_frac, bob_amt, sway_amt, cycles):
-    canvas = paper_bg.copy()
+def render_color_animation_frame(
+    original_img, mask, mode, global_t, speed, strength, transparent_bg=False
+):
+    h, w = original_img.shape[:2]
+    ys, xs = np.where(mask > 20)
 
-    if global_t < walk_frac:
-        local_t = global_t / max(1e-6, walk_frac)
-        movement = ease_in_out(local_t)
-
-        start_x = -char_crop.shape[1]
-        target_x, target_y = home_center
-
-        cur_x = start_x + (target_x - start_x) * movement
-        cur_y = target_y
-
-        phase = local_t * cycles * math.pi * 2
-        bob = math.sin(phase) * bob_amt
-        sway = math.sin(phase + math.pi / 2) * sway_amt
-
-        warped_c, warped_a = transform_crop(char_crop, alpha_crop, sway)
-        canvas = paste_crop(canvas, warped_c, warped_a, cur_x, cur_y + bob)
-        return canvas
+    if transparent_bg:
+        # Create transparent RGBA canvas
+        canvas = np.zeros((h, w, 4), dtype=np.uint8)
     else:
-        local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
-        fade_alpha = ease_in_out(local_t)
+        canvas = original_img.copy()
 
-        canvas = paste_crop(canvas, char_crop, alpha_crop, home_center[0], home_center[1])
-        blended = canvas.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha
-        return np.clip(blended, 0, 255).astype(np.uint8)
+    if len(xs) == 0:
+        return canvas
+
+    x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+    crop = original_img[y1:y2, x1:x2].copy()
+    alpha = mask[y1:y2, x1:x2].copy()
+    
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    pivot = (cx - x1, cy - y1)
+    
+    phase = global_t * speed * math.pi * 2
+
+    if mode == "Seamless Wiggle & Sway":
+        angle = math.sin(phase) * strength
+        scale_x, scale_y = 1.0, 1.0
+        warped_c, warped_a = transform_layer(crop, alpha, scale_x, scale_y, angle, pivot)
+        
+    elif mode == "Rhythmic Bounce & Stretch":
+        bounce = abs(math.sin(phase)) * strength * 0.5
+        scale_y = 1.0 + math.sin(phase) * (strength * 0.02)
+        scale_x = 1.0 - math.sin(phase) * (strength * 0.01)
+        angle = math.sin(phase * 0.5) * (strength * 0.3)
+        warped_c, warped_a = transform_layer(crop, alpha, scale_x, scale_y, angle, pivot)
+        cy -= bounce
+
+    elif mode == "Glowing Zoom In/Out":
+        zoom = 1.0 + math.sin(phase) * (strength * 0.02)
+        glow_val = (math.sin(phase) + 1.0) / 2.0 * (strength * 0.04)
+        
+        if not transparent_bg:
+            canvas = apply_glow_effect(canvas, mask, glow_val)
+            
+        warped_c, warped_a = transform_layer(crop, alpha, zoom, zoom, 0.0, pivot)
+
+    elif mode == "Storytelling Speech Cadence":
+        angle = math.sin(phase * 0.5) * strength
+        nod = abs(math.sin(phase * 2.0)) * strength * 0.8
+        scale_y = 1.0 + math.sin(phase * 3.0) * 0.03
+        scale_x = 1.0 - math.sin(phase * 3.0) * 0.02
+        warped_c, warped_a = transform_layer(crop, alpha, scale_x, scale_y, angle, pivot)
+        cy -= nod
+
+    if transparent_bg:
+        # Composite directly onto transparent RGBA canvas
+        rgba_crop = cv2.cvtColor(warped_c, cv2.COLOR_BGR2BGRA)
+        rgba_crop[:, :, 3] = warped_a
+        return paste_layer(canvas, rgba_crop[:, :, :3], warped_a, cx, cy)
+    else:
+        return paste_layer(canvas, warped_c, warped_a, cx, cy)
+
+
+# ============================================================
+# EXPORT HELPERS (TRANSPARENT GIF & PNG ZIP)
+# ============================================================
+
+def build_transparent_gif(frames, fps):
+    buffer = io.BytesIO()
+    prepared = []
+    duration = int(1000 / fps)
+
+    for frame in frames:
+        if frame.shape[2] == 4:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+            pil = Image.fromarray(rgb)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb)
+        prepared.append(pil)
+
+    prepared[0].save(
+        buffer, format="GIF", save_all=True, append_images=prepared[1:], duration=duration, loop=0, disposal=2
+    )
+    return buffer.getvalue()
 
 
 # ============================================================
 # STREAMLIT UI
 # ============================================================
 
-st.sidebar.header("🎬 Motion Settings")
+st.sidebar.header("🎬 Motion & Glow Settings")
+animation_mode = st.sidebar.selectbox("Animation Style", ANIMATION_MODES)
 fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
-duration = st.sidebar.slider("Duration (sec)", 3.0, 10.0, 6.0, 0.5)
+duration = st.sidebar.slider("Duration (sec)", 2.0, 10.0, 5.0, 0.5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("🚶 Gait Settings")
-walk_percent = st.sidebar.slider("Walk-In Duration (%)", 40, 80, 65)
-bob_amount = st.sidebar.slider("Vertical Bobbing", 0, 20, 5)
-sway_amount = st.sidebar.slider("Body Sway Angle", 0, 10, 3)
-cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
+st.sidebar.header("⚙️ Motion Adjustments")
+speed = st.sidebar.slider("Animation Speed", 1, 8, 4)
+strength = st.sidebar.slider("Motion / Zoom / Glow Intensity", 1, 20, 8)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎞️ Export Options")
+transparent_bg = st.sidebar.checkbox("Export with Transparent Background (for Video Editing)", value=False)
 
 uploaded_files = st.file_uploader(
-    "Upload Drawings (Select Multiple Files)", 
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True
+    "Upload Drawings (Multiple Supported)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
 )
 
 if uploaded_files:
-    st.info(f"📁 {len(uploaded_files)} file(s) loaded. Set the character bounding box area for batch extraction:")
+    for idx, file in enumerate(uploaded_files):
+        st.markdown("---")
+        st.subheader(f"🖼️ Drawing {idx + 1}: {file.name}")
 
-    col_box1, col_box2 = st.columns(2)
-    with col_box1:
-        x_range = st.slider("Horizontal Range (X %)", 0, 100, (15, 85))
-    with col_box2:
-        y_range = st.slider("Vertical Range (Y %)", 0, 100, (10, 90))
+        file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+        raw_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-    bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
+        image = auto_rotate_vertical(raw_image)
+        image = resize_image(image)
 
-    if st.button("✨ Process & Animate All Drawings", type="primary", use_container_width=True):
-        
-        for idx, uploaded_file in enumerate(uploaded_files):
-            st.markdown("---")
-            st.subheader(f"🖼️ Drawing {idx + 1}: {uploaded_file.name}")
+        # Detect dominant colors
+        detected_colors = extract_dominant_colors(image)
+        color_labels = [c["label"] for c in detected_colors]
 
-            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            raw_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Image", use_container_width=True)
 
-            # Auto-rotate horizontal images to vertical
-            image = auto_rotate_vertical(raw_image)
-            image = resize_image(image)
+        with col2:
+            st.markdown("**🎨 Select Color Region to Animate**")
+            selected_label = st.selectbox("Identified Colors", color_labels, key=f"color_{idx}")
+            selected_color = next(c for c in detected_colors if c["label"] == selected_label)
+            tolerance = st.slider("Color Selection Area (Tolerance)", 10, 80, 45, key=f"tol_{idx}")
 
-            with st.spinner(f"Extracting character from {uploaded_file.name}..."):
-                char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
-                paper_bg = extract_paper_background(image)
+            mask = make_color_mask(image, selected_color["bgr"], tolerance)
+            mask_preview = cv2.bitwise_and(image, image, mask=mask)
+            st.image(cv2.cvtColor(mask_preview, cv2.COLOR_BGR2RGB), caption="Isolated Animated Part", use_container_width=True)
 
-            if char_crop is None:
-                st.error(f"Could not extract character from {uploaded_file.name}.")
-                continue
-
+        if st.button(f"✨ Animate {file.name}", key=f"btn_{idx}", type="primary", use_container_width=True):
             frame_count = max(8, int(fps * duration))
-            walk_frac = walk_percent / 100.0
-
-            progress = st.progress(0, text=f"Rendering animation for {uploaded_file.name}...")
+            progress = st.progress(0, text="Rendering animation frames...")
             frames = []
 
             for i in range(frame_count):
                 t = i / max(1, frame_count - 1)
-                frame = render_frame(image, paper_bg, char_crop, alpha_crop, home_center, t, walk_frac, bob_amount, sway_amount, cycles)
+                frame = render_color_animation_frame(
+                    image, mask, animation_mode, t, speed, strength, transparent_bg
+                )
                 frames.append(frame)
                 progress.progress((i + 1) / frame_count)
 
             progress.empty()
 
-            # Compile GIF
-            buffer = io.BytesIO()
-            pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE) for f in frames]
-            pil_frames[0].save(buffer, format="GIF", save_all=True, append_images=pil_frames[1:], duration=int(1000 / fps), loop=0)
+            gif_data = build_transparent_gif(frames, fps)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Processed Drawing**")
-                st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-            with c2:
-                st.markdown("**Animation Preview**")
-                st.image(buffer.getvalue(), use_container_width=True)
+            st.subheader("🎬 Final Animated Preview")
+            st.image(gif_data, use_container_width=True)
 
             st.download_button(
-                f"⬇️ Download GIF ({uploaded_file.name})",
-                data=buffer.getvalue(),
-                file_name=f"animated_{uploaded_file.name}.gif",
+                f"⬇️ Download Animated GIF ({file.name})",
+                data=gif_data,
+                file_name=f"animated_{selected_color['hex']}_{file.name}.gif",
                 mime="image/gif",
                 use_container_width=True,
             )
