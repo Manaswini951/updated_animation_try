@@ -1,3 +1,4 @@
+
 import io
 import math
 import os
@@ -14,26 +15,29 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Hand-Drawn Character Animator — Natural Walk",
+    page_title="Hand-Drawn Character Animator — Clean Extraction",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Character Animator — Natural Walk & Scene Merge")
+st.title("🎨 Hand-Drawn Character Animator — Clean Character Extraction")
 
 st.markdown(
     """
-This version uses a **background plate + isolated character** workflow.
+### New extraction system
+This version is designed for **photographed hand-drawn artwork on paper**.
 
-**Animation sequence**
-1. The character starts outside the frame.
-2. It walks slowly toward its original position.
-3. It settles naturally instead of immediately switching.
-4. The original artwork is gradually restored while the moving character fades out.
-5. The background therefore appears to **return naturally**, instead of the whole canvas glowing/wiggling.
+Instead of treating every darker/pinker paper pixel as foreground, it uses:
 
-The important change is that the app no longer uses a solid paper-color canvas as the main scene.
+- the **dark hand-drawn outline** as the main character boundary,
+- closed-contour filling to recover the character's interior,
+- local colour/ink information **only inside the character silhouette**,
+- component filtering to reject hearts, stars and other decorations,
+- a real background plate made from the original scene,
+- slow **walk → settle → merge back into the original artwork** animation.
+
+The extraction preview is the most important part: **red should cover the llama, not the surrounding paper.**
 """
 )
 
@@ -48,7 +52,7 @@ MOTION_MODES = [
 
 
 # ============================================================
-# BASIC IMAGE UTILITIES
+# IMAGE UTILITIES
 # ============================================================
 
 def auto_rotate_vertical(image):
@@ -60,49 +64,68 @@ def auto_rotate_vertical(image):
 
 def resize_image(image, max_size=MAX_IMAGE_SIZE):
     h, w = image.shape[:2]
+
     if max(h, w) <= max_size:
         return image.copy()
 
     scale = max_size / float(max(h, w))
+
     return cv2.resize(
         image,
-        (max(2, int(w * scale)), max(2, int(h * scale))),
+        (
+            max(2, int(w * scale)),
+            max(2, int(h * scale)),
+        ),
         interpolation=cv2.INTER_AREA,
     )
 
 
 def enhance_color_temperature_and_warmth(
-    image, temp_shift=8, saturation_boost=1.05
+    image,
+    temp_shift=6,
+    saturation_boost=1.03,
 ):
-    """Very mild polish. Avoids changing the drawing too aggressively."""
     img = image.astype(np.float32)
+
     b, g, r = cv2.split(img)
 
-    r *= 1.0 + temp_shift / 200.0
-    b *= 1.0 - temp_shift / 300.0
+    r *= 1.0 + temp_shift / 220.0
+    b *= 1.0 - temp_shift / 330.0
 
     warmed = cv2.merge([b, g, r])
     warmed = np.clip(warmed, 0, 255).astype(np.uint8)
 
     hsv = cv2.cvtColor(warmed, cv2.COLOR_BGR2HSV).astype(np.float32)
+
     h, s, v = cv2.split(hsv)
     s = np.clip(s * saturation_boost, 0, 255)
 
     polished = cv2.merge([h, s, v]).astype(np.uint8)
+
     return cv2.cvtColor(polished, cv2.COLOR_HSV2BGR)
 
 
 # ============================================================
-# PAPER / BACKGROUND ESTIMATION
+# PAPER ESTIMATION
 # ============================================================
 
 def estimate_paper_color(image):
     """
-    Estimate paper color from border pixels.
-    Median is robust against a few marks touching the border.
+    Estimate the paper colour from the outer border.
+
+    The result is used only as a weak reference. It is NOT used
+    to globally classify the whole photograph as foreground.
     """
+
     h, w = image.shape[:2]
-    band = max(8, min(30, int(min(h, w) * 0.025)))
+
+    band = max(
+        5,
+        min(
+            25,
+            int(min(h, w) * 0.025),
+        ),
+    )
 
     border = np.concatenate(
         [
@@ -117,381 +140,1075 @@ def estimate_paper_color(image):
     return np.median(border, axis=0).astype(np.float32)
 
 
-def estimate_background_similarity(image):
-    """
-    Pixel-level similarity to the estimated paper color.
-
-    Lower values = more different from paper.
-    """
+def paper_distance(image):
     bg = estimate_paper_color(image)
 
     diff = image.astype(np.float32) - bg.reshape(1, 1, 3)
-    dist = np.sqrt(np.sum(diff * diff, axis=2))
 
-    # Robust normalization.
-    p95 = np.percentile(dist, 95)
-    p95 = max(p95, 1.0)
-
-    similarity = np.clip(1.0 - dist / p95, 0.0, 1.0)
-    return similarity, bg
+    return np.sqrt(
+        np.sum(diff * diff, axis=2)
+    )
 
 
 # ============================================================
-# CHARACTER MASK EXTRACTION
+# MASK HELPERS
 # ============================================================
 
-def keep_components_near_bbox(mask, bbox, min_area_ratio=0.00003):
-    """
-    Keep disconnected pieces inside/near the user-selected character box.
+def bbox_from_percentages(image, bbox_pct):
+    h, w = image.shape[:2]
 
-    This is deliberately NOT 'largest contour only'. A hand-drawn
-    character can have disconnected legs, arms, eyes, hair, etc.
-    """
-    h, w = mask.shape[:2]
+    x1 = int(
+        np.clip(
+            bbox_pct[0],
+            0,
+            100,
+        )
+        * w
+        / 100.0
+    )
 
-    x1, y1, x2, y2 = bbox
-    box_w = max(1, x2 - x1)
-    box_h = max(1, y2 - y1)
+    y1 = int(
+        np.clip(
+            bbox_pct[1],
+            0,
+            100,
+        )
+        * h
+        / 100.0
+    )
 
-    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
+    x2 = int(
+        np.clip(
+            bbox_pct[2],
+            0,
+            100,
+        )
+        * w
+        / 100.0
+    )
+
+    y2 = int(
+        np.clip(
+            bbox_pct[3],
+            0,
+            100,
+        )
+        * h
+        / 100.0
+    )
+
+    x1, x2 = sorted([x1, x2])
+    y1, y2 = sorted([y1, y2])
+
+    x2 = max(x2, x1 + 5)
+    y2 = max(y2, y1 + 5)
+
+    x2 = min(x2, w)
+    y2 = min(y2, h)
+
+    return x1, y1, x2, y2
+
+
+def largest_component(mask):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=8,
+    )
+
+    if n <= 1:
+        return np.zeros_like(mask)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+
+    index = 1 + int(np.argmax(areas))
+
+    return np.where(
+        labels == index,
+        255,
+        0,
+    ).astype(np.uint8)
+
+
+def remove_small_components(
+    mask,
+    minimum_area,
+):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=8,
     )
 
     cleaned = np.zeros_like(mask)
-    min_area = max(4, int(h * w * min_area_ratio))
 
-    # Slightly expanded bbox allows disconnected feet/hair/arms.
-    pad_x = int(box_w * 0.12)
-    pad_y = int(box_h * 0.12)
-
-    ex1 = max(0, x1 - pad_x)
-    ey1 = max(0, y1 - pad_y)
-    ex2 = min(w, x2 + pad_x)
-    ey2 = min(h, y2 + pad_y)
-
-    for label in range(1, n_labels):
+    for label in range(1, n):
         area = stats[label, cv2.CC_STAT_AREA]
-        if area < min_area:
-            continue
 
-        cx, cy = centroids[label]
-
-        if ex1 <= cx <= ex2 and ey1 <= cy <= ey2:
+        if area >= minimum_area:
             cleaned[labels == label] = 255
 
     return cleaned
 
 
+# ============================================================
+# OUTLINE DETECTION
+# ============================================================
+
+def detect_dark_outline(
+    crop,
+    sensitivity=55,
+):
+    """
+    Detect the hand-drawn dark outline.
+
+    This deliberately favours dark/local-contrast strokes instead
+    of global colour difference. This is the key change from the
+    previous algorithm.
+    """
+
+    gray = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    h, w = gray.shape
+
+    # --------------------------------------------------------
+    # Local darkness
+    # --------------------------------------------------------
+
+    blur_size = int(
+        np.clip(
+            min(h, w) * 0.07,
+            15,
+            71,
+        )
+    )
+
+    if blur_size % 2 == 0:
+        blur_size += 1
+
+    local_bg = cv2.GaussianBlur(
+        gray,
+        (blur_size, blur_size),
+        0,
+    )
+
+    darkness = cv2.subtract(
+        local_bg,
+        gray,
+    )
+
+    # Higher sensitivity = slightly easier detection.
+    darkness_percentile = np.interp(
+        sensitivity,
+        [0, 100],
+        [97, 82],
+    )
+
+    threshold_dark = np.percentile(
+        darkness,
+        darkness_percentile,
+    )
+
+    local_mask = np.where(
+        darkness >= threshold_dark,
+        255,
+        0,
+    ).astype(np.uint8)
+
+    # --------------------------------------------------------
+    # Absolute dark ink
+    # --------------------------------------------------------
+
+    hsv = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2HSV,
+    )
+
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    absolute_value_threshold = int(
+        np.interp(
+            sensitivity,
+            [0, 100],
+            [105, 170],
+        )
+    )
+
+    absolute_dark = (
+        (value <= absolute_value_threshold)
+        &
+        (
+            (saturation >= 10)
+            |
+            (value <= 125)
+        )
+    )
+
+    absolute_dark = (
+        absolute_dark.astype(np.uint8)
+        * 255
+    )
+
+    ink = cv2.bitwise_or(
+        local_mask,
+        absolute_dark,
+    )
+
+    # --------------------------------------------------------
+    # Remove tiny paper texture
+    # --------------------------------------------------------
+
+    open_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (3, 3),
+    )
+
+    ink = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        open_kernel,
+        iterations=1,
+    )
+
+    # --------------------------------------------------------
+    # Close small breaks in hand-drawn outline
+    # --------------------------------------------------------
+
+    close_size = int(
+        np.interp(
+            sensitivity,
+            [0, 100],
+            [5, 11],
+        )
+    )
+
+    if close_size % 2 == 0:
+        close_size += 1
+
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (
+            close_size,
+            close_size,
+        ),
+    )
+
+    ink = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_CLOSE,
+        close_kernel,
+        iterations=1,
+    )
+
+    return ink
+
+
+# ============================================================
+# CLOSED OUTLINE -> CHARACTER SILHOUETTE
+# ============================================================
+
+def contour_fill_from_outline(
+    outline,
+    sensitivity=55,
+):
+    """
+    Convert dark outline into a filled character silhouette.
+
+    Decorations such as hearts are usually separate contours.
+    The character contour is selected using a score based on:
+
+      - contour area,
+      - position inside the bbox,
+      - shape size,
+      - proximity to the crop centre.
+
+    This is much safer than globally thresholding paper colour.
+    """
+
+    h, w = outline.shape[:2]
+
+    contours, hierarchy = cv2.findContours(
+        outline,
+        cv2.RETR_CCOMP,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if not contours:
+        return np.zeros_like(outline)
+
+    crop_area = float(h * w)
+    cx0 = w / 2.0
+    cy0 = h / 2.0
+
+    candidates = []
+
+    for i, contour in enumerate(contours):
+
+        area = cv2.contourArea(contour)
+
+        if area < crop_area * 0.003:
+            continue
+
+        x, y, cw, ch = cv2.boundingRect(
+            contour
+        )
+
+        bbox_area = float(
+            max(1, cw * ch)
+        )
+
+        fill_ratio = area / bbox_area
+
+        center_x = x + cw / 2.0
+        center_y = y + ch / 2.0
+
+        distance = math.sqrt(
+            (
+                (center_x - cx0)
+                / max(1, w)
+            )
+            ** 2
+            +
+            (
+                (center_y - cy0)
+                / max(1, h)
+            )
+            ** 2
+        )
+
+        centre_score = max(
+            0.0,
+            1.0 - distance * 2.5,
+        )
+
+        size_score = min(
+            1.0,
+            area / (crop_area * 0.30),
+        )
+
+        # Large, central contours win.
+        score = (
+            area
+            * (
+                0.55
+                + 0.30 * centre_score
+                + 0.15 * size_score
+            )
+        )
+
+        candidates.append(
+            (
+                score,
+                i,
+                area,
+                fill_ratio,
+            )
+        )
+
+    if not candidates:
+        return np.zeros_like(outline)
+
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    # --------------------------------------------------------
+    # Select the best contour.
+    # --------------------------------------------------------
+
+    best_index = candidates[0][1]
+
+    silhouette = np.zeros_like(
+        outline
+    )
+
+    cv2.drawContours(
+        silhouette,
+        contours,
+        best_index,
+        255,
+        thickness=cv2.FILLED,
+    )
+
+    # --------------------------------------------------------
+    # Preserve holes if they are real contour children.
+    # --------------------------------------------------------
+
+    if hierarchy is not None:
+        children = []
+
+        for i, c in enumerate(
+            hierarchy[0]
+        ):
+            parent = c[3]
+
+            if parent == best_index:
+                children.append(i)
+
+        for child_index in children:
+            child_area = cv2.contourArea(
+                contours[child_index]
+            )
+
+            # Only remove reasonably large enclosed holes.
+            if child_area > crop_area * 0.0004:
+                cv2.drawContours(
+                    silhouette,
+                    contours,
+                    child_index,
+                    0,
+                    thickness=cv2.FILLED,
+                )
+
+    # --------------------------------------------------------
+    # If the outline is fragmented, gently connect nearby
+    # character pieces. Do not aggressively flood the bbox.
+    # --------------------------------------------------------
+
+    bridge_size = int(
+        np.interp(
+            sensitivity,
+            [0, 100],
+            [3, 7],
+        )
+    )
+
+    if bridge_size % 2 == 0:
+        bridge_size += 1
+
+    bridge_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (
+            bridge_size,
+            bridge_size,
+        ),
+    )
+
+    # Only a very small closing here.
+    silhouette = cv2.morphologyEx(
+        silhouette,
+        cv2.MORPH_CLOSE,
+        bridge_kernel,
+        iterations=1,
+    )
+
+    return silhouette
+
+
+# ============================================================
+# CHARACTER EXTRACTION
+# ============================================================
+
 def extract_character_mask(
     image,
     bbox_pct,
-    threshold_strength=30,
-    preserve_details=True,
+    outline_sensitivity=55,
+    detail_strength=45,
 ):
     """
-    Robust extraction for hand-drawn artwork.
+    Main extraction algorithm.
 
-    Combines:
-      - GrabCut
-      - local darkness / color distance from paper
-      - edge/ink information
-      - component filtering
+    IMPORTANT:
+    The old algorithm used paper-distance pixels as foreground
+    across the entire bbox. That is exactly what caused the large
+    red paper patches in the user's screenshot.
 
-    Crucially, it does NOT collapse the character to one contour.
+    This version does the opposite:
+
+        1. find the dark character outline,
+        2. build a silhouette from it,
+        3. use colour only INSIDE that silhouette,
+        4. attach nearby disconnected character details,
+        5. reject surrounding decorations.
     """
 
-    h, w = image.shape[:2]
-
-    x1 = int(np.clip(bbox_pct[0], 0, 100) / 100.0 * w)
-    y1 = int(np.clip(bbox_pct[1], 0, 100) / 100.0 * h)
-    x2 = int(np.clip(bbox_pct[2], 0, 100) / 100.0 * w)
-    y2 = int(np.clip(bbox_pct[3], 0, 100) / 100.0 * h)
-
-    if x2 <= x1:
-        x2 = min(w, x1 + 10)
-    if y2 <= y1:
-        y2 = min(h, y1 + 10)
-
-    bbox = (x1, y1, x2, y2)
-
-    # --------------------------------------------------------
-    # 1. GrabCut
-    # --------------------------------------------------------
-    gc_mask = np.full((h, w), cv2.GC_BGD, np.uint8)
-
-    # Outside bbox = definite background.
-    gc_mask[y1:y2, x1:x2] = cv2.GC_PR_BGD
-
-    # Inner area = probable foreground.
-    margin_x = max(2, int((x2 - x1) * 0.08))
-    margin_y = max(2, int((y2 - y1) * 0.08))
-
-    ix1 = min(x2 - 1, x1 + margin_x)
-    iy1 = min(y2 - 1, y1 + margin_y)
-    ix2 = max(ix1 + 1, x2 - margin_x)
-    iy2 = max(iy1 + 1, y2 - margin_y)
-
-    gc_mask[iy1:iy2, ix1:ix2] = cv2.GC_PR_FGD
-
-    bg_model = np.zeros((1, 65), np.float64)
-    fg_model = np.zeros((1, 65), np.float64)
-
-    try:
-        cv2.grabCut(
-            image,
-            gc_mask,
-            None,
-            bg_model,
-            fg_model,
-            6,
-            cv2.GC_INIT_WITH_MASK,
-        )
-
-        grab = np.where(
-            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
-            255,
-            0,
-        ).astype(np.uint8)
-    except Exception:
-        grab = np.zeros((h, w), np.uint8)
-
-    # --------------------------------------------------------
-    # 2. Paper-distance / ink mask
-    # --------------------------------------------------------
-    similarity, paper_color = estimate_background_similarity(image)
-
-    # Difference from paper. Stronger threshold means fewer pixels.
-    difference = (1.0 - similarity) * 255.0
-
-    # Adaptive threshold based on the selected strength.
-    percentile = np.clip(92.0 - threshold_strength * 0.45, 72.0, 92.0)
-    diff_threshold = np.percentile(
-        difference[y1:y2, x1:x2],
-        percentile,
+    x1, y1, x2, y2 = bbox_from_percentages(
+        image,
+        bbox_pct,
     )
 
-    paper_mask = np.zeros((h, w), np.uint8)
-    paper_mask[
-        (difference >= diff_threshold)
-    ] = 255
+    crop = image[
+        y1:y2,
+        x1:x2,
+    ].copy()
 
-    # Restrict paper-derived mask to the selected region.
-    region = np.zeros((h, w), np.uint8)
-    region[y1:y2, x1:x2] = 255
-    paper_mask = cv2.bitwise_and(paper_mask, region)
+    ch, cw = crop.shape[:2]
+
+    if ch < 10 or cw < 10:
+        return (
+            np.zeros(
+                image.shape[:2],
+                dtype=np.uint8,
+            ),
+            (x1, y1, x2, y2),
+        )
 
     # --------------------------------------------------------
-    # 3. Ink / line structure mask
+    # STEP 1: Dark outline
     # --------------------------------------------------------
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    crop_gray = gray[y1:y2, x1:x2]
 
-    # Local background normalization helps with uneven paper lighting.
-    blur_size = max(15, int(min(crop_gray.shape[:2]) * 0.08))
-    if blur_size % 2 == 0:
-        blur_size += 1
-    blur_size = min(101, blur_size)
+    outline = detect_dark_outline(
+        crop,
+        sensitivity=outline_sensitivity,
+    )
 
-    local_bg = cv2.GaussianBlur(crop_gray, (blur_size, blur_size), 0)
+    # --------------------------------------------------------
+    # STEP 2: Main filled silhouette
+    # --------------------------------------------------------
 
-    local_darkness = cv2.subtract(local_bg, crop_gray)
+    silhouette = contour_fill_from_outline(
+        outline,
+        sensitivity=outline_sensitivity,
+    )
+
+    # --------------------------------------------------------
+    # STEP 3: If contour detection fails, use GrabCut,
+    # but with strict seeds rather than treating the whole bbox
+    # as probable foreground.
+    # --------------------------------------------------------
+
+    silhouette_area = np.count_nonzero(
+        silhouette
+    )
+
+    bbox_area = max(
+        1,
+        cw * ch,
+    )
+
+    if (
+        silhouette_area < bbox_area * 0.01
+        or silhouette_area > bbox_area * 0.88
+    ):
+        silhouette = fallback_grabcut_mask(
+            crop,
+            outline,
+        )
+
+    # --------------------------------------------------------
+    # STEP 4: Recover coloured interior pixels.
+    #
+    # This is now restricted to the silhouette.
+    # Therefore pink body pixels can be recovered without
+    # selecting the grey paper elsewhere.
+    # --------------------------------------------------------
+
+    hsv = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2HSV,
+    )
+
+    saturation = hsv[:, :, 1].astype(
+        np.float32
+    )
+
+    value = hsv[:, :, 2].astype(
+        np.float32
+    )
+
+    # Colourful pixels inside the silhouette.
+    colour_pixels = (
+        (saturation > np.interp(
+            detail_strength,
+            [0, 100],
+            [22, 10],
+        ))
+        &
+        (value < 252)
+    ).astype(np.uint8) * 255
+
+    # Dark pixels inside silhouette.
+    gray = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    local_bg = cv2.GaussianBlur(
+        gray,
+        (21, 21),
+        0,
+    )
+
+    local_darkness = cv2.subtract(
+        local_bg,
+        gray,
+    )
 
     dark_threshold = np.percentile(
         local_darkness,
-        np.clip(93 - threshold_strength * 0.35, 70, 93),
+        np.interp(
+            detail_strength,
+            [0, 100],
+            [97, 75],
+        ),
     )
 
-    ink_crop = np.where(local_darkness >= dark_threshold, 255, 0).astype(
-        np.uint8
-    )
+    local_dark = np.where(
+        local_darkness >= dark_threshold,
+        255,
+        0,
+    ).astype(np.uint8)
 
-    # Also preserve genuinely dark colored strokes.
-    hsv_crop = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
-    saturation = hsv_crop[:, :, 1]
-    value = hsv_crop[:, :, 2]
-
-    color_ink = (
-        (saturation > max(35, 65 - threshold_strength))
-        & (value < 245)
-    ).astype(np.uint8) * 255
-
-    ink_crop = cv2.bitwise_or(ink_crop, color_ink)
-
-    ink_mask = np.zeros((h, w), np.uint8)
-    ink_mask[y1:y2, x1:x2] = ink_crop
-
-    # --------------------------------------------------------
-    # 4. Combine
-    # --------------------------------------------------------
-    if preserve_details:
-        combined = cv2.bitwise_or(grab, paper_mask)
-        combined = cv2.bitwise_or(combined, ink_mask)
-    else:
-        combined = cv2.bitwise_or(grab, paper_mask)
-
-    # Never allow anything outside bbox.
-    combined = cv2.bitwise_and(combined, region)
-
-    # Close tiny gaps but do not fill huge holes.
-    k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    k_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-
-    combined = cv2.morphologyEx(
-        combined, cv2.MORPH_CLOSE, k_small, iterations=1
-    )
-    combined = cv2.morphologyEx(
-        combined, cv2.MORPH_OPEN, k_small, iterations=1
+    interior_details = cv2.bitwise_or(
+        colour_pixels,
+        local_dark,
     )
 
     # --------------------------------------------------------
-    # 5. Keep relevant disconnected components
+    # STEP 5: Add details ONLY when they are close to the
+    # silhouette. This prevents hearts / stars from being
+    # accidentally selected.
     # --------------------------------------------------------
-    combined = keep_components_near_bbox(combined, bbox)
 
-    # If component filtering was too aggressive, fall back to bbox mask.
-    area = np.count_nonzero(combined)
-    bbox_area = max(1, (x2 - x1) * (y2 - y1))
+    proximity_size = int(
+        np.clip(
+            min(ch, cw) * 0.055,
+            9,
+            31,
+        )
+    )
 
-    if area < bbox_area * 0.002:
-        combined = cv2.bitwise_or(grab, ink_mask)
-        combined = cv2.bitwise_and(combined, region)
+    if proximity_size % 2 == 0:
+        proximity_size += 1
 
-    # Small feather only. This prevents harsh cutout edges.
-    combined = cv2.GaussianBlur(combined, (3, 3), 0)
+    proximity_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (
+            proximity_size,
+            proximity_size,
+        ),
+    )
 
-    return combined, bbox, paper_color
+    silhouette_neighbourhood = cv2.dilate(
+        silhouette,
+        proximity_kernel,
+        iterations=1,
+    )
+
+    nearby_details = cv2.bitwise_and(
+        interior_details,
+        silhouette_neighbourhood,
+    )
+
+    # The silhouette itself remains dominant.
+    combined = cv2.bitwise_or(
+        silhouette,
+        nearby_details,
+    )
+
+    # --------------------------------------------------------
+    # STEP 6: Remove tiny isolated pieces.
+    # --------------------------------------------------------
+
+    min_component = max(
+        8,
+        int(bbox_area * 0.000035),
+    )
+
+    combined = remove_small_components(
+        combined,
+        min_component,
+    )
+
+    # --------------------------------------------------------
+    # STEP 7: Never allow pixels outside the user bbox.
+    # --------------------------------------------------------
+
+    combined = np.where(
+        combined > 0,
+        255,
+        0,
+    ).astype(np.uint8)
+
+    full_mask = np.zeros(
+        image.shape[:2],
+        dtype=np.uint8,
+    )
+
+    full_mask[
+        y1:y2,
+        x1:x2,
+    ] = combined
+
+    # --------------------------------------------------------
+    # STEP 8: Very small feather.
+    # --------------------------------------------------------
+
+    full_mask = cv2.GaussianBlur(
+        full_mask,
+        (3, 3),
+        0,
+    )
+
+    return (
+        full_mask,
+        (x1, y1, x2, y2),
+    )
+
+
+# ============================================================
+# GRABCUT FALLBACK
+# ============================================================
+
+def fallback_grabcut(
+    crop,
+    outline,
+):
+    h, w = crop.shape[:2]
+
+    mask = np.full(
+        (h, w),
+        cv2.GC_PR_BGD,
+        dtype=np.uint8,
+    )
+
+    # Border is definite background.
+    border = max(
+        2,
+        int(min(h, w) * 0.025),
+    )
+
+    mask[
+        :border,
+        :,
+    ] = cv2.GC_BGD
+
+    mask[
+        -border:,
+        :,
+    ] = cv2.GC_BGD
+
+    mask[
+        :,
+        :border,
+    ] = cv2.GC_BGD
+
+    mask[
+        :,
+        -border:,
+    ] = cv2.GC_BGD
+
+    # Dark outline is probable foreground.
+    mask[
+        outline > 0
+    ] = cv2.GC_PR_FGD
+
+    # A very small dilation gives GrabCut a useful region
+    # without making the entire bbox foreground.
+    seed = cv2.dilate(
+        outline,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (9, 9),
+        ),
+        iterations=1,
+    )
+
+    mask[
+        seed > 0
+    ] = cv2.GC_PR_FGD
+
+    bg_model = np.zeros(
+        (1, 65),
+        np.float64,
+    )
+
+    fg_model = np.zeros(
+        (1, 65),
+        np.float64,
+    )
+
+    try:
+        cv2.grabCut(
+            crop,
+            mask,
+            None,
+            bg_model,
+            fg_model,
+            5,
+            cv2.GC_INIT_WITH_MASK,
+        )
+
+        result = np.where(
+            (
+                (mask == cv2.GC_FGD)
+                |
+                (mask == cv2.GC_PR_FGD)
+            ),
+            255,
+            0,
+        ).astype(np.uint8)
+
+        # Keep only the largest component.
+        result = largest_component(
+            result
+        )
+
+        return result
+
+    except Exception:
+        return np.zeros_like(
+            outline
+        )
 
 
 # ============================================================
 # BACKGROUND PLATE
 # ============================================================
 
-def create_background_plate(image, character_mask):
+def create_background_plate(
+    image,
+    character_mask,
+):
     """
-    Remove the extracted character from the original image using
-    inpainting. This gives the walk-in animation a real background
-    rather than a flat paper-color background.
+    Remove ONLY the extracted character.
+
+    The surrounding decorations remain untouched.
+
+    This is important for the user's scene:
+    the hearts / coloured shapes should still exist in the
+    restored background.
     """
 
-    h, w = character_mask.shape[:2]
+    hard_mask = np.where(
+        character_mask > 30,
+        255,
+        0,
+    ).astype(np.uint8)
 
-    # Slight expansion is important: otherwise a halo of character
-    # pixels remains behind the walking character.
-    kernel_size = max(5, int(min(h, w) * 0.012))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel_size = min(31, kernel_size)
+    h, w = hard_mask.shape
+
+    # Remove a small halo around the character.
+    dilation_size = int(
+        np.clip(
+            min(h, w) * 0.012,
+            5,
+            25,
+        )
+    )
+
+    if dilation_size % 2 == 0:
+        dilation_size += 1
 
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
-        (kernel_size, kernel_size),
+        (
+            dilation_size,
+            dilation_size,
+        ),
     )
 
-    removal_mask = cv2.dilate(character_mask, kernel, iterations=1)
+    removal_mask = cv2.dilate(
+        hard_mask,
+        kernel,
+        iterations=1,
+    )
 
-    # Inpainting works better with a hard mask.
-    hard_mask = np.where(removal_mask > 25, 255, 0).astype(np.uint8)
+    # --------------------------------------------------------
+    # Inpaint.
+    # --------------------------------------------------------
 
-    # Two passes: Telea first, then mild smoothing.
     try:
         plate = cv2.inpaint(
             image,
-            hard_mask,
+            removal_mask,
             5,
             cv2.INPAINT_TELEA,
         )
     except Exception:
         plate = image.copy()
 
-    # Keep original background untouched outside the removal zone.
-    # This minimizes unintended image changes.
-    soft = cv2.GaussianBlur(hard_mask, (9, 9), 0).astype(np.float32) / 255.0
+    # --------------------------------------------------------
+    # Keep original pixels outside the removed character.
+    # --------------------------------------------------------
+
+    soft = cv2.GaussianBlur(
+        removal_mask,
+        (9, 9),
+        0,
+    ).astype(np.float32) / 255.0
+
     soft = soft[:, :, None]
 
     plate = (
         plate.astype(np.float32) * soft
-        + image.astype(np.float32) * (1.0 - soft)
+        +
+        image.astype(np.float32) * (1.0 - soft)
     )
 
-    return np.clip(plate, 0, 255).astype(np.uint8)
+    return np.clip(
+        plate,
+        0,
+        255,
+    ).astype(np.uint8)
 
 
 # ============================================================
 # CHARACTER CROP
 # ============================================================
 
-def crop_character(image, mask, padding_ratio=0.10):
-    ys, xs = np.where(mask > 20)
+def crop_character(
+    image,
+    mask,
+    padding_ratio=0.08,
+):
+    ys, xs = np.where(
+        mask > 20
+    )
 
     if len(xs) == 0:
-        return None, None, None, None
+        return (
+            None,
+            None,
+            None,
+            None,
+        )
 
-    x1, x2 = int(xs.min()), int(xs.max()) + 1
-    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1 = int(xs.min())
+    x2 = int(xs.max()) + 1
+
+    y1 = int(ys.min())
+    y2 = int(ys.max()) + 1
 
     width = x2 - x1
     height = y2 - y1
 
-    px = max(4, int(width * padding_ratio))
-    py = max(4, int(height * padding_ratio))
+    px = max(
+        4,
+        int(width * padding_ratio),
+    )
 
-    x1 = max(0, x1 - px)
-    y1 = max(0, y1 - py)
-    x2 = min(image.shape[1], x2 + px)
-    y2 = min(image.shape[0], y2 + py)
+    py = max(
+        4,
+        int(height * padding_ratio),
+    )
 
-    crop = image[y1:y2, x1:x2].copy()
-    alpha = mask[y1:y2, x1:x2].copy()
+    x1 = max(
+        0,
+        x1 - px,
+    )
+
+    y1 = max(
+        0,
+        y1 - py,
+    )
+
+    x2 = min(
+        image.shape[1],
+        x2 + px,
+    )
+
+    y2 = min(
+        image.shape[0],
+        y2 + py,
+    )
+
+    crop = image[
+        y1:y2,
+        x1:x2,
+    ].copy()
+
+    alpha = mask[
+        y1:y2,
+        x1:x2,
+    ].copy()
 
     center = (
         (x1 + x2) / 2.0,
         (y1 + y2) / 2.0,
     )
 
-    return crop, alpha, center, (x1, y1, x2, y2)
+    return (
+        crop,
+        alpha,
+        center,
+        (x1, y1, x2, y2),
+    )
 
 
 # ============================================================
 # ALPHA COMPOSITING
 # ============================================================
 
-def paste_rgba_like(canvas, crop, alpha, center_x, center_y):
-    """
-    High-quality alpha compositing.
-    """
-    if canvas.ndim != 3:
+def paste_layer(
+    canvas,
+    crop,
+    alpha,
+    center_x,
+    center_y,
+):
+    if crop is None or alpha is None:
         return canvas
 
     h, w = canvas.shape[:2]
     ch, cw = crop.shape[:2]
 
-    x1 = int(round(center_x - cw / 2))
-    y1 = int(round(center_y - ch / 2))
+    x1 = int(
+        round(center_x - cw / 2)
+    )
+
+    y1 = int(
+        round(center_y - ch / 2)
+    )
+
     x2 = x1 + cw
     y2 = y1 + ch
 
-    if x2 <= 0 or y2 <= 0 or x1 >= w or y1 >= h:
+    if (
+        x2 <= 0
+        or y2 <= 0
+        or x1 >= w
+        or y1 >= h
+    ):
         return canvas
 
     cx1 = max(0, x1)
     cy1 = max(0, y1)
+
     cx2 = min(w, x2)
     cy2 = min(h, y2)
 
     sx1 = cx1 - x1
     sy1 = cy1 - y1
+
     sx2 = sx1 + (cx2 - cx1)
     sy2 = sy1 + (cy2 - cy1)
 
-    src = crop[sy1:sy2, sx1:sx2].astype(np.float32)
-    a = alpha[sy1:sy2, sx1:sx2].astype(np.float32) / 255.0
+    src = crop[
+        sy1:sy2,
+        sx1:sx2,
+    ].astype(np.float32)
+
+    a = alpha[
+        sy1:sy2,
+        sx1:sx2,
+    ].astype(np.float32) / 255.0
+
     a = a[:, :, None]
 
-    dst = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
+    dst = canvas[
+        cy1:cy2,
+        cx1:cx2,
+    ].astype(np.float32)
 
-    result = src * a + dst * (1.0 - a)
+    result = (
+        src * a
+        +
+        dst * (1.0 - a)
+    )
 
-    canvas[cy1:cy2, cx1:cx2] = np.clip(result, 0, 255).astype(np.uint8)
+    canvas[
+        cy1:cy2,
+        cx1:cx2,
+    ] = np.clip(
+        result,
+        0,
+        255,
+    ).astype(np.uint8)
+
     return canvas
 
 
@@ -504,38 +1221,83 @@ def transform_character(
 ):
     h, w = crop.shape[:2]
 
-    new_w = max(2, int(w * scale_x))
-    new_h = max(2, int(h * scale_y))
+    new_w = max(
+        2,
+        int(w * scale_x),
+    )
+
+    new_h = max(
+        2,
+        int(h * scale_y),
+    )
 
     resized = cv2.resize(
         crop,
-        (new_w, new_h),
+        (
+            new_w,
+            new_h,
+        ),
         interpolation=cv2.INTER_CUBIC,
     )
 
     resized_alpha = cv2.resize(
         alpha,
-        (new_w, new_h),
+        (
+            new_w,
+            new_h,
+        ),
         interpolation=cv2.INTER_CUBIC,
     )
 
-    center = (new_w / 2.0, new_h / 2.0)
+    center = (
+        new_w / 2.0,
+        new_h / 2.0,
+    )
 
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    matrix = cv2.getRotationMatrix2D(
+        center,
+        angle,
+        1.0,
+    )
 
-    cos = abs(M[0, 0])
-    sin = abs(M[0, 1])
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
 
-    bw = max(2, int(new_h * sin + new_w * cos))
-    bh = max(2, int(new_h * cos + new_w * sin))
+    bound_w = max(
+        2,
+        int(
+            new_h * sin
+            +
+            new_w * cos
+        ),
+    )
 
-    M[0, 2] += bw / 2.0 - center[0]
-    M[1, 2] += bh / 2.0 - center[1]
+    bound_h = max(
+        2,
+        int(
+            new_h * cos
+            +
+            new_w * sin
+        ),
+    )
+
+    matrix[0, 2] += (
+        bound_w / 2
+        - center[0]
+    )
+
+    matrix[1, 2] += (
+        bound_h / 2
+        - center[1]
+    )
 
     warped = cv2.warpAffine(
         resized,
-        M,
-        (bw, bh),
+        matrix,
+        (
+            bound_w,
+            bound_h,
+        ),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
@@ -543,14 +1305,20 @@ def transform_character(
 
     warped_alpha = cv2.warpAffine(
         resized_alpha,
-        M,
-        (bw, bh),
+        matrix,
+        (
+            bound_w,
+            bound_h,
+        ),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
 
-    return warped, warped_alpha
+    return (
+        warped,
+        warped_alpha,
+    )
 
 
 # ============================================================
@@ -558,21 +1326,55 @@ def transform_character(
 # ============================================================
 
 def ease_in_out(t):
-    t = float(np.clip(t, 0.0, 1.0))
-    return 0.5 - 0.5 * math.cos(math.pi * t)
+    t = float(
+        np.clip(
+            t,
+            0.0,
+            1.0,
+        )
+    )
+
+    return (
+        0.5
+        -
+        0.5
+        *
+        math.cos(
+            math.pi * t
+        )
+    )
 
 
 def smoothstep(t):
-    t = float(np.clip(t, 0.0, 1.0))
-    return t * t * (3.0 - 2.0 * t)
+    t = float(
+        np.clip(
+            t,
+            0.0,
+            1.0,
+        )
+    )
+
+    return (
+        t * t
+        *
+        (
+            3.0
+            -
+            2.0 * t
+        )
+    )
 
 
 def lerp(a, b, t):
-    return a + (b - a) * t
+    return (
+        a
+        +
+        (b - a) * t
+    )
 
 
 # ============================================================
-# WALK CYCLE
+# SLOW WALK MOTION
 # ============================================================
 
 def walking_pose(
@@ -582,14 +1384,12 @@ def walking_pose(
     bob_amount,
     sway_amount,
 ):
-    """
-    Subtle 2D motion only.
-
-    We deliberately keep the amplitude low because large transforms
-    make a hand-drawn cutout look like a sticker sliding around.
-    """
-
-    phase = local_t * step_count * math.pi * 2.0
+    phase = (
+        local_t
+        * step_count
+        * math.pi
+        * 2.0
+    )
 
     if mode == "Walk Only":
         bob = 0.0
@@ -597,25 +1397,89 @@ def walking_pose(
         scale_y = 1.0
 
     elif mode == "Slow Walk + Soft Bounce":
-        bob = math.sin(phase) * bob_amount
-        sway = math.sin(phase + math.pi / 2.0) * sway_amount
-        scale_y = 1.0 + math.sin(phase) * 0.006
+        bob = (
+            math.sin(phase)
+            * bob_amount
+        )
+
+        sway = (
+            math.sin(
+                phase
+                +
+                math.pi / 2.0
+            )
+            * sway_amount
+        )
+
+        scale_y = (
+            1.0
+            +
+            math.sin(phase)
+            * 0.004
+        )
 
     elif mode == "Slow Walk + Subtle Breathing":
-        bob = math.sin(phase) * bob_amount * 0.65
-        sway = math.sin(phase * 0.5) * sway_amount
-        scale_y = 1.0 + math.sin(phase * 0.5) * 0.012
+        bob = (
+            math.sin(phase)
+            * bob_amount
+            * 0.55
+        )
+
+        sway = (
+            math.sin(
+                phase * 0.5
+            )
+            * sway_amount
+        )
+
+        scale_y = (
+            1.0
+            +
+            math.sin(
+                phase * 0.5
+            )
+            * 0.009
+        )
 
     else:
-        bob = math.sin(phase) * bob_amount
-        sway = math.sin(phase + math.pi / 2.0) * sway_amount
-        scale_y = 1.0 + math.sin(phase) * 0.004
+        bob = (
+            math.sin(phase)
+            * bob_amount
+        )
 
-    return bob, sway, 1.0 / scale_y, scale_y
+        sway = (
+            math.sin(
+                phase
+                +
+                math.pi / 2.0
+            )
+            * sway_amount
+        )
+
+        scale_y = (
+            1.0
+            +
+            math.sin(phase)
+            * 0.003
+        )
+
+    scale_x = (
+        1.0 / max(
+            0.98,
+            scale_y,
+        )
+    )
+
+    return (
+        bob,
+        sway,
+        scale_x,
+        scale_y,
+    )
 
 
 # ============================================================
-# MAIN FRAME RENDER
+# FRAME RENDER
 # ============================================================
 
 def render_frame(
@@ -632,56 +1496,61 @@ def render_frame(
     bob_amount,
     sway_amount,
     entrance_side,
-    merge_strength,
+    merge_smoothness,
 ):
-    """
-    Timeline:
-
-      [ WALK ] -> [ SETTLE ] -> [ MERGE TO ORIGINAL ]
-
-    During MERGE:
-      background plate fades into original artwork
-      while moving character fades out.
-
-    This avoids the previous 'paper background -> original background'
-    jump.
-    """
-
     h, w = original.shape[:2]
 
-    # --------------------------------------------------------
-    # Timeline
-    # --------------------------------------------------------
-    walk_end = walk_fraction
-    settle_end = min(
-        0.95,
-        walk_end + settle_fraction,
+    walk_end = np.clip(
+        walk_fraction,
+        0.20,
+        0.80,
     )
 
-    # Start from outside the canvas.
+    settle_end = min(
+        0.92,
+        walk_end
+        +
+        np.clip(
+            settle_fraction,
+            0.03,
+            0.25,
+        ),
+    )
+
     char_w = char_crop.shape[1]
 
     if entrance_side == "Left":
-        start_x = -char_w * 0.75
+        start_x = -char_w * 0.85
     else:
-        start_x = w + char_w * 0.75
+        start_x = (
+            w
+            +
+            char_w * 0.85
+        )
 
     target_x = home_center[0]
     target_y = home_center[1]
 
     # --------------------------------------------------------
-    # Phase 1: WALK IN
+    # WALK
     # --------------------------------------------------------
+
     if t < walk_end:
-        p = ease_in_out(t / max(1e-6, walk_end))
 
-        # Slightly slow at the end of the walk.
-        p = smoothstep(p)
+        p = smoothstep(
+            t
+            /
+            max(
+                1e-6,
+                walk_end,
+            )
+        )
 
-        current_x = lerp(start_x, target_x, p)
-
-        # Character should settle around the correct height.
-        current_y = target_y
+        current_x = lerp(
+            start_x,
+            target_x,
+            p,
+        )
 
         bob, sway, sx, sy = walking_pose(
             p,
@@ -691,7 +1560,11 @@ def render_frame(
             sway_amount,
         )
 
-        current_y += bob
+        current_y = (
+            target_y
+            +
+            bob
+        )
 
         warped_c, warped_a = transform_character(
             char_crop,
@@ -701,9 +1574,11 @@ def render_frame(
             sway,
         )
 
-        frame = background_plate.copy()
+        frame = (
+            background_plate.copy()
+        )
 
-        return paste_rgba_like(
+        return paste_layer(
             frame,
             warped_c,
             warped_a,
@@ -712,24 +1587,43 @@ def render_frame(
         )
 
     # --------------------------------------------------------
-    # Phase 2: SETTLE
+    # SETTLE
     # --------------------------------------------------------
+
     if t < settle_end:
+
         p = smoothstep(
-            (t - walk_end) / max(1e-6, settle_end - walk_end)
+            (
+                t
+                -
+                walk_end
+            )
+            /
+            max(
+                1e-6,
+                settle_end
+                -
+                walk_end,
+            )
         )
 
-        # Motion decreases to zero.
+        remaining = (
+            1.0 - p
+        )
+
         bob, sway, sx, sy = walking_pose(
-            1.0 - p,
+            remaining,
             mode,
             step_count,
-            bob_amount * (1.0 - p),
-            sway_amount * (1.0 - p),
+            bob_amount * remaining,
+            sway_amount * remaining,
         )
 
-        current_x = target_x
-        current_y = target_y + bob
+        current_y = (
+            target_y
+            +
+            bob
+        )
 
         warped_c, warped_a = transform_character(
             char_crop,
@@ -739,32 +1633,65 @@ def render_frame(
             sway,
         )
 
-        frame = background_plate.copy()
+        frame = (
+            background_plate.copy()
+        )
 
-        return paste_rgba_like(
+        return paste_layer(
             frame,
             warped_c,
             warped_a,
-            current_x,
+            target_x,
             current_y,
         )
 
     # --------------------------------------------------------
-    # Phase 3: MERGE TO ORIGINAL
+    # MERGE INTO ORIGINAL
     # --------------------------------------------------------
+
     p = smoothstep(
-        (t - settle_end) / max(1e-6, 1.0 - settle_end)
+        (
+            t
+            -
+            settle_end
+        )
+        /
+        max(
+            1e-6,
+            1.0
+            -
+            settle_end,
+        )
     )
 
-    # First half: almost completely settled.
-    # Second half: stronger restoration.
-    merge = smoothstep(np.clip(p * 1.20, 0.0, 1.0))
-    merge = merge ** max(0.35, 1.0 / max(0.1, merge_strength))
+    # More smoothness = slower initial merge.
+    exponent = np.interp(
+        merge_smoothness,
+        [1, 10],
+        [1.0, 0.45],
+    )
 
-    moving = background_plate.copy()
+    merge = p ** exponent
 
-    # Character remains visible at first and then gently disappears.
-    character_alpha_factor = 1.0 - merge
+    # Hold the character almost fully visible at the beginning
+    # of the merge, then restore the real artwork.
+    merge = smoothstep(
+        np.clip(
+            merge * 1.15,
+            0.0,
+            1.0,
+        )
+    )
+
+    moving = (
+        background_plate.copy()
+    )
+
+    character_factor = (
+        1.0
+        -
+        merge
+    )
 
     warped_c, warped_a = transform_character(
         char_crop,
@@ -775,12 +1702,16 @@ def render_frame(
     )
 
     warped_a = np.clip(
-        warped_a.astype(np.float32) * character_alpha_factor,
+        warped_a.astype(
+            np.float32
+        )
+        *
+        character_factor,
         0,
         255,
     ).astype(np.uint8)
 
-    moving = paste_rgba_like(
+    moving = paste_layer(
         moving,
         warped_c,
         warped_a,
@@ -788,28 +1719,58 @@ def render_frame(
         target_y,
     )
 
-    # Restore the original image gradually.
     frame = (
-        moving.astype(np.float32) * (1.0 - merge)
-        + original.astype(np.float32) * merge
+        moving.astype(
+            np.float32
+        )
+        *
+        (1.0 - merge)
+        +
+        original.astype(
+            np.float32
+        )
+        *
+        merge
     )
 
-    return np.clip(frame, 0, 255).astype(np.uint8)
+    return np.clip(
+        frame,
+        0,
+        255,
+    ).astype(np.uint8)
 
 
 # ============================================================
-# GIF / APNG EXPORT
+# EXPORT
 # ============================================================
 
-def build_gif(frames, fps):
+def build_gif(
+    frames,
+    fps,
+):
     buffer = io.BytesIO()
 
     prepared = [
-        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        Image.fromarray(
+            cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB,
+            )
+        )
         for frame in frames
     ]
 
-    duration = max(20, int(1000 / max(1, fps)))
+    duration = max(
+        20,
+        int(
+            1000
+            /
+            max(
+                1,
+                fps,
+            )
+        ),
+    )
 
     prepared[0].save(
         buffer,
@@ -824,18 +1785,33 @@ def build_gif(frames, fps):
     return buffer.getvalue()
 
 
-def build_apng(frames, fps):
-    """
-    APNG preserves full RGB quality better than GIF.
-    """
+def build_apng(
+    frames,
+    fps,
+):
     buffer = io.BytesIO()
 
     prepared = [
-        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGB")
+        Image.fromarray(
+            cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB,
+            )
+        ).convert("RGB")
         for frame in frames
     ]
 
-    duration = max(20, int(1000 / max(1, fps)))
+    duration = max(
+        20,
+        int(
+            1000
+            /
+            max(
+                1,
+                fps,
+            )
+        ),
+    )
 
     prepared[0].save(
         buffer,
@@ -858,12 +1834,19 @@ st.sidebar.header("🎬 Timing")
 
 fps = st.sidebar.select_slider(
     "FPS",
-    options=[8, 10, 12, 15, 20, 24],
+    options=[
+        8,
+        10,
+        12,
+        15,
+        20,
+        24,
+    ],
     value=12,
 )
 
 duration = st.sidebar.slider(
-    "Total Duration (seconds)",
+    "Total duration (seconds)",
     5.0,
     16.0,
     9.0,
@@ -872,13 +1855,13 @@ duration = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("🚶 Walk")
+st.sidebar.header("🚶 Slow Walk")
 
 walk_percent = st.sidebar.slider(
     "Walking time (%)",
     25,
-    60,
-    42,
+    65,
+    45,
 )
 
 settle_percent = st.sidebar.slider(
@@ -890,29 +1873,32 @@ settle_percent = st.sidebar.slider(
 
 entrance_side = st.sidebar.selectbox(
     "Entrance side",
-    ["Left", "Right"],
+    [
+        "Left",
+        "Right",
+    ],
 )
 
 step_count = st.sidebar.slider(
-    "Slow walking steps",
+    "Walking steps",
     2,
     12,
-    5,
+    4,
 )
 
 bob_amount = st.sidebar.slider(
-    "Walking vertical motion",
+    "Vertical motion",
     0.0,
-    12.0,
-    3.0,
+    10.0,
+    2.5,
     0.5,
 )
 
 sway_amount = st.sidebar.slider(
-    "Walking body sway",
+    "Body sway",
     0.0,
     5.0,
-    1.5,
+    1.2,
     0.25,
 )
 
@@ -923,44 +1909,68 @@ motion_mode = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("🧩 Character Extraction")
+st.sidebar.header("✂️ Clean Extraction")
 
-threshold_strength = st.sidebar.slider(
-    "Character extraction strength",
-    10,
-    70,
-    35,
+outline_sensitivity = st.sidebar.slider(
+    "Outline sensitivity",
+    0,
+    100,
+    55,
+    help=(
+        "Higher values detect lighter/broken hand-drawn outlines. "
+        "If paper texture becomes selected, lower this."
+    ),
 )
 
-preserve_details = st.sidebar.checkbox(
-    "Preserve disconnected details",
-    value=True,
+detail_strength = st.sidebar.slider(
+    "Interior colour/detail",
+    0,
+    100,
+    45,
+    help=(
+        "Controls how much coloured/pencil detail is retained "
+        "inside the detected character silhouette."
+    ),
 )
 
 padding = st.sidebar.slider(
-    "Character edge padding",
+    "Character edge padding (%)",
     2,
     20,
-    10,
+    8,
+)
+
+st.sidebar.markdown(
+    """
+**Recommended for your llama drawing**
+
+- Outline sensitivity: **45–60**
+- Interior colour/detail: **35–50**
+- Bounding box: tightly around the llama
+- Walking steps: **4**
+- Vertical motion: **2–3**
+- Body sway: **1–1.5**
+- Duration: **9–10 seconds**
+"""
 )
 
 st.sidebar.markdown("---")
 
 st.sidebar.header("🌅 Scene Merge")
 
-merge_strength = st.sidebar.slider(
+merge_smoothness = st.sidebar.slider(
     "Merge smoothness",
     1,
     10,
-    5,
+    7,
 )
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("✨ Very Mild Color Polish")
+st.sidebar.header("✨ Optional Colour Polish")
 
 enable_enhancement = st.sidebar.checkbox(
-    "Enable",
+    "Enable mild warmth",
     value=False,
 )
 
@@ -968,7 +1978,7 @@ temp_shift = st.sidebar.slider(
     "Warmth",
     0,
     20,
-    6,
+    5,
 )
 
 
@@ -978,40 +1988,62 @@ temp_shift = st.sidebar.slider(
 
 uploaded_files = st.file_uploader(
     "Upload one or more drawings",
-    type=["jpg", "jpeg", "png", "webp"],
+    type=[
+        "jpg",
+        "jpeg",
+        "png",
+        "webp",
+    ],
     accept_multiple_files=True,
 )
 
 if not uploaded_files:
     st.info(
-        "Upload your drawing above. For the best result, set the bounding "
-        "box around the entire character, including disconnected arms, "
-        "legs, hair, and small details."
+        "Upload a drawing. Put the X/Y bounding box around the "
+        "character, not around the whole scene."
     )
     st.stop()
 
 
 # ============================================================
-# PROCESS FILES
+# PROCESS
 # ============================================================
 
 zip_export_files = {}
 
-for idx, uploaded in enumerate(uploaded_files):
+for idx, uploaded in enumerate(
+    uploaded_files
+):
 
     st.markdown("---")
-    st.subheader(f"🖼️ Drawing {idx + 1}: {uploaded.name}")
+
+    st.subheader(
+        f"🖼️ Drawing {idx + 1}: {uploaded.name}"
+    )
 
     uploaded.seek(0)
-    file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
 
-    raw = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    file_bytes = np.asarray(
+        bytearray(
+            uploaded.read()
+        ),
+        dtype=np.uint8,
+    )
+
+    raw = cv2.imdecode(
+        file_bytes,
+        cv2.IMREAD_COLOR,
+    )
 
     if raw is None:
-        st.error(f"Could not read {uploaded.name}.")
+        st.error(
+            f"Could not read {uploaded.name}."
+        )
         continue
 
-    raw = auto_rotate_vertical(raw)
+    raw = auto_rotate_vertical(
+        raw
+    )
 
     if enable_enhancement:
         image = enhance_color_temperature_and_warmth(
@@ -1022,16 +2054,17 @@ for idx, uploaded in enumerate(uploaded_files):
     else:
         image = raw.copy()
 
-    image = resize_image(image)
-
-    h, w = image.shape[:2]
+    image = resize_image(
+        image
+    )
 
     # --------------------------------------------------------
-    # BBOX
+    # BOUNDING BOX
     # --------------------------------------------------------
-    cbox1, cbox2 = st.columns(2)
 
-    with cbox1:
+    c1, c2 = st.columns(2)
+
+    with c1:
         x_range = st.slider(
             f"Character X range #{idx + 1}",
             0,
@@ -1040,7 +2073,7 @@ for idx, uploaded in enumerate(uploaded_files):
             key=f"x_{idx}_{uploaded.name}",
         )
 
-    with cbox2:
+    with c2:
         y_range = st.slider(
             f"Character Y range #{idx + 1}",
             0,
@@ -1057,13 +2090,14 @@ for idx, uploaded in enumerate(uploaded_files):
     ]
 
     # --------------------------------------------------------
-    # PREVIEW EXTRACTION
+    # EXTRACT
     # --------------------------------------------------------
-    mask_preview, bbox, paper_color = extract_character_mask(
+
+    mask_preview, bbox = extract_character_mask(
         image,
         bbox_pct,
-        threshold_strength=threshold_strength,
-        preserve_details=preserve_details,
+        outline_sensitivity=outline_sensitivity,
+        detail_strength=detail_strength,
     )
 
     char_preview, alpha_preview, home_preview, char_bbox = crop_character(
@@ -1072,63 +2106,165 @@ for idx, uploaded in enumerate(uploaded_files):
         padding_ratio=padding / 100.0,
     )
 
-    preview1, preview2, preview3 = st.columns(3)
+    # --------------------------------------------------------
+    # PREVIEWS
+    # --------------------------------------------------------
 
-    with preview1:
+    p1, p2, p3 = st.columns(3)
+
+    with p1:
         st.image(
-            cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(
+                image,
+                cv2.COLOR_BGR2RGB,
+            ),
             caption="Original artwork",
             width="stretch",
         )
 
-    with preview2:
-        mask_visual = cv2.cvtColor(mask_preview, cv2.COLOR_GRAY2RGB)
+    with p2:
 
-        # Red overlay makes accidental background selection obvious.
         overlay = image.copy()
-        red = np.zeros_like(image)
+
+        red = np.zeros_like(
+            image
+        )
+
+        # OpenCV BGR: channel 2 is red.
         red[:, :, 2] = 255
 
-        m = mask_preview.astype(np.float32) / 255.0
+        m = (
+            mask_preview.astype(
+                np.float32
+            )
+            /
+            255.0
+        )
+
         m = m[:, :, None]
 
         overlay = (
-            overlay.astype(np.float32) * (1 - 0.38 * m)
-            + red.astype(np.float32) * (0.38 * m)
+            overlay.astype(
+                np.float32
+            )
+            *
+            (1.0 - 0.52 * m)
+            +
+            red.astype(
+                np.float32
+            )
+            *
+            (0.52 * m)
         )
 
-        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+        overlay = np.clip(
+            overlay,
+            0,
+            255,
+        ).astype(np.uint8)
 
         st.image(
-            cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
-            caption="Character extraction preview (red = selected)",
+            cv2.cvtColor(
+                overlay,
+                cv2.COLOR_BGR2RGB,
+            ),
+            caption=(
+                "Extraction preview — red = character"
+            ),
             width="stretch",
         )
 
-    with preview3:
+    with p3:
+
         if char_preview is not None:
-            isolated = np.ones_like(char_preview) * 255
-            a = alpha_preview.astype(np.float32) / 255.0
+
+            white = np.ones_like(
+                char_preview
+            ) * 255
+
+            a = (
+                alpha_preview.astype(
+                    np.float32
+                )
+                /
+                255.0
+            )
+
             a = a[:, :, None]
 
             isolated = (
-                char_preview.astype(np.float32) * a
-                + isolated.astype(np.float32) * (1 - a)
+                char_preview.astype(
+                    np.float32
+                )
+                *
+                a
+                +
+                white.astype(
+                    np.float32
+                )
+                *
+                (1.0 - a)
             )
 
-            isolated = np.clip(isolated, 0, 255).astype(np.uint8)
+            isolated = np.clip(
+                isolated,
+                0,
+                255,
+            ).astype(np.uint8)
 
             st.image(
-                cv2.cvtColor(isolated, cv2.COLOR_BGR2RGB),
+                cv2.cvtColor(
+                    isolated,
+                    cv2.COLOR_BGR2RGB,
+                ),
                 caption="Isolated character",
                 width="stretch",
             )
+
         else:
-            st.error("No character pixels detected.")
+            st.error(
+                "No character was detected."
+            )
+
+    # --------------------------------------------------------
+    # MASK QUALITY INDICATOR
+    # --------------------------------------------------------
+
+    selected_ratio = (
+        np.count_nonzero(
+            mask_preview > 30
+        )
+        /
+        max(
+            1,
+            image.shape[0]
+            *
+            image.shape[1],
+        )
+    )
+
+    if selected_ratio > 0.35:
+        st.warning(
+            "⚠️ The selected area is very large. "
+            "Tighten the X/Y bounding box or lower Outline sensitivity."
+        )
+
+    elif selected_ratio < 0.003:
+        st.warning(
+            "⚠️ Very little was selected. "
+            "Increase Outline sensitivity or slightly widen the bounding box."
+        )
+
+    else:
+        st.success(
+            f"✓ Character mask size looks reasonable "
+            f"({selected_ratio * 100:.1f}% of image)."
+        )
 
     # --------------------------------------------------------
     # PROCESS BUTTON
     # --------------------------------------------------------
+
     process = st.button(
         f"🎬 Animate {uploaded.name}",
         key=f"process_{idx}_{uploaded.name}",
@@ -1141,29 +2277,37 @@ for idx, uploaded in enumerate(uploaded_files):
 
     if char_preview is None:
         st.error(
-            "The character could not be isolated. Expand the bounding box "
-            "or increase Character Extraction Strength."
+            "The character could not be isolated."
         )
         continue
 
-    with st.spinner("Building clean background plate..."):
+    # --------------------------------------------------------
+    # BACKGROUND PLATE
+    # --------------------------------------------------------
+
+    with st.spinner(
+        "Creating clean background plate..."
+    ):
         background_plate = create_background_plate(
             image,
             mask_preview,
         )
 
-    # --------------------------------------------------------
-    # SHOW BACKGROUND PLATE
-    # --------------------------------------------------------
     st.image(
-        cv2.cvtColor(background_plate, cv2.COLOR_BGR2RGB),
-        caption="Background plate — character removed",
+        cv2.cvtColor(
+            background_plate,
+            cv2.COLOR_BGR2RGB,
+        ),
+        caption=(
+            "Background plate — only the character removed"
+        ),
         width="stretch",
     )
 
     # --------------------------------------------------------
-    # FINAL CHARACTER CROP
+    # CHARACTER
     # --------------------------------------------------------
+
     char_crop, char_alpha, home_center, char_bbox = crop_character(
         image,
         mask_preview,
@@ -1171,26 +2315,53 @@ for idx, uploaded in enumerate(uploaded_files):
     )
 
     if char_crop is None:
-        st.error("Character crop failed.")
+        st.error(
+            "Character crop failed."
+        )
         continue
 
     frame_count = max(
         12,
-        int(round(fps * duration)),
+        int(
+            round(
+                fps
+                *
+                duration
+            )
+        ),
     )
 
-    walk_fraction = walk_percent / 100.0
-    settle_fraction = settle_percent / 100.0
+    walk_fraction = (
+        walk_percent
+        /
+        100.0
+    )
+
+    settle_fraction = (
+        settle_percent
+        /
+        100.0
+    )
 
     progress = st.progress(
         0,
-        text="Rendering natural walk...",
+        text="Rendering slow walk...",
     )
 
     frames = []
 
-    for i in range(frame_count):
-        t = i / max(1, frame_count - 1)
+    for i in range(
+        frame_count
+    ):
+
+        t = (
+            i
+            /
+            max(
+                1,
+                frame_count - 1,
+            )
+        )
 
         frame = render_frame(
             original=image,
@@ -1206,13 +2377,19 @@ for idx, uploaded in enumerate(uploaded_files):
             bob_amount=bob_amount,
             sway_amount=sway_amount,
             entrance_side=entrance_side,
-            merge_strength=merge_strength,
+            merge_smoothness=merge_smoothness,
         )
 
         frames.append(frame)
+
         progress.progress(
-            (i + 1) / frame_count,
-            text=f"Rendering frame {i + 1}/{frame_count}",
+            (i + 1)
+            /
+            frame_count,
+            text=(
+                f"Rendering frame "
+                f"{i + 1}/{frame_count}"
+            ),
         )
 
     progress.empty()
@@ -1220,22 +2397,46 @@ for idx, uploaded in enumerate(uploaded_files):
     # --------------------------------------------------------
     # EXPORT
     # --------------------------------------------------------
-    gif_data = build_gif(frames, fps)
 
-    # APNG may be larger but keeps the drawing cleaner.
-    apng_data = build_apng(frames, fps)
+    gif_data = build_gif(
+        frames,
+        fps,
+    )
 
-    gif_name = f"natural_walk_{os.path.splitext(uploaded.name)[0]}.gif"
-    apng_name = f"natural_walk_{os.path.splitext(uploaded.name)[0]}.png"
+    apng_data = build_apng(
+        frames,
+        fps,
+    )
 
-    zip_export_files[gif_name] = gif_data
-    zip_export_files[apng_name] = apng_data
+    base_name = os.path.splitext(
+        uploaded.name
+    )[0]
 
-    st.markdown("### 🎬 Result")
+    gif_name = (
+        f"natural_walk_{base_name}.gif"
+    )
+
+    apng_name = (
+        f"natural_walk_{base_name}.png"
+    )
+
+    zip_export_files[
+        gif_name
+    ] = gif_data
+
+    zip_export_files[
+        apng_name
+    ] = apng_data
+
+    st.markdown(
+        "### 🎬 Final animation"
+    )
 
     st.image(
         gif_data,
-        caption="Natural walk → settle → merge back into original scene",
+        caption=(
+            "Slow walk → settle → merge into original artwork"
+        ),
         width="stretch",
     )
 
@@ -1263,12 +2464,16 @@ for idx, uploaded in enumerate(uploaded_files):
 
 
 # ============================================================
-# ZIP EXPORT
+# ZIP
 # ============================================================
 
 if zip_export_files:
+
     st.markdown("---")
-    st.subheader("📦 Bulk Download")
+
+    st.subheader(
+        "📦 Bulk Download"
+    )
 
     zip_buffer = io.BytesIO()
 
@@ -1277,8 +2482,12 @@ if zip_export_files:
         "w",
         zipfile.ZIP_DEFLATED,
     ) as z:
+
         for name, data in zip_export_files.items():
-            z.writestr(name, data)
+            z.writestr(
+                name,
+                data,
+            )
 
     st.download_button(
         "📦 Download All Animations",
