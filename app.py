@@ -28,7 +28,7 @@ st.markdown(
 1. **Lighting & Shadow Removal:** Cleans up dark camera shadows, flattens paper lighting, and boosts color contrast.
 2. **Walk-In & Merge:** Main character walks in smoothly, settles into place, and cross-fades into the full enhanced drawing.
 3. **In-Scene Seamless Motion:** Inpaints background holes behind animated color parts to eliminate double-object ghosting!
-4. **Dual Export & Bulk ZIP:** Download both Full Scene and Transparent Overlay GIFs.
+4. **Bulk Single-Click Processing:** Process all uploaded images at once and download as a single ZIP archive!
 """
 )
 
@@ -62,30 +62,19 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 
 def enhance_paper_photo(image, clip_limit=2.5, tile_size=8, brightness_boost=15):
-    """
-    Cleans up camera shadows, flattens lighting gradients, 
-    and boosts line contrast on physical hand-drawn artwork.
-    """
-    # Convert to LAB color space to process lightness separately from color
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
-    # Apply CLAHE to Lightness channel
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
     cl = clahe.apply(l)
 
-    # Recombine and convert back to BGR
     enhanced_lab = cv2.merge((cl, a, b))
     enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
 
-    # Whiten background while preserving drawing saturation
     gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
     bg_illumination = cv2.GaussianBlur(gray, (101, 101), 0)
     
-    # Division normalization to flatten cast shadows
     normalized = cv2.divide(enhanced_bgr, cv2.cvtColor(bg_illumination, cv2.COLOR_GRAY2BGR), scale=255.0)
-    
-    # Adjust brightness/contrast
     result = cv2.convertScaleAbs(normalized, alpha=1.1, beta=brightness_boost)
     return result
 
@@ -103,18 +92,13 @@ def extract_paper_background(image):
 
 
 def inpaint_color_hole(image, mask):
-    """
-    Fills in the area behind an animated color region to eliminate 
-    double-object ghosting when the region moves.
-    """
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     dilated_mask = cv2.dilate(mask, kernel, iterations=2)
-    inpainted = cv2.inpaint(image, dilated_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
-    return inpainted
+    return cv2.inpaint(image, dilated_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 
 # ============================================================
-# COLOR IDENTIFICATION & EXTRACTION
+# COLOR EXTRACTION & MASKING
 # ============================================================
 
 def get_color_name(rgb):
@@ -300,7 +284,7 @@ def render_sequential_frame(
 ):
     h, w = original_img.shape[:2]
 
-    # --- PHASE 1: WALK-IN FROM OFF-SCREEN ---
+    # PHASE 1: WALK-IN
     if global_t < walk_frac:
         local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
@@ -320,12 +304,11 @@ def render_sequential_frame(
             canvas = paper_bg.copy()
             return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
-    # --- PHASE 2: CROSS-FADE & SEAMLESS COLOR ANIMATION (INPAINTED HOLE) ---
+    # PHASE 2: CROSS-FADE & COLOR MOTION
     else:
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(min(1.0, local_t * 2.5))
 
-        # Base Canvas uses the inpainted background to prevent ghosting
         if transparent_mode:
             base_img = np.zeros((h, w, 4), dtype=np.uint8)
             base_canvas = paste_layer(base_img, char_crop, alpha_crop, home_center[0], home_center[1])
@@ -420,6 +403,10 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
+    # Single Master Button to process all files in one click
+    st.markdown("---")
+    process_all = st.button("🚀 Process & Animate ALL Uploaded Files", type="primary", use_container_width=True)
+
     zip_export_files = {}
 
     for idx, file in enumerate(uploaded_files):
@@ -430,7 +417,6 @@ if uploaded_files:
         file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
         raw_image = auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
 
-        # Enhance lighting and remove camera shadows
         if enable_enhancement:
             image = resize_image(enhance_paper_photo(raw_image, clip_limit=clip_limit, brightness_boost=brightness_boost))
         else:
@@ -460,8 +446,11 @@ if uploaded_files:
                 caption="Isolated Color Region", use_container_width=True
             )
 
-        if st.button(f"✨ Process & Animate Sequence ({file.name})", key=f"btn_{idx}_{file.name}", type="primary", use_container_width=True):
-            with st.spinner("Enhancing artwork, inpainting background & rendering..."):
+        # Trigger processing if individual button or Master "Process All" button is clicked
+        single_click = st.button(f"✨ Process & Animate ({file.name})", key=f"btn_{idx}_{file.name}", use_container_width=True)
+
+        if process_all or single_click:
+            with st.spinner(f"Processing {file.name}..."):
                 char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
                 paper_bg = extract_paper_background(image)
                 inpainted_bg = inpaint_color_hole(image, color_mask)
@@ -473,8 +462,7 @@ if uploaded_files:
             frame_count = max(8, int(fps * duration))
             walk_frac = walk_percent / 100.0
 
-            # RENDER FULL SCENE
-            progress = st.progress(0, text="Rendering Full Scene Sequence...")
+            progress = st.progress(0, text=f"Rendering Full Scene for {file.name}...")
             full_frames = []
             for i in range(frame_count):
                 t = i / max(1, frame_count - 1)
@@ -487,8 +475,7 @@ if uploaded_files:
 
             progress.empty()
 
-            # RENDER TRANSPARENT OVERLAY
-            progress_trans = st.progress(0, text="Rendering Transparent Overlay Sequence...")
+            progress_trans = st.progress(0, text=f"Rendering Transparent Overlay for {file.name}...")
             transparent_frames = []
             for i in range(frame_count):
                 t = i / max(1, frame_count - 1)
