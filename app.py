@@ -14,20 +14,21 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Complete Unified Hand-Drawn Animator",
+    page_title="Complete Enhanced Hand-Drawn Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Complete Unified Hand-Drawn Animator")
+st.title("🎨 Enhanced Hand-Drawn Animation Engine")
 
 st.markdown(
     """
 **Sequential Pipeline Executed Per Image:**
-1. **Walk-In & Merge:** Character walks in, settles into place, and cross-fades into the full scene with all scenery.
-2. **Mandatory In-Scene Color Animation:** The selected color element immediately wiggles, bounces, or glows as part of the image.
-3. **Dual Export & Bulk ZIP:** Generates both a **Full Scene GIF** and a **Transparent Overlay GIF** for each drawing, plus a **Bulk ZIP Download** for batch uploads!
+1. **Lighting & Shadow Removal:** Cleans up dark camera shadows, flattens paper lighting, and boosts color contrast.
+2. **Walk-In & Merge:** Main character walks in smoothly, settles into place, and cross-fades into the full enhanced drawing.
+3. **In-Scene Seamless Motion:** Inpaints background holes behind animated color parts to eliminate double-object ghosting!
+4. **Dual Export & Bulk ZIP:** Download both Full Scene and Transparent Overlay GIFs.
 """
 )
 
@@ -42,7 +43,7 @@ COLOR_ANIMATION_MODES = [
 
 
 # ============================================================
-# UTILITIES & COLOR EXTRACTION
+# IMAGE ENHANCEMENT & SHADOW REMOVAL
 # ============================================================
 
 def auto_rotate_vertical(image):
@@ -60,6 +61,35 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
     return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
+def enhance_paper_photo(image, clip_limit=2.5, tile_size=8, brightness_boost=15):
+    """
+    Cleans up camera shadows, flattens lighting gradients, 
+    and boosts line contrast on physical hand-drawn artwork.
+    """
+    # Convert to LAB color space to process lightness separately from color
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    # Apply CLAHE to Lightness channel
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+    cl = clahe.apply(l)
+
+    # Recombine and convert back to BGR
+    enhanced_lab = cv2.merge((cl, a, b))
+    enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+
+    # Whiten background while preserving drawing saturation
+    gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+    bg_illumination = cv2.GaussianBlur(gray, (101, 101), 0)
+    
+    # Division normalization to flatten cast shadows
+    normalized = cv2.divide(enhanced_bgr, cv2.cvtColor(bg_illumination, cv2.COLOR_GRAY2BGR), scale=255.0)
+    
+    # Adjust brightness/contrast
+    result = cv2.convertScaleAbs(normalized, alpha=1.1, beta=brightness_boost)
+    return result
+
+
 def extract_paper_background(image):
     h, w = image.shape[:2]
     border_pixels = np.concatenate([
@@ -71,6 +101,21 @@ def extract_paper_background(image):
     bg_color = np.median(border_pixels, axis=0).astype(np.uint8)
     return np.full_like(image, bg_color)
 
+
+def inpaint_color_hole(image, mask):
+    """
+    Fills in the area behind an animated color region to eliminate 
+    double-object ghosting when the region moves.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dilated_mask = cv2.dilate(mask, kernel, iterations=2)
+    inpainted = cv2.inpaint(image, dilated_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+    return inpainted
+
+
+# ============================================================
+# COLOR IDENTIFICATION & EXTRACTION
+# ============================================================
 
 def get_color_name(rgb):
     r, g, b = [int(x) for x in rgb]
@@ -250,12 +295,12 @@ def apply_glow_effect(image, mask, intensity):
 
 
 def render_sequential_frame(
-    original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask, 
+    original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask, inpainted_bg,
     global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength, transparent_mode=False
 ):
     h, w = original_img.shape[:2]
 
-    # PHASE 1: WALK-IN FROM OFF-SCREEN
+    # --- PHASE 1: WALK-IN FROM OFF-SCREEN ---
     if global_t < walk_frac:
         local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
@@ -275,18 +320,19 @@ def render_sequential_frame(
             canvas = paper_bg.copy()
             return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
-    # PHASE 2: CROSS-FADE & MANDATORY IN-SCENE COLOR ANIMATION
+    # --- PHASE 2: CROSS-FADE & SEAMLESS COLOR ANIMATION (INPAINTED HOLE) ---
     else:
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(min(1.0, local_t * 2.5))
 
+        # Base Canvas uses the inpainted background to prevent ghosting
         if transparent_mode:
             base_img = np.zeros((h, w, 4), dtype=np.uint8)
             base_canvas = paste_layer(base_img, char_crop, alpha_crop, home_center[0], home_center[1])
         else:
             canvas_p1 = paste_layer(paper_bg.copy(), char_crop, alpha_crop, home_center[0], home_center[1])
             base_canvas = np.clip(
-                canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha, 
+                canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + inpainted_bg.astype(np.float32) * fade_alpha, 
                 0, 255
             ).astype(np.uint8)
 
@@ -346,9 +392,15 @@ def build_gif(frames, fps):
 # STREAMLIT UI & CONTROLS
 # ============================================================
 
-st.sidebar.header("🎬 Global Animation Controls")
+st.sidebar.header("☀️ Image Enhancement")
+enable_enhancement = st.sidebar.checkbox("Enable Light & Shadow Cleaning", value=True)
+clip_limit = st.sidebar.slider("Shadow Flattening (CLAHE)", 1.0, 5.0, 2.5, 0.5)
+brightness_boost = st.sidebar.slider("Paper Brightness Boost", 0, 40, 15)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎬 Motion Controls")
 fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
-duration = st.sidebar.slider("Total Sequence Duration (sec)", 4.0, 14.0, 7.0, 0.5)
+duration = st.sidebar.slider("Total Duration (sec)", 4.0, 14.0, 7.0, 0.5)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🚶 Gait Controls (Walk-In)")
@@ -376,7 +428,13 @@ if uploaded_files:
 
         file.seek(0)
         file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
-        image = resize_image(auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)))
+        raw_image = auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
+
+        # Enhance lighting and remove camera shadows
+        if enable_enhancement:
+            image = resize_image(enhance_paper_photo(raw_image, clip_limit=clip_limit, brightness_boost=brightness_boost))
+        else:
+            image = resize_image(raw_image)
 
         col_box1, col_box2 = st.columns(2)
         with col_box1:
@@ -389,7 +447,7 @@ if uploaded_files:
         detected_colors = extract_dominant_colors(image)
         c1, c2 = st.columns(2)
         with c1:
-            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Image", use_container_width=True)
+            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Enhanced Lighting Image", use_container_width=True)
         with c2:
             selected_label = st.selectbox(
                 f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}_{file.name}"
@@ -399,13 +457,14 @@ if uploaded_files:
             color_mask = make_color_mask(image, selected_color["bgr"], tolerance)
             st.image(
                 cv2.cvtColor(cv2.bitwise_and(image, image, mask=color_mask), cv2.COLOR_BGR2RGB), 
-                caption="Isolated Color Motion Region", use_container_width=True
+                caption="Isolated Color Region", use_container_width=True
             )
 
         if st.button(f"✨ Process & Animate Sequence ({file.name})", key=f"btn_{idx}_{file.name}", type="primary", use_container_width=True):
-            with st.spinner("Extracting character & preparing pipeline..."):
+            with st.spinner("Enhancing artwork, inpainting background & rendering..."):
                 char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
                 paper_bg = extract_paper_background(image)
+                inpainted_bg = inpaint_color_hole(image, color_mask)
 
             if char_crop is None:
                 st.error(f"Could not extract character from {file.name}.")
@@ -420,7 +479,7 @@ if uploaded_files:
             for i in range(frame_count):
                 t = i / max(1, frame_count - 1)
                 frame = render_sequential_frame(
-                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask, inpainted_bg,
                     t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=False
                 )
                 full_frames.append(frame)
@@ -434,7 +493,7 @@ if uploaded_files:
             for i in range(frame_count):
                 t = i / max(1, frame_count - 1)
                 frame_t = render_sequential_frame(
-                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask, inpainted_bg,
                     t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=True
                 )
                 transparent_frames.append(frame_t)
@@ -445,11 +504,9 @@ if uploaded_files:
             full_gif = build_gif(full_frames, fps)
             trans_gif = build_gif(transparent_frames, fps)
 
-            # Store in session state for individual and bulk export
             st.session_state[f"res_full_{idx}_{file.name}"] = full_gif
             st.session_state[f"res_trans_{idx}_{file.name}"] = trans_gif
 
-        # Display previews and individual download buttons if rendered
         if f"res_full_{idx}_{file.name}" in st.session_state:
             full_gif = st.session_state[f"res_full_{idx}_{file.name}"]
             trans_gif = st.session_state[f"res_trans_{idx}_{file.name}"]
@@ -472,7 +529,6 @@ if uploaded_files:
                     "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", key=f"dl_trans_{idx}_{file.name}", use_container_width=True
                 )
 
-    # BULK ZIP DOWNLOAD BUTTON
     if zip_export_files:
         st.markdown("---")
         st.subheader("📦 Bulk Download All Generated Animations")
