@@ -9,22 +9,22 @@ from PIL import Image
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="Main Character Only Animator",
+    page_title="Interactive Hand-Drawn Character Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Main Character Animator")
+st.title("🎨 Hand-Drawn Character Precise Separator & Animator")
 
 st.markdown(
     """
-Isolate **only** your main character from a hand-drawn scene (leaving trees, clouds, and scenery untouched). 
-The character walks smoothly from off-screen into its exact spot on the canvas, then blends back into the full original painting.
+Select your main character from complex hand-drawn artwork (ignoring grass, trees, and sky). 
+The character will walk into the frame, settle into place, and seamlessly cross-fade into your complete drawing.
 """
 )
 
@@ -32,7 +32,7 @@ MAX_IMAGE_SIZE = 1000
 
 
 # ============================================================
-# MAIN CHARACTER EXTRACTION (FILTERING SCENERY)
+# HELPER FUNCTIONS
 # ============================================================
 
 def resize_image(image, max_size=MAX_IMAGE_SIZE):
@@ -44,7 +44,7 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 
 def extract_paper_background(image):
-    """Samples edge pixels to build a clean paper background for the walking path."""
+    """Samples edge pixels to build a uniform background canvas."""
     h, w = image.shape[:2]
     border_pixels = np.concatenate([
         image[:15, :].reshape(-1, 3),
@@ -56,63 +56,61 @@ def extract_paper_background(image):
     return np.full_like(image, bg_color)
 
 
-def extract_main_character_only(image):
+def extract_character_interactive(image, bbox_pct):
     """
-    Isolates only the primary subject (e.g. main animal/person) 
-    and discards minor background scenery elements.
+    Extracts the main character inside a user-defined percentage bounding box 
+    using OpenCV GrabCut, removing surrounding scenery.
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    h, w = image.shape[:2]
     
-    # Threshold dark drawing lines
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 3
-    )
+    # Unpack percentage coordinates [x_min, y_min, x_max, y_max]
+    xmin = int((bbox_pct[0] / 100.0) * w)
+    ymin = int((bbox_pct[1] / 100.0) * h)
+    xmax = int((bbox_pct[2] / 100.0) * w)
+    ymax = int((bbox_pct[3] / 100.0) * h)
     
-    # Threshold color saturation
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-    _, sat_thresh = cv2.threshold(sat, 30, 255, cv2.THRESH_BINARY)
+    rect_w = max(10, xmax - xmin)
+    rect_h = max(10, ymax - ymin)
     
-    combined_mask = cv2.bitwise_or(thresh, sat_thresh)
+    rect = (xmin, ymin, rect_w, rect_h)
     
-    # Close gaps in the main character outline
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    closed_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    # Initialize GrabCut mask
+    gc_mask = np.zeros((h, w), np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
     
-    # Find all connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed_mask)
-    if num_labels <= 1:
-        return None, None, None
-        
-    # Find the largest dominant object (ignoring background border at index 0)
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    largest_idx = 1 + np.argmax(areas)
-    
-    # Build a mask ONLY for the largest character component
-    main_char_mask = (labels == largest_idx).astype(np.uint8) * 255
-    
-    # Smooth edges for natural placement
-    main_char_mask = cv2.GaussianBlur(main_char_mask, (5, 5), 0)
-    
-    ys, xs = np.where(main_char_mask > 20)
+    try:
+        cv2.grabCut(image, gc_mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+        char_mask = np.where((gc_mask == 2) | (gc_mask == 0), 0, 255).astype(np.uint8)
+    except Exception:
+        # Fallback to simple rectangle crop if GrabCut fails
+        char_mask = np.zeros((h, w), np.uint8)
+        char_mask[ymin:ymax, xmin:xmax] = 255
+
+    # Smooth edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    char_mask = cv2.morphologyEx(char_mask, cv2.MORPH_CLOSE, kernel)
+    char_mask = cv2.GaussianBlur(char_mask, (3, 3), 0)
+
+    # Crop out character
+    ys, xs = np.where(char_mask > 20)
     if len(xs) == 0:
         return None, None, None
-        
+
     x1, y1 = max(0, np.min(xs) - 5), max(0, np.min(ys) - 5)
-    x2, y2 = min(image.shape[1], np.max(xs) + 5), min(image.shape[0], np.max(ys) + 5)
-    
+    x2, y2 = min(w, np.max(xs) + 5), min(h, np.max(ys) + 5)
+
     char_crop = image[y1:y2, x1:x2].copy()
-    alpha_crop = main_char_mask[y1:y2, x1:x2].copy()
-    
+    alpha_crop = char_mask[y1:y2, x1:x2].copy()
+
     center_x = (x1 + x2) / 2.0
     center_y = (y1 + y2) / 2.0
-    
+
     return char_crop, alpha_crop, (center_x, center_y)
 
 
 # ============================================================
-# COMPOSITING & ANIMATION ENGINE
+# RENDERING ENGINE
 # ============================================================
 
 def transform_crop(crop, alpha, angle):
@@ -182,7 +180,7 @@ def render_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, glo
         return canvas
 
     else:
-        # Phase 2: Arrive at home position & cross-fade to reveal full original scene (with all scenery)
+        # Phase 2: Arrive at home position & cross-fade to reveal full drawing with all scenery
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(local_t)
 
@@ -192,45 +190,55 @@ def render_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, glo
 
 
 # ============================================================
-# STREAMLIT UI & CONTROLS
+# STREAMLIT UI
 # ============================================================
 
-st.sidebar.header("🎬 Motion Controls")
+st.sidebar.header("🎬 Motion Settings")
 fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
-duration = st.sidebar.slider("Duration (seconds)", 3.0, 10.0, 6.0, 0.5)
+duration = st.sidebar.slider("Duration (sec)", 3.0, 10.0, 6.0, 0.5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("🚶 Gait Controls")
+st.sidebar.header("🚶 Gait Settings")
 walk_percent = st.sidebar.slider("Walk-In Duration (%)", 40, 80, 65)
 bob_amount = st.sidebar.slider("Vertical Bobbing", 0, 20, 5)
 sway_amount = st.sidebar.slider("Body Sway Angle", 0, 10, 3)
 cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
 
-uploaded = st.file_uploader("Upload Hand-Drawn Painting", type=["jpg", "jpeg", "png", "webp"])
+uploaded = st.file_uploader("Upload Drawing", type=["jpg", "jpeg", "png", "webp"])
 
 if uploaded is not None:
     file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
     image = resize_image(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
 
-    with st.spinner("Extracting main character..."):
-        char_crop, alpha_crop, home_center = extract_main_character_only(image)
-        paper_bg = extract_paper_background(image)
+    st.subheader("🎯 Bounding Box Character Selector")
+    st.caption("Adjust sliders so the red bounding box covers ONLY your main character (rabbit, boy, or family).")
 
-    if char_crop is None:
-        st.error("Could not isolate a distinct main character.")
-        st.stop()
+    col_box1, col_box2 = st.columns(2)
+    with col_box1:
+        x_range = st.slider("Horizontal Range (X %)", 0, 100, (20, 80))
+    with col_box2:
+        y_range = st.slider("Vertical Range (Y %)", 0, 100, (10, 90))
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("🖼️ Original Painting")
-        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
+    bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
 
-    with col2:
-        st.subheader("✂️ Separated Main Character Only")
-        preview = paste_crop(paper_bg.copy(), char_crop, alpha_crop, char_crop.shape[1] // 2 + 10, char_crop.shape[0] // 2 + 10)
-        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
+    # Draw live preview rectangle
+    h, w = image.shape[:2]
+    preview_img = image.copy()
+    p_x1, p_y1 = int((bbox_pct[0] / 100.0) * w), int((bbox_pct[1] / 100.0) * h)
+    p_x2, p_y2 = int((bbox_pct[2] / 100.0) * w), int((bbox_pct[3] / 100.0) * h)
+    cv2.rectangle(preview_img, (p_x1, p_y1), (p_x2, p_y2), (0, 0, 255), 3)
 
-    if st.button("✨ Generate Walk-In & Merge Animation", type="primary", use_container_width=True):
+    st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+    if st.button("✨ Extract Character & Animate", type="primary", use_container_width=True):
+        with st.spinner("Extracting selected character with GrabCut..."):
+            char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
+            paper_bg = extract_paper_background(image)
+
+        if char_crop is None:
+            st.error("Could not extract character from selected region.")
+            st.stop()
+
         frame_count = max(8, int(fps * duration))
         walk_frac = walk_percent / 100.0
 
@@ -252,11 +260,11 @@ if uploaded is not None:
 
         st.subheader("🎬 Final Animation")
         st.image(buffer.getvalue(), use_container_width=True)
-        
+
         st.download_button(
             "⬇️ Download GIF",
             data=buffer.getvalue(),
-            file_name="main_character_walk_in.gif",
+            file_name="character_walk_in.gif",
             mime="image/gif",
             use_container_width=True,
         )
