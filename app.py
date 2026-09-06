@@ -24,10 +24,10 @@ st.title("🎨 Hand-Drawn Character & Precise Color Animator")
 
 st.markdown(
     """
-**Full Animation & Processing Pipeline:**
-1. **Clean Character Walk-In:** Main character enters without background grass or scenery leakage.
-2. **Seamless Cross-Fade:** Cross-fades into your complete original artwork at its exact position.
-3. **High-Precision Color Motion:** Fine HSV color discrimination (e.g. separating light pink vs. dark pink).
+**Fixed In This Update:**
+1. **Background Glowing Fix:** Excludes paper/canvas colors from target animation selection so the background never wiggles or glows.
+2. **Reliable Extraction:** Uses robust adaptive thresholding to prevent black frame outputs.
+3. **Clean Subject Isolation:** Separates subject elements cleanly from background textures.
 """
 )
 
@@ -61,21 +61,15 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 
 def enhance_color_temperature_and_warmth(image, temp_shift=12, saturation_boost=1.15):
-    """
-    Applies warm color-temperature adjustments and saturation polish 
-    while preserving original hand-drawn textures and line weights.
-    """
     img_float = image.astype(np.float32)
     b, g, r = cv2.split(img_float)
 
-    # Warmth shift: Boost Red and slightly reduce Blue
     r = r * (1.0 + (temp_shift / 100.0))
     b = b * (1.0 - (temp_shift / 200.0))
 
     warmed = cv2.merge([b, g, r])
     warmed = np.clip(warmed, 0, 255).astype(np.uint8)
 
-    # Convert to HSV to polish saturation slightly
     hsv = cv2.cvtColor(warmed, cv2.COLOR_BGR2HSV).astype(np.float32)
     h, s, v = cv2.split(hsv)
     s = np.clip(s * saturation_boost, 0, 255)
@@ -97,20 +91,19 @@ def extract_paper_background(image):
 
 
 def inpaint_color_hole(image, mask):
-    """Fills background holes behind animated regions to prevent double-object ghosting."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     dilated_mask = cv2.dilate(mask, kernel, iterations=2)
     return cv2.inpaint(image, dilated_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 
 # ============================================================
-# ACCURATE CHARACTER EXTRACTION (NO SCENERY LEAKAGE)
+# RELIABLE CHARACTER EXTRACTION
 # ============================================================
 
 def extract_character_interactive(image, bbox_pct):
     """
-    Extracts the character inside the bounding box and cleans up 
-    background grass/scenery leakage using contour filtering.
+    Extracts foreground character with fallback adaptive thresholding 
+    to prevent empty/black extraction outputs.
     """
     h, w = image.shape[:2]
     xmin = int((bbox_pct[0] / 100.0) * w)
@@ -120,6 +113,7 @@ def extract_character_interactive(image, bbox_pct):
     
     rect = (xmin, ymin, max(10, xmax - xmin), max(10, ymax - ymin))
     
+    char_mask = np.zeros((h, w), np.uint8)
     gc_mask = np.zeros((h, w), np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
@@ -129,16 +123,30 @@ def extract_character_interactive(image, bbox_pct):
         char_mask = np.where((gc_mask == 2) | (gc_mask == 0), 0, 255).astype(np.uint8)
     except Exception:
         char_mask = np.zeros((h, w), np.uint8)
-        char_mask[ymin:ymax, xmin:xmax] = 255
 
-    # Filter out detached stray background blobs (e.g. grass/tree tufts)
+    # Fallback to Adaptive Thresholding if GrabCut returns empty
+    if np.count_nonzero(char_mask) < (rect[2] * rect[3] * 0.05):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        crop_gray = gray[ymin:ymax, xmin:xmax]
+        
+        # Adaptive Threshold to capture hand-drawn ink lines
+        thresh = cv2.adaptiveThreshold(
+            crop_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10
+        )
+        
+        # Fill inner holes using morphological close
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        char_mask[ymin:ymax, xmin:xmax] = closed
+
+    # Isolate main foreground object contour
     contours, _ = cv2.findContours(char_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
-        # Keep largest central contour
         main_contour = max(contours, key=cv2.contourArea)
         clean_mask = np.zeros_like(char_mask)
         cv2.drawContours(clean_mask, [main_contour], -1, 255, thickness=cv2.FILLED)
-        char_mask = cv2.bitwise_and(char_mask, clean_mask)
+        char_mask = clean_mask
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     char_mask = cv2.morphologyEx(char_mask, cv2.MORPH_CLOSE, kernel)
@@ -146,7 +154,9 @@ def extract_character_interactive(image, bbox_pct):
 
     ys, xs = np.where(char_mask > 20)
     if len(xs) == 0:
-        return None, None, None
+        # Ultimate Fallback: Default to bounding box center region
+        char_mask[ymin:ymax, xmin:xmax] = 255
+        ys, xs = np.where(char_mask > 20)
 
     x1, y1 = max(0, np.min(xs) - 5), max(0, np.min(ys) - 5)
     x2, y2 = min(w, np.max(xs) + 5), min(h, np.max(ys) + 5)
@@ -158,7 +168,7 @@ def extract_character_interactive(image, bbox_pct):
 
 
 # ============================================================
-# HIGH-PRECISION HSV COLOR DISCRIMINATION
+# ACCURATE COLOR DISCRIMINATION (PREVENTS BACKGROUND SELECTION)
 # ============================================================
 
 def get_color_name(rgb):
@@ -167,13 +177,11 @@ def get_color_name(rgb):
     hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
     hue, sat, val = int(hsv[0]), int(hsv[1]), int(hsv[2])
 
-    if sat < 25 and val > 200:
-        return "White/Paper"
-    elif sat < 25:
-        return "Gray/Neutral"
+    if sat < 30:
+        return "Paper / Background Neutral"
     
     if hue < 10 or hue >= 170:
-        return "Light Pink/Red" if val > 200 and sat < 150 else "Dark Red/Pink"
+        return "Light Pink" if val > 180 and sat < 140 else "Dark Red / Pink"
     elif hue < 25:
         return "Orange"
     elif hue < 35:
@@ -192,12 +200,13 @@ def extract_dominant_colors(image, max_colors=8):
     small = cv2.resize(image, (150, 150), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     
-    valid_pixels = small[hsv[:, :, 1] > 25].reshape(-1, 3)
-    if len(valid_pixels) < 100:
+    # Filter out paper/background low-saturation pixels
+    valid_pixels = small[hsv[:, :, 1] > 35].reshape(-1, 3)
+    if len(valid_pixels) < 50:
         valid_pixels = small.reshape(-1, 3)
 
     pixels = valid_pixels.astype(np.float32)
-    k = min(max_colors, max(2, len(pixels) // 80))
+    k = min(max_colors, max(2, len(pixels) // 60))
     
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 25, 1.0)
     _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
@@ -209,7 +218,13 @@ def extract_dominant_colors(image, max_colors=8):
     for idx, center in enumerate(centers):
         b, g, r = [int(x) for x in center]
         hex_code = f"#{r:02x}{g:02x}{b:02x}"
-        label = f"{get_color_name((r, g, b))} ({hex_code}) — {counts[idx]/total*100:.1f}%"
+        c_name = get_color_name((r, g, b))
+        
+        # Exclude paper/background tones from primary list
+        if "Paper" in c_name:
+            continue
+
+        label = f"{c_name} ({hex_code}) — {counts[idx]/total*100:.1f}%"
         detected.append({
             "label": label,
             "rgb": (r, g, b),
@@ -218,27 +233,43 @@ def extract_dominant_colors(image, max_colors=8):
             "coverage": counts[idx] / total
         })
 
+    if not detected:
+        # Fallback if no high-saturation colors exist
+        for idx, center in enumerate(centers):
+            b, g, r = [int(x) for x in center]
+            hex_code = f"#{r:02x}{g:02x}{b:02x}"
+            detected.append({
+                "label": f"Color ({hex_code})",
+                "rgb": (r, g, b),
+                "bgr": (b, g, r),
+                "hex": hex_code,
+                "coverage": counts[idx] / total
+            })
+
     detected.sort(key=lambda x: x["coverage"], reverse=True)
     return detected
 
 
 def make_precise_color_mask(image, target_bgr, sharpness=25):
     """
-    Discriminates subtle color variations (e.g. Light Pink vs Dark Pink)
-    using tight HSV saturation and value bounds.
+    Creates an HSV mask for the selected color. 
+    Applies safety limits to ensure background paper is never masked.
     """
     hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     target_pixel = np.uint8([[[target_bgr[0], target_bgr[1], target_bgr[2]]]])
     target_hsv = cv2.cvtColor(target_pixel, cv2.COLOR_BGR2HSV)[0][0]
 
     hue_tol = max(4, int(sharpness * 0.25))
-    sat_tol = max(15, int(sharpness * 0.8))
-    val_tol = max(15, int(sharpness * 0.8))
+    sat_tol = max(20, int(sharpness * 0.8))
+    val_tol = max(20, int(sharpness * 0.8))
+
+    # Force minimum saturation threshold to prevent matching paper background
+    min_sat = max(35, int(target_hsv[1]) - sat_tol)
 
     lower_bound = np.array([
         max(0, int(target_hsv[0]) - hue_tol),
-        max(10, int(target_hsv[1]) - sat_tol),
-        max(10, int(target_hsv[2]) - val_tol)
+        min_sat,
+        max(20, int(target_hsv[2]) - val_tol)
     ], dtype=np.uint8)
 
     upper_bound = np.array([
@@ -248,6 +279,11 @@ def make_precise_color_mask(image, target_bgr, sharpness=25):
     ], dtype=np.uint8)
 
     mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
+
+    # Safety Guard: If mask covers >45% of total image area, tighten bounds
+    if np.count_nonzero(mask) > (image.shape[0] * image.shape[1] * 0.45):
+        lower_bound[1] = max(60, lower_bound[1])
+        mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
