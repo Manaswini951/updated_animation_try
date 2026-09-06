@@ -1,6 +1,7 @@
 import io
 import math
 import os
+import zipfile
 
 import cv2
 import numpy as np
@@ -26,7 +27,7 @@ st.markdown(
 **Sequential Pipeline Executed Per Image:**
 1. **Walk-In & Merge:** Character walks in, settles into place, and cross-fades into the full scene with all scenery.
 2. **Mandatory In-Scene Color Animation:** The selected color element immediately wiggles, bounces, or glows as part of the image.
-3. **Dual Export:** Generates both a **Full Scene GIF** and a **Transparent Overlay GIF** for video editing!
+3. **Dual Export & Bulk ZIP:** Generates both a **Full Scene GIF** and a **Transparent Overlay GIF** for each drawing, plus a **Bulk ZIP Download** for batch uploads!
 """
 )
 
@@ -367,6 +368,8 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
+    zip_export_files = {}
+
     for idx, file in enumerate(uploaded_files):
         st.markdown("---")
         st.subheader(f"🖼️ Drawing {idx + 1}: {file.name}")
@@ -442,6 +445,18 @@ if uploaded_files:
             full_gif = build_gif(full_frames, fps)
             trans_gif = build_gif(transparent_frames, fps)
 
+            # Store in session state for individual and bulk export
+            st.session_state[f"res_full_{idx}_{file.name}"] = full_gif
+            st.session_state[f"res_trans_{idx}_{file.name}"] = trans_gif
+
+        # Display previews and individual download buttons if rendered
+        if f"res_full_{idx}_{file.name}" in st.session_state:
+            full_gif = st.session_state[f"res_full_{idx}_{file.name}"]
+            trans_gif = st.session_state[f"res_trans_{idx}_{file.name}"]
+
+            zip_export_files[f"full_scene_{file.name}.gif"] = full_gif
+            zip_export_files[f"transparent_overlay_{file.name}.gif"] = trans_gif
+
             st.subheader("🎬 Generated Previews & Downloads")
             p1, p2 = st.columns(2)
             with p1:
@@ -456,3 +471,22 @@ if uploaded_files:
                 st.download_button(
                     "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", key=f"dl_trans_{idx}_{file.name}", use_container_width=True
                 )
+
+    # BULK ZIP DOWNLOAD BUTTON
+    if zip_export_files:
+        st.markdown("---")
+        st.subheader("📦 Bulk Download All Generated Animations")
+        
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_name, file_bytes in zip_export_files.items():
+                zip_file.writestr(file_name, file_bytes)
+
+        st.download_button(
+            "📦 Download All Animations (ZIP Archive)",
+            data=zip_buffer.getvalue(),
+            file_name="all_animated_drawings.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
