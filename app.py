@@ -13,29 +13,24 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Complete Hand-Drawn Character & Color Animator",
+    page_title="Complete Unified Hand-Drawn Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Complete Hand-Drawn Character & Color Animator")
+st.title("🎨 Complete Unified Hand-Drawn Animator")
 
 st.markdown(
     """
-**Full Storytelling Pipeline:**
-1. **Walk-In & Merge:** Character walks in, settles into place, and cross-fades into your full scene with all scenery intact.
-2. **Color Region Animation:** Pick an identified color (e.g. shirt, hat, fur) to wiggle, bounce, talk, or zoom & glow while remaining attached to the image.
-3. **Transparent Export:** Export as standard GIF or transparent RGBA stream for video editing software!
+**Sequential Pipeline Executed Per Image:**
+1. **Walk-In & Merge:** Character walks in, settles into place, and cross-fades into the full scene with all scenery.
+2. **Mandatory In-Scene Color Animation:** The selected color element immediately wiggles, bounces, or glows as part of the image.
+3. **Dual Export:** Generates both a **Full Scene GIF** and a **Transparent Overlay GIF** for video editing!
 """
 )
 
 MAX_IMAGE_SIZE = 1000
-
-STAGE_CHOICES = [
-    "1. Walk-In → Settle → Cross-Fade to Full Drawing",
-    "2. Color Region Animation (Wiggle / Bounce / Glow / Talk)",
-]
 
 COLOR_ANIMATION_MODES = [
     "Seamless Wiggle & Sway",
@@ -183,7 +178,7 @@ def extract_character_interactive(image, bbox_pct):
 
 
 # ============================================================
-# RENDERING ENGINE
+# LAYER TRANSFORMATIONS & RENDERING ENGINE
 # ============================================================
 
 def transform_layer(crop, alpha, scale_x, scale_y, angle, pivot):
@@ -242,9 +237,14 @@ def apply_glow_effect(image, mask, intensity):
     return np.clip(image.astype(np.float32) * (1.0 - alpha * 0.5) + glow_layer * (alpha * 0.5), 0, 255).astype(np.uint8)
 
 
-# Stage 1: Walk-In & Merge
-def render_walk_in_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, global_t, walk_frac, bob_amt, sway_amt, cycles):
-    canvas = paper_bg.copy()
+# Sequential Master Rendering Function: Walk-In -> Cross-Fade -> Color Animation
+def render_sequential_frame(
+    original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask, 
+    global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength, transparent_mode=False
+):
+    h, w = original_img.shape[:2]
+
+    # --- PHASE 1: WALK-IN FROM OFF-SCREEN ---
     if global_t < walk_frac:
         local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
@@ -252,137 +252,207 @@ def render_walk_in_frame(original_img, paper_bg, char_crop, alpha_crop, home_cen
         phase = local_t * cycles * math.pi * 2
         bob = math.sin(phase) * bob_amt
         sway = math.sin(phase + math.pi / 2) * sway_amt
-        warped_c, warped_a = transform_layer(char_crop, alpha_crop, 1.0, 1.0, sway, (char_crop.shape[1]/2, char_crop.shape[0]/2))
-        return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+        
+        warped_c, warped_a = transform_layer(
+            char_crop, alpha_crop, 1.0, 1.0, sway, (char_crop.shape[1] / 2.0, char_crop.shape[0] / 2.0)
+        )
+
+        if transparent_mode:
+            canvas = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba_crop = cv2.cvtColor(warped_c, cv2.COLOR_BGR2BGRA)
+            rgba_crop[:, :, 3] = warped_a
+            return paste_layer(canvas, rgba_crop[:, :, :3], warped_a, cur_x, home_center[1] + bob)
+        else:
+            canvas = paper_bg.copy()
+            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+
+    # --- PHASE 2: CROSS-FADE & MANDATORY IN-SCENE COLOR ANIMATION ---
     else:
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
-        fade_alpha = ease_in_out(local_t)
-        canvas = paste_layer(canvas, char_crop, alpha_crop, home_center[0], home_center[1])
-        return np.clip(canvas.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha, 0, 255).astype(np.uint8)
+        fade_alpha = ease_in_out(min(1.0, local_t * 2.5))  # Smooth cross-fade to full scene
 
+        # Base Canvas State
+        if transparent_mode:
+            base_img = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba_char = cv2.cvtColor(char_crop, cv2.COLOR_BGR2BGRA)
+            rgba_char[:, :, 3] = alpha_crop
+            base_canvas = paste_layer(base_img, rgba_char[:, :, :3], alpha_crop, home_center[0], home_center[1])
+        else:
+            canvas_p1 = paste_layer(paper_bg.copy(), char_crop, alpha_crop, home_center[0], home_center[1])
+            base_canvas = np.clip(
+                canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha, 
+                0, 255
+            ).astype(np.uint8)
 
-# Stage 2: Color Animation
-def render_color_animation_frame(original_img, mask, mode, global_t, speed, strength, transparent_bg):
-    h, w = original_img.shape[:2]
-    ys, xs = np.where(mask > 20)
-    canvas = np.zeros((h, w, 4), dtype=np.uint8) if transparent_bg else original_img.copy()
+        # Apply In-Scene Color Animation
+        ys, xs = np.where(color_mask > 20)
+        if len(xs) == 0:
+            return base_canvas
 
-    if len(xs) == 0:
-        return canvas
+        x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+        crop_c = original_img[y1:y2, x1:x2].copy()
+        crop_a = color_mask[y1:y2, x1:x2].copy()
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        pivot = (cx - x1, cy - y1)
+        phase_c = local_t * speed * math.pi * 2
 
-    x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
-    crop, alpha = original_img[y1:y2, x1:x2].copy(), mask[y1:y2, x1:x2].copy()
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    pivot = (cx - x1, cy - y1)
-    phase = global_t * speed * math.pi * 2
+        if color_mode == "Seamless Wiggle & Sway":
+            angle = math.sin(phase_c) * strength
+            warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
+        elif color_mode == "Rhythmic Bounce & Stretch":
+            bounce = abs(math.sin(phase_c)) * strength * 0.5
+            scale_y = 1.0 + math.sin(phase_c) * (strength * 0.02)
+            scale_x = 1.0 - math.sin(phase_c) * (strength * 0.01)
+            warped_c, warped_a = transform_layer(
+                crop_c, crop_a, scale_x, scale_y, math.sin(phase_c * 0.5) * strength * 0.3, pivot
+            )
+            cy -= bounce
+        elif color_mode == "Glowing Zoom In/Out":
+            zoom = 1.0 + math.sin(phase_c) * (strength * 0.02)
+            if not transparent_mode:
+                base_canvas = apply_glow_effect(
+                    base_canvas, color_mask, (math.sin(phase_c) + 1.0) / 2.0 * (strength * 0.04)
+                )
+            warped_c, warped_a = transform_layer(crop_c, crop_a, zoom, zoom, 0.0, pivot)
+        elif color_mode == "Storytelling Speech Cadence":
+            angle = math.sin(phase_c * 0.5) * strength
+            nod = abs(math.sin(phase_c * 2.0)) * strength * 0.8
+            warped_c, warped_a = transform_layer(
+                crop_c, crop_a, 1.0 - math.sin(phase_c * 3.0) * 0.02, 1.0 + math.sin(phase_c * 3.0) * 0.03, angle, pivot
+            )
+            cy -= nod
 
-    if mode == "Seamless Wiggle & Sway":
-        angle = math.sin(phase) * strength
-        warped_c, warped_a = transform_layer(crop, alpha, 1.0, 1.0, angle, pivot)
-    elif mode == "Rhythmic Bounce & Stretch":
-        bounce = abs(math.sin(phase)) * strength * 0.5
-        scale_y = 1.0 + math.sin(phase) * (strength * 0.02)
-        scale_x = 1.0 - math.sin(phase) * (strength * 0.01)
-        warped_c, warped_a = transform_layer(crop, alpha, scale_x, scale_y, math.sin(phase * 0.5) * strength * 0.3, pivot)
-        cy -= bounce
-    elif mode == "Glowing Zoom In/Out":
-        zoom = 1.0 + math.sin(phase) * (strength * 0.02)
-        if not transparent_bg:
-            canvas = apply_glow_effect(canvas, mask, (math.sin(phase) + 1.0) / 2.0 * (strength * 0.04))
-        warped_c, warped_a = transform_layer(crop, alpha, zoom, zoom, 0.0, pivot)
-    elif mode == "Storytelling Speech Cadence":
-        angle = math.sin(phase * 0.5) * strength
-        nod = abs(math.sin(phase * 2.0)) * strength * 0.8
-        warped_c, warped_a = transform_layer(crop, alpha, 1.0 - math.sin(phase * 3.0) * 0.02, 1.0 + math.sin(phase * 3.0) * 0.03, angle, pivot)
-        cy -= nod
-
-    if transparent_bg:
-        rgba = cv2.cvtColor(warped_c, cv2.COLOR_BGR2BGRA)
-        rgba[:, :, 3] = warped_a
-        return paste_layer(canvas, rgba[:, :, :3], warped_a, cx, cy)
-    else:
-        return paste_layer(canvas, warped_c, warped_a, cx, cy)
+        if transparent_mode:
+            rgba_color = cv2.cvtColor(warped_c, cv2.COLOR_BGR2BGRA)
+            rgba_color[:, :, 3] = warped_a
+            return paste_layer(base_canvas, rgba_color[:, :, :3], warped_a, cx, cy)
+        else:
+            return paste_layer(base_canvas, warped_c, warped_a, cx, cy)
 
 
 def build_gif(frames, fps):
     buffer = io.BytesIO()
-    prepared = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGRA2RGBA if f.shape[2] == 4 else cv2.COLOR_BGR2RGB)) for f in frames]
-    prepared[0].save(buffer, format="GIF", save_all=True, append_images=prepared[1:], duration=int(1000 / fps), loop=0, disposal=2)
+    prepared = [
+        Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGRA2RGBA if f.shape[2] == 4 else cv2.COLOR_BGR2RGB)) 
+        for f in frames
+    ]
+    prepared[0].save(
+        buffer, format="GIF", save_all=True, append_images=prepared[1:], duration=int(1000 / fps), loop=0, disposal=2
+    )
     return buffer.getvalue()
 
 
 # ============================================================
-# STREAMLIT UI
+# STREAMLIT UI & CONTROLS
 # ============================================================
 
-st.sidebar.header("🎬 Pipeline Stage")
-chosen_stage = st.sidebar.radio("Select Animation Phase", STAGE_CHOICES)
-
+st.sidebar.header("🎬 Global Animation Controls")
 fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
-duration = st.sidebar.slider("Duration (sec)", 2.0, 10.0, 5.0, 0.5)
+duration = st.sidebar.slider("Total Sequence Duration (sec)", 4.0, 14.0, 7.0, 0.5)
 
 st.sidebar.markdown("---")
+st.sidebar.header("🚶 Gait Controls (Walk-In)")
+walk_percent = st.sidebar.slider("Walk-In Duration (%)", 30, 70, 50)
+bob_amount = st.sidebar.slider("Vertical Bobbing", 0, 20, 5)
+sway_amount = st.sidebar.slider("Body Sway Angle", 0, 10, 3)
+cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
 
-if "1. Walk-In" in chosen_stage:
-    st.sidebar.header("🚶 Gait Controls")
-    walk_percent = st.sidebar.slider("Walk-In Duration (%)", 40, 80, 65)
-    bob_amount = st.sidebar.slider("Vertical Bobbing", 0, 20, 5)
-    sway_amount = st.sidebar.slider("Body Sway Angle", 0, 10, 3)
-    cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
-else:
-    st.sidebar.header("🎨 Color Motion Mode")
-    color_mode = st.sidebar.selectbox("Color Motion Style", COLOR_ANIMATION_MODES)
-    speed = st.sidebar.slider("Animation Speed", 1, 8, 4)
-    strength = st.sidebar.slider("Motion / Zoom / Glow Intensity", 1, 20, 8)
-    transparent_bg = st.sidebar.checkbox("Export with Transparent Background", value=False)
+st.sidebar.markdown("---")
+st.sidebar.header("🎨 In-Scene Color Motion")
+color_mode = st.sidebar.selectbox("Color Motion Style", COLOR_ANIMATION_MODES)
+speed = st.sidebar.slider("Color Motion Speed", 1, 8, 4)
+strength = st.sidebar.slider("Motion / Zoom / Glow Intensity", 1, 20, 8)
 
-uploaded_files = st.file_uploader("Upload Drawings (Multiple Supported)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload Drawings (Select Multiple Files)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
+)
 
 if uploaded_files:
     for idx, file in enumerate(uploaded_files):
         st.markdown("---")
-        st.subheader(f"🖼️ File {idx + 1}: {file.name}")
+        st.subheader(f"🖼️ Drawing {idx + 1}: {file.name}")
 
         file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
         image = resize_image(auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)))
 
-        if "1. Walk-In" in chosen_stage:
-            col_box1, col_box2 = st.columns(2)
-            with col_box1:
-                x_range = st.slider(f"Horizontal Range (X %) #{idx+1}", 0, 100, (15, 85))
-            with col_box2:
-                y_range = st.slider(f"Vertical Range (Y %) #{idx+1}", 0, 100, (10, 90))
+        col_box1, col_box2 = st.columns(2)
+        with col_box1:
+            x_range = st.slider(f"Horizontal Bounding Box (X %) #{idx+1}", 0, 100, (15, 85))
+        with col_box2:
+            y_range = st.slider(f"Vertical Bounding Box (Y %) #{idx+1}", 0, 100, (10, 90))
 
-            bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
+        bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
 
-            if st.button(f"✨ Generate Walk-In Animation ({file.name})", key=f"w_{idx}", type="primary", use_container_width=True):
-                with st.spinner("Extracting character & background..."):
-                    char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
-                    paper_bg = extract_paper_background(image)
+        detected_colors = extract_dominant_colors(image)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Image", use_container_width=True)
+        with c2:
+            selected_label = st.selectbox(
+                f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}"
+            )
+            selected_color = next(c for c in detected_colors if c["label"] == selected_label)
+            tolerance = st.slider(f"Color Tolerance #{idx+1}", 10, 80, 45, key=f"tol_{idx}")
+            color_mask = make_color_mask(image, selected_color["bgr"], tolerance)
+            st.image(
+                cv2.cvtColor(cv2.bitwise_and(image, image, mask=color_mask), cv2.COLOR_BGR2RGB), 
+                caption="Isolated Color Motion Region", use_container_width=True
+            )
 
-                frame_count = max(8, int(fps * duration))
-                frames = [render_walk_in_frame(image, paper_bg, char_crop, alpha_crop, home_center, i/max(1, frame_count-1), walk_percent/100.0, bob_amount, sway_amount, cycles) for i in range(frame_count)]
-                gif_data = build_gif(frames, fps)
+        if st.button(f"✨ Process & Animate Sequence ({file.name})", key=f"btn_{idx}", type="primary", use_container_width=True):
+            with st.spinner("Extracting character & preparing pipeline..."):
+                char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
+                paper_bg = extract_paper_background(image)
 
-                st.image(gif_data, use_container_width=True)
-                st.download_button("⬇️ Download Walk-In GIF", gif_data, f"walk_in_{file.name}.gif", "image/gif", use_container_width=True)
+            if char_crop is None:
+                st.error(f"Could not extract character from {file.name}.")
+                continue
 
-        else:
-            detected_colors = extract_dominant_colors(image)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Image", use_container_width=True)
-            with c2:
-                selected_label = st.selectbox("Identified Colors", [c["label"] for c in detected_colors], key=f"col_{idx}")
-                selected_color = next(c for c in detected_colors if c["label"] == selected_label)
-                tolerance = st.slider("Selection Tolerance", 10, 80, 45, key=f"tol_{idx}")
-                mask = make_color_mask(image, selected_color["bgr"], tolerance)
-                st.image(cv2.cvtColor(cv2.bitwise_and(image, image, mask=mask), cv2.COLOR_BGR2RGB), caption="Isolated Animated Part", use_container_width=True)
+            frame_count = max(8, int(fps * duration))
+            walk_frac = walk_percent / 100.0
 
-            if st.button(f"✨ Animate Color Region ({file.name})", key=f"c_{idx}", type="primary", use_container_width=True):
-                frame_count = max(8, int(fps * duration))
-                frames = [render_color_animation_frame(image, mask, color_mode, i/max(1, frame_count-1), speed, strength, transparent_bg) for i in range(frame_count)]
-                gif_data = build_gif(frames, fps)
+            # --- RENDER FULL SCENE ---
+            progress = st.progress(0, text="Rendering Full Scene Sequence...")
+            full_frames = []
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame = render_sequential_frame(
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=False
+                )
+                full_frames.append(frame)
+                progress.progress((i + 1) / frame_count)
 
-                st.image(gif_data, use_container_width=True)
-                st.download_button("⬇️ Download Color Motion GIF", gif_data, f"color_motion_{selected_color['hex']}_{file.name}.gif", "image/gif", use_container_width=True)
+            progress.empty()
+
+            # --- RENDER TRANSPARENT OVERLAY ---
+            progress_trans = st.progress(0, text="Rendering Transparent Overlay Sequence...")
+            transparent_frames = []
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame_t = render_sequential_frame(
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=True
+                )
+                transparent_frames.append(frame_t)
+                progress_trans.progress((i + 1) / frame_count)
+
+            progress_trans.empty()
+
+            full_gif = build_gif(full_frames, fps)
+            trans_gif = build_gif(transparent_frames, fps)
+
+            st.subheader("🎬 Generated Previews & Downloads")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.markdown("**1. Full Scene Animated Sequence**")
+                st.image(full_gif, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download Full Scene GIF", full_gif, f"full_scene_{file.name}.gif", "image/gif", use_container_width=True
+                )
+            with p2:
+                st.markdown("**2. Transparent Overlay Sequence (For Video Editors)**")
+                st.image(trans_gif, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", use_container_width=True
+                )
