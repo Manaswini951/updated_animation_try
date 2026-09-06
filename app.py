@@ -28,7 +28,7 @@ st.markdown(
 1. **Clean Extraction:** Isolates character outline cleanly without grabbing paper textures or scenery.
 2. **Smooth Walk-In & Merge:** Starts on a pure white canvas, character walks in, then cross-fades slowly into the real scene.
 3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels with HSV discrimination.
-4. **Decorative Overlays:** Floating butterflies drifting randomly across the scene.
+4. **Customizable Overlays:** Floating butterflies with selectable wing shapes and custom color palettes.
 5. **Dual Export & Bulk ZIP:** Generates both Full Scene and Transparent Overlay GIFs, plus a bulk ZIP download.
 """
 )
@@ -294,7 +294,7 @@ def crop_character(image, mask, padding_ratio=0.08):
 
 
 # ============================================================
-# ACCURATE COLOR SEPARATION (PREVENTS BACKGROUND SELECTION)
+# ACCURATE COLOR SEPARATION
 # ============================================================
 
 def get_color_name(rgb):
@@ -406,31 +406,36 @@ def make_precise_color_mask(image, target_bgr, sharpness=25):
 
 
 # ============================================================
-# PROCEDURAL BUTTERFLY OVERLAY
+# PROCEDURAL BUTTERFLY OVERLAY (CUSTOMIZABLE SHAPES & COLORS)
 # ============================================================
 
-def draw_butterflies_overlay(canvas, global_t, num_butterflies=5, seed=42):
+def draw_butterflies_overlay(
+    canvas, global_t, num_butterflies=5, shape_style="Round", color_palette="Vivid Multicolor", custom_bgr=(255, 191, 0), seed=42
+):
     """
-    Draws procedurally animated floating butterflies over the canvas.
-    No extra asset files needed—drawn directly using OpenCV shapes.
+    Draws procedurally animated floating butterflies with customizable colors and wing shapes.
     """
     h, w = canvas.shape[:2]
     np.random.seed(seed)
-    
-    # Define a few butterfly colors (BGR)
-    colors = [
-        (238, 130, 238),  # Soft Purple / Pink
-        (255, 191, 0),    # Gold / Yellow
-        (255, 144, 30),   # Light Blue
-        (180, 105, 255),  # Hot Pink
-    ]
+
+    # Palette Selection (BGR format)
+    if color_palette == "Soft Pink & Purple":
+        colors = [(238, 130, 238), (203, 192, 255), (180, 105, 255), (221, 160, 221)]
+    elif color_palette == "Gold & Orange":
+        colors = [(0, 191, 255), (0, 140, 255), (50, 205, 50), (0, 215, 255)]
+    elif color_palette == "Electric Blue & Cyan":
+        colors = [(255, 191, 0), (255, 144, 30), (238, 214, 175), (209, 206, 0)]
+    elif color_palette == "Custom Single Color":
+        colors = [custom_bgr]
+    else:  # Vivid Multicolor
+        colors = [(238, 130, 238), (255, 191, 0), (255, 144, 30), (180, 105, 255), (50, 205, 50)]
 
     for i in range(num_butterflies):
         base_x = (0.15 + 0.7 * np.random.rand()) * w
         base_y = (0.15 + 0.7 * np.random.rand()) * h
         color = colors[i % len(colors)]
         scale = 0.6 + 0.5 * np.random.rand()
-        
+
         freq_x = 1.2 + 0.5 * i
         freq_y = 0.8 + 0.4 * i
         offset_x = math.sin(global_t * math.pi * 2 * freq_x + i) * (0.12 * w)
@@ -444,9 +449,27 @@ def draw_butterflies_overlay(canvas, global_t, num_butterflies=5, seed=42):
         wing_h = max(2, int(10 * scale))
 
         if 0 < cx < w and 0 < cy < h:
-            cv2.ellipse(canvas, (cx - wing_w // 2, cy - 2), (wing_w, wing_h), -15, 0, 360, color, -1)
-            cv2.ellipse(canvas, (cx + wing_w // 2, cy - 2), (wing_w, wing_h), 15, 0, 360, color, -1)
+            if shape_style == "Pointed / Swallowtail":
+                pts_left = np.array([[cx, cy], [cx - wing_w, cy - wing_h], [cx - wing_w // 2, cy + wing_h // 2]], np.int32)
+                pts_right = np.array([[cx, cy], [cx + wing_w, cy - wing_h], [cx + wing_w // 2, cy + wing_h // 2]], np.int32)
+                cv2.fillPoly(canvas, [pts_left], color)
+                cv2.fillPoly(canvas, [pts_right], color)
+
+            elif shape_style == "Heart-Shaped":
+                r = max(2, wing_w // 2)
+                cv2.circle(canvas, (cx - r, cy - r // 2), r, color, -1)
+                cv2.circle(canvas, (cx - r, cy + r // 2), int(r * 0.75), color, -1)
+                cv2.circle(canvas, (cx + r, cy - r // 2), r, color, -1)
+                cv2.circle(canvas, (cx + r, cy + r // 2), int(r * 0.75), color, -1)
+
+            else:  # Round Wings
+                cv2.ellipse(canvas, (cx - wing_w // 2, cy - 2), (wing_w, wing_h), -15, 0, 360, color, -1)
+                cv2.ellipse(canvas, (cx + wing_w // 2, cy - 2), (wing_w, wing_h), 15, 0, 360, color, -1)
+
+            # Body and Antennae
             cv2.line(canvas, (cx, cy - wing_h), (cx, cy + wing_h), (40, 40, 40), max(1, int(2 * scale)))
+            cv2.line(canvas, (cx, cy - wing_h), (cx - 3, cy - wing_h - 4), (40, 40, 40), 1)
+            cv2.line(canvas, (cx, cy - wing_h), (cx + 3, cy - wing_h - 4), (40, 40, 40), 1)
 
     return canvas
 
@@ -518,7 +541,7 @@ def ease_in_out(t):
 def render_sequential_frame(
     original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask,
     global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength,
-    enable_butterflies=True, num_butterflies=5, transparent_mode=False
+    enable_butterflies=True, num_butterflies=5, butterfly_shape="Round", butterfly_palette="Vivid Multicolor", custom_bgr=(255, 191, 0), transparent_mode=False
 ):
     h, w = original_img.shape[:2]
 
@@ -595,7 +618,10 @@ def render_sequential_frame(
 
     # OVERLAY BUTTERFLIES
     if enable_butterflies:
-        frame = draw_butterflies_overlay(frame, global_t, num_butterflies=num_butterflies)
+        frame = draw_butterflies_overlay(
+            frame, global_t, num_butterflies=num_butterflies,
+            shape_style=butterfly_shape, color_palette=butterfly_palette, custom_bgr=custom_bgr
+        )
 
     return frame
 
@@ -643,6 +669,23 @@ st.sidebar.markdown("---")
 st.sidebar.header("🦋 Decorative Overlays")
 enable_butterflies = st.sidebar.checkbox("Overlay Flying Butterflies", value=True)
 num_butterflies = st.sidebar.slider("Number of Butterflies", 1, 10, 5)
+
+butterfly_shape = st.sidebar.selectbox(
+    "Butterfly Wing Shape",
+    ["Round", "Pointed / Swallowtail", "Heart-Shaped"]
+)
+
+butterfly_palette = st.sidebar.selectbox(
+    "Butterfly Color Theme",
+    ["Vivid Multicolor", "Soft Pink & Purple", "Gold & Orange", "Electric Blue & Cyan", "Custom Single Color"]
+)
+
+custom_bgr = (255, 191, 0)
+if butterfly_palette == "Custom Single Color":
+    hex_color = st.sidebar.color_picker("Pick Butterfly Color", "#FFBF00")
+    hex_clean = hex_color.lstrip('#')
+    r, g, b = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+    custom_bgr = (b, g, r)
 
 uploaded_files = st.file_uploader(
     "Upload Drawings (Select Multiple Files)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
@@ -712,7 +755,9 @@ if uploaded_files:
                 frame = render_sequential_frame(
                     image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
                     t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength,
-                    enable_butterflies=enable_butterflies, num_butterflies=num_butterflies, transparent_mode=False
+                    enable_butterflies=enable_butterflies, num_butterflies=num_butterflies,
+                    butterfly_shape=butterfly_shape, butterfly_palette=butterfly_palette, custom_bgr=custom_bgr,
+                    transparent_mode=False
                 )
                 full_frames.append(frame)
                 progress.progress((i + 1) / frame_count)
@@ -726,7 +771,9 @@ if uploaded_files:
                 frame_t = render_sequential_frame(
                     image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
                     t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength,
-                    enable_butterflies=enable_butterflies, num_butterflies=num_butterflies, transparent_mode=True
+                    enable_butterflies=enable_butterflies, num_butterflies=num_butterflies,
+                    butterfly_shape=butterfly_shape, butterfly_palette=butterfly_palette, custom_bgr=custom_bgr,
+                    transparent_mode=True
                 )
                 transparent_frames.append(frame_t)
                 progress_trans.progress((i + 1) / frame_count)
