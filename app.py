@@ -1,4 +1,3 @@
-
 import io
 import math
 import os
@@ -15,44 +14,36 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Hand-Drawn Character Animator — Clean Extraction",
+    page_title="Complete Unified Hand-Drawn Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Character Animator — Clean Character Extraction")
+st.title("🎨 Complete Unified Hand-Drawn Animator")
 
 st.markdown(
     """
-### New extraction system
-This version is designed for **photographed hand-drawn artwork on paper**.
-
-Instead of treating every darker/pinker paper pixel as foreground, it uses:
-
-- the **dark hand-drawn outline** as the main character boundary,
-- closed-contour filling to recover the character's interior,
-- local colour/ink information **only inside the character silhouette**,
-- component filtering to reject hearts, stars and other decorations,
-- a real background plate made from the original scene,
-- slow **walk → settle → merge back into the original artwork** animation.
-
-The extraction preview is the most important part: **red should cover the llama, not the surrounding paper.**
+**Sequential Animation & Extraction Pipeline:**
+1. **Clean Extraction:** Isolates character outline cleanly without grabbing paper textures or scenery.
+2. **Smooth Walk-In & Merge:** Character walks in smoothly, settles into place, and cross-fades into the complete scene.
+3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels (e.g. shirt, cap) with HSV discrimination.
+4. **Dual Export & Bulk ZIP:** Generates both Full Scene and Transparent Overlay GIFs, plus a bulk ZIP download.
 """
 )
 
 MAX_IMAGE_SIZE = 1100
 
-MOTION_MODES = [
-    "Slow Walk + Gentle Sway",
-    "Slow Walk + Soft Bounce",
-    "Slow Walk + Subtle Breathing",
-    "Walk Only",
+COLOR_ANIMATION_MODES = [
+    "Seamless Wiggle & Sway",
+    "Rhythmic Bounce & Stretch",
+    "Glowing Zoom In/Out",
+    "Storytelling Speech Cadence",
 ]
 
 
 # ============================================================
-# IMAGE UTILITIES
+# IMAGE UTILITIES & ENHANCEMENTS
 # ============================================================
 
 def auto_rotate_vertical(image):
@@ -64,29 +55,18 @@ def auto_rotate_vertical(image):
 
 def resize_image(image, max_size=MAX_IMAGE_SIZE):
     h, w = image.shape[:2]
-
     if max(h, w) <= max_size:
         return image.copy()
-
     scale = max_size / float(max(h, w))
-
     return cv2.resize(
         image,
-        (
-            max(2, int(w * scale)),
-            max(2, int(h * scale)),
-        ),
+        (max(2, int(w * scale)), max(2, int(h * scale))),
         interpolation=cv2.INTER_AREA,
     )
 
 
-def enhance_color_temperature_and_warmth(
-    image,
-    temp_shift=6,
-    saturation_boost=1.03,
-):
+def enhance_color_temperature_and_warmth(image, temp_shift=6, saturation_boost=1.03):
     img = image.astype(np.float32)
-
     b, g, r = cv2.split(img)
 
     r *= 1.0 + temp_shift / 220.0
@@ -96,2405 +76,604 @@ def enhance_color_temperature_and_warmth(
     warmed = np.clip(warmed, 0, 255).astype(np.uint8)
 
     hsv = cv2.cvtColor(warmed, cv2.COLOR_BGR2HSV).astype(np.float32)
-
     h, s, v = cv2.split(hsv)
     s = np.clip(s * saturation_boost, 0, 255)
 
     polished = cv2.merge([h, s, v]).astype(np.uint8)
-
     return cv2.cvtColor(polished, cv2.COLOR_HSV2BGR)
 
 
 # ============================================================
-# PAPER ESTIMATION
-# ============================================================
-
-def estimate_paper_color(image):
-    """
-    Estimate the paper colour from the outer border.
-
-    The result is used only as a weak reference. It is NOT used
-    to globally classify the whole photograph as foreground.
-    """
-
-    h, w = image.shape[:2]
-
-    band = max(
-        5,
-        min(
-            25,
-            int(min(h, w) * 0.025),
-        ),
-    )
-
-    border = np.concatenate(
-        [
-            image[:band, :].reshape(-1, 3),
-            image[-band:, :].reshape(-1, 3),
-            image[:, :band].reshape(-1, 3),
-            image[:, -band:].reshape(-1, 3),
-        ],
-        axis=0,
-    )
-
-    return np.median(border, axis=0).astype(np.float32)
-
-
-def paper_distance(image):
-    bg = estimate_paper_color(image)
-
-    diff = image.astype(np.float32) - bg.reshape(1, 1, 3)
-
-    return np.sqrt(
-        np.sum(diff * diff, axis=2)
-    )
-
-
-# ============================================================
-# MASK HELPERS
+# EXTRACTION & OUTLINE DETECTION
 # ============================================================
 
 def bbox_from_percentages(image, bbox_pct):
     h, w = image.shape[:2]
-
-    x1 = int(
-        np.clip(
-            bbox_pct[0],
-            0,
-            100,
-        )
-        * w
-        / 100.0
-    )
-
-    y1 = int(
-        np.clip(
-            bbox_pct[1],
-            0,
-            100,
-        )
-        * h
-        / 100.0
-    )
-
-    x2 = int(
-        np.clip(
-            bbox_pct[2],
-            0,
-            100,
-        )
-        * w
-        / 100.0
-    )
-
-    y2 = int(
-        np.clip(
-            bbox_pct[3],
-            0,
-            100,
-        )
-        * h
-        / 100.0
-    )
+    x1 = int(np.clip(bbox_pct[0], 0, 100) * w / 100.0)
+    y1 = int(np.clip(bbox_pct[1], 0, 100) * h / 100.0)
+    x2 = int(np.clip(bbox_pct[2], 0, 100) * w / 100.0)
+    y2 = int(np.clip(bbox_pct[3], 0, 100) * h / 100.0)
 
     x1, x2 = sorted([x1, x2])
     y1, y2 = sorted([y1, y2])
 
-    x2 = max(x2, x1 + 5)
-    y2 = max(y2, y1 + 5)
-
-    x2 = min(x2, w)
-    y2 = min(y2, h)
-
+    x2 = min(max(x2, x1 + 5), w)
+    y2 = min(max(y2, y1 + 5), h)
     return x1, y1, x2, y2
 
 
-def largest_component(mask):
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask,
-        connectivity=8,
-    )
-
-    if n <= 1:
-        return np.zeros_like(mask)
-
-    areas = stats[1:, cv2.CC_STAT_AREA]
-
-    index = 1 + int(np.argmax(areas))
-
-    return np.where(
-        labels == index,
-        255,
-        0,
-    ).astype(np.uint8)
-
-
-def remove_small_components(
-    mask,
-    minimum_area,
-):
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask,
-        connectivity=8,
-    )
-
-    cleaned = np.zeros_like(mask)
-
-    for label in range(1, n):
-        area = stats[label, cv2.CC_STAT_AREA]
-
-        if area >= minimum_area:
-            cleaned[labels == label] = 255
-
-    return cleaned
-
-
-# ============================================================
-# OUTLINE DETECTION
-# ============================================================
-
-def detect_dark_outline(
-    crop,
-    sensitivity=55,
-):
-    """
-    Detect the hand-drawn dark outline.
-
-    This deliberately favours dark/local-contrast strokes instead
-    of global colour difference. This is the key change from the
-    previous algorithm.
-    """
-
-    gray = cv2.cvtColor(
-        crop,
-        cv2.COLOR_BGR2GRAY,
-    )
-
+def detect_dark_outline(crop, sensitivity=55):
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # --------------------------------------------------------
-    # Local darkness
-    # --------------------------------------------------------
-
-    blur_size = int(
-        np.clip(
-            min(h, w) * 0.07,
-            15,
-            71,
-        )
-    )
-
+    blur_size = int(np.clip(min(h, w) * 0.07, 15, 71))
     if blur_size % 2 == 0:
         blur_size += 1
 
-    local_bg = cv2.GaussianBlur(
-        gray,
-        (blur_size, blur_size),
-        0,
-    )
+    local_bg = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+    darkness = cv2.subtract(local_bg, gray)
 
-    darkness = cv2.subtract(
-        local_bg,
-        gray,
-    )
+    darkness_percentile = np.interp(sensitivity, [0, 100], [97, 82])
+    threshold_dark = np.percentile(darkness, darkness_percentile)
 
-    # Higher sensitivity = slightly easier detection.
-    darkness_percentile = np.interp(
-        sensitivity,
-        [0, 100],
-        [97, 82],
-    )
+    local_mask = np.where(darkness >= threshold_dark, 255, 0).astype(np.uint8)
 
-    threshold_dark = np.percentile(
-        darkness,
-        darkness_percentile,
-    )
-
-    local_mask = np.where(
-        darkness >= threshold_dark,
-        255,
-        0,
-    ).astype(np.uint8)
-
-    # --------------------------------------------------------
-    # Absolute dark ink
-    # --------------------------------------------------------
-
-    hsv = cv2.cvtColor(
-        crop,
-        cv2.COLOR_BGR2HSV,
-    )
-
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
 
-    absolute_value_threshold = int(
-        np.interp(
-            sensitivity,
-            [0, 100],
-            [105, 170],
-        )
-    )
+    absolute_value_threshold = int(np.interp(sensitivity, [0, 100], [105, 170]))
+    absolute_dark = (value <= absolute_value_threshold) & ((saturation >= 10) | (value <= 125))
+    absolute_dark = absolute_dark.astype(np.uint8) * 255
 
-    absolute_dark = (
-        (value <= absolute_value_threshold)
-        &
-        (
-            (saturation >= 10)
-            |
-            (value <= 125)
-        )
-    )
+    ink = cv2.bitwise_or(local_mask, absolute_dark)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, open_kernel, iterations=1)
 
-    absolute_dark = (
-        absolute_dark.astype(np.uint8)
-        * 255
-    )
-
-    ink = cv2.bitwise_or(
-        local_mask,
-        absolute_dark,
-    )
-
-    # --------------------------------------------------------
-    # Remove tiny paper texture
-    # --------------------------------------------------------
-
-    open_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (3, 3),
-    )
-
-    ink = cv2.morphologyEx(
-        ink,
-        cv2.MORPH_OPEN,
-        open_kernel,
-        iterations=1,
-    )
-
-    # --------------------------------------------------------
-    # Close small breaks in hand-drawn outline
-    # --------------------------------------------------------
-
-    close_size = int(
-        np.interp(
-            sensitivity,
-            [0, 100],
-            [5, 11],
-        )
-    )
-
+    close_size = int(np.interp(sensitivity, [0, 100], [5, 11]))
     if close_size % 2 == 0:
         close_size += 1
-
-    close_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (
-            close_size,
-            close_size,
-        ),
-    )
-
-    ink = cv2.morphologyEx(
-        ink,
-        cv2.MORPH_CLOSE,
-        close_kernel,
-        iterations=1,
-    )
-
-    return ink
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+    return cv2.morphologyEx(ink, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
 
-# ============================================================
-# CLOSED OUTLINE -> CHARACTER SILHOUETTE
-# ============================================================
-
-def contour_fill_from_outline(
-    outline,
-    sensitivity=55,
-):
-    """
-    Convert dark outline into a filled character silhouette.
-
-    Decorations such as hearts are usually separate contours.
-    The character contour is selected using a score based on:
-
-      - contour area,
-      - position inside the bbox,
-      - shape size,
-      - proximity to the crop centre.
-
-    This is much safer than globally thresholding paper colour.
-    """
-
+def contour_fill_from_outline(outline, sensitivity=55):
     h, w = outline.shape[:2]
-
-    contours, hierarchy = cv2.findContours(
-        outline,
-        cv2.RETR_CCOMP,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-
+    contours, hierarchy = cv2.findContours(outline, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return np.zeros_like(outline)
 
     crop_area = float(h * w)
-    cx0 = w / 2.0
-    cy0 = h / 2.0
-
+    cx0, cy0 = w / 2.0, h / 2.0
     candidates = []
 
     for i, contour in enumerate(contours):
-
         area = cv2.contourArea(contour)
-
         if area < crop_area * 0.003:
             continue
 
-        x, y, cw, ch = cv2.boundingRect(
-            contour
-        )
+        x, y, cw, ch = cv2.boundingRect(contour)
+        center_x, center_y = x + cw / 2.0, y + ch / 2.0
+        distance = math.sqrt(((center_x - cx0) / max(1, w)) ** 2 + ((center_y - cy0) / max(1, h)) ** 2)
 
-        bbox_area = float(
-            max(1, cw * ch)
-        )
+        centre_score = max(0.0, 1.0 - distance * 2.5)
+        size_score = min(1.0, area / (crop_area * 0.30))
+        score = area * (0.55 + 0.30 * centre_score + 0.15 * size_score)
 
-        fill_ratio = area / bbox_area
-
-        center_x = x + cw / 2.0
-        center_y = y + ch / 2.0
-
-        distance = math.sqrt(
-            (
-                (center_x - cx0)
-                / max(1, w)
-            )
-            ** 2
-            +
-            (
-                (center_y - cy0)
-                / max(1, h)
-            )
-            ** 2
-        )
-
-        centre_score = max(
-            0.0,
-            1.0 - distance * 2.5,
-        )
-
-        size_score = min(
-            1.0,
-            area / (crop_area * 0.30),
-        )
-
-        # Large, central contours win.
-        score = (
-            area
-            * (
-                0.55
-                + 0.30 * centre_score
-                + 0.15 * size_score
-            )
-        )
-
-        candidates.append(
-            (
-                score,
-                i,
-                area,
-                fill_ratio,
-            )
-        )
+        candidates.append((score, i))
 
     if not candidates:
         return np.zeros_like(outline)
 
-    candidates.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    # --------------------------------------------------------
-    # Select the best contour.
-    # --------------------------------------------------------
-
+    candidates.sort(key=lambda item: item[0], reverse=True)
     best_index = candidates[0][1]
 
-    silhouette = np.zeros_like(
-        outline
-    )
+    silhouette = np.zeros_like(outline)
+    cv2.drawContours(silhouette, contours, best_index, 255, thickness=cv2.FILLED)
 
-    cv2.drawContours(
-        silhouette,
-        contours,
-        best_index,
-        255,
-        thickness=cv2.FILLED,
-    )
-
-    # --------------------------------------------------------
-    # Preserve holes if they are real contour children.
-    # --------------------------------------------------------
-
-    if hierarchy is not None:
-        children = []
-
-        for i, c in enumerate(
-            hierarchy[0]
-        ):
-            parent = c[3]
-
-            if parent == best_index:
-                children.append(i)
-
-        for child_index in children:
-            child_area = cv2.contourArea(
-                contours[child_index]
-            )
-
-            # Only remove reasonably large enclosed holes.
-            if child_area > crop_area * 0.0004:
-                cv2.drawContours(
-                    silhouette,
-                    contours,
-                    child_index,
-                    0,
-                    thickness=cv2.FILLED,
-                )
-
-    # --------------------------------------------------------
-    # If the outline is fragmented, gently connect nearby
-    # character pieces. Do not aggressively flood the bbox.
-    # --------------------------------------------------------
-
-    bridge_size = int(
-        np.interp(
-            sensitivity,
-            [0, 100],
-            [3, 7],
-        )
-    )
-
+    bridge_size = int(np.interp(sensitivity, [0, 100], [3, 7]))
     if bridge_size % 2 == 0:
         bridge_size += 1
-
-    bridge_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (
-            bridge_size,
-            bridge_size,
-        ),
-    )
-
-    # Only a very small closing here.
-    silhouette = cv2.morphologyEx(
-        silhouette,
-        cv2.MORPH_CLOSE,
-        bridge_kernel,
-        iterations=1,
-    )
-
-    return silhouette
+    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_size, bridge_size))
+    return cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
 
 
-# ============================================================
-# CHARACTER EXTRACTION
-# ============================================================
-
-def extract_character_mask(
-    image,
-    bbox_pct,
-    outline_sensitivity=55,
-    detail_strength=45,
-):
-    """
-    Main extraction algorithm.
-
-    IMPORTANT:
-    The old algorithm used paper-distance pixels as foreground
-    across the entire bbox. That is exactly what caused the large
-    red paper patches in the user's screenshot.
-
-    This version does the opposite:
-
-        1. find the dark character outline,
-        2. build a silhouette from it,
-        3. use colour only INSIDE that silhouette,
-        4. attach nearby disconnected character details,
-        5. reject surrounding decorations.
-    """
-
-    x1, y1, x2, y2 = bbox_from_percentages(
-        image,
-        bbox_pct,
-    )
-
-    crop = image[
-        y1:y2,
-        x1:x2,
-    ].copy()
-
+def extract_character_mask(image, bbox_pct, outline_sensitivity=55, detail_strength=45):
+    x1, y1, x2, y2 = bbox_from_percentages(image, bbox_pct)
+    crop = image[y1:y2, x1:x2].copy()
     ch, cw = crop.shape[:2]
 
     if ch < 10 or cw < 10:
-        return (
-            np.zeros(
-                image.shape[:2],
-                dtype=np.uint8,
-            ),
-            (x1, y1, x2, y2),
-        )
+        return np.zeros(image.shape[:2], dtype=np.uint8), (x1, y1, x2, y2)
 
-    # --------------------------------------------------------
-    # STEP 1: Dark outline
-    # --------------------------------------------------------
+    outline = detect_dark_outline(crop, sensitivity=outline_sensitivity)
+    silhouette = contour_fill_from_outline(outline, sensitivity=outline_sensitivity)
 
-    outline = detect_dark_outline(
-        crop,
-        sensitivity=outline_sensitivity,
-    )
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1].astype(np.float32)
+    value = hsv[:, :, 2].astype(np.float32)
 
-    # --------------------------------------------------------
-    # STEP 2: Main filled silhouette
-    # --------------------------------------------------------
+    colour_pixels = ((saturation > np.interp(detail_strength, [0, 100], [22, 10])) & (value < 252)).astype(np.uint8) * 255
 
-    silhouette = contour_fill_from_outline(
-        outline,
-        sensitivity=outline_sensitivity,
-    )
-
-    # --------------------------------------------------------
-    # STEP 3: If contour detection fails, use GrabCut,
-    # but with strict seeds rather than treating the whole bbox
-    # as probable foreground.
-    # --------------------------------------------------------
-
-    silhouette_area = np.count_nonzero(
-        silhouette
-    )
-
-    bbox_area = max(
-        1,
-        cw * ch,
-    )
-
-    if (
-        silhouette_area < bbox_area * 0.01
-        or silhouette_area > bbox_area * 0.88
-    ):
-        silhouette = fallback_grabcut_mask(
-            crop,
-            outline,
-        )
-
-    # --------------------------------------------------------
-    # STEP 4: Recover coloured interior pixels.
-    #
-    # This is now restricted to the silhouette.
-    # Therefore pink body pixels can be recovered without
-    # selecting the grey paper elsewhere.
-    # --------------------------------------------------------
-
-    hsv = cv2.cvtColor(
-        crop,
-        cv2.COLOR_BGR2HSV,
-    )
-
-    saturation = hsv[:, :, 1].astype(
-        np.float32
-    )
-
-    value = hsv[:, :, 2].astype(
-        np.float32
-    )
-
-    # Colourful pixels inside the silhouette.
-    colour_pixels = (
-        (saturation > np.interp(
-            detail_strength,
-            [0, 100],
-            [22, 10],
-        ))
-        &
-        (value < 252)
-    ).astype(np.uint8) * 255
-
-    # Dark pixels inside silhouette.
-    gray = cv2.cvtColor(
-        crop,
-        cv2.COLOR_BGR2GRAY,
-    )
-
-    local_bg = cv2.GaussianBlur(
-        gray,
-        (21, 21),
-        0,
-    )
-
-    local_darkness = cv2.subtract(
-        local_bg,
-        gray,
-    )
-
-    dark_threshold = np.percentile(
-        local_darkness,
-        np.interp(
-            detail_strength,
-            [0, 100],
-            [97, 75],
-        ),
-    )
-
-    local_dark = np.where(
-        local_darkness >= dark_threshold,
-        255,
-        0,
-    ).astype(np.uint8)
-
-    interior_details = cv2.bitwise_or(
-        colour_pixels,
-        local_dark,
-    )
-
-    # --------------------------------------------------------
-    # STEP 5: Add details ONLY when they are close to the
-    # silhouette. This prevents hearts / stars from being
-    # accidentally selected.
-    # --------------------------------------------------------
-
-    proximity_size = int(
-        np.clip(
-            min(ch, cw) * 0.055,
-            9,
-            31,
-        )
-    )
-
+    proximity_size = int(np.clip(min(ch, cw) * 0.055, 9, 31))
     if proximity_size % 2 == 0:
         proximity_size += 1
+    proximity_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (proximity_size, proximity_size))
 
-    proximity_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (
-            proximity_size,
-            proximity_size,
-        ),
-    )
+    silhouette_neighbourhood = cv2.dilate(silhouette, proximity_kernel, iterations=1)
+    nearby_details = cv2.bitwise_and(colour_pixels, silhouette_neighbourhood)
 
-    silhouette_neighbourhood = cv2.dilate(
-        silhouette,
-        proximity_kernel,
-        iterations=1,
-    )
+    combined = cv2.bitwise_or(silhouette, nearby_details)
+    combined = np.where(combined > 0, 255, 0).astype(np.uint8)
 
-    nearby_details = cv2.bitwise_and(
-        interior_details,
-        silhouette_neighbourhood,
-    )
-
-    # The silhouette itself remains dominant.
-    combined = cv2.bitwise_or(
-        silhouette,
-        nearby_details,
-    )
-
-    # --------------------------------------------------------
-    # STEP 6: Remove tiny isolated pieces.
-    # --------------------------------------------------------
-
-    min_component = max(
-        8,
-        int(bbox_area * 0.000035),
-    )
-
-    combined = remove_small_components(
-        combined,
-        min_component,
-    )
-
-    # --------------------------------------------------------
-    # STEP 7: Never allow pixels outside the user bbox.
-    # --------------------------------------------------------
-
-    combined = np.where(
-        combined > 0,
-        255,
-        0,
-    ).astype(np.uint8)
-
-    full_mask = np.zeros(
-        image.shape[:2],
-        dtype=np.uint8,
-    )
-
-    full_mask[
-        y1:y2,
-        x1:x2,
-    ] = combined
-
-    # --------------------------------------------------------
-    # STEP 8: Very small feather.
-    # --------------------------------------------------------
-
-    full_mask = cv2.GaussianBlur(
-        full_mask,
-        (3, 3),
-        0,
-    )
-
-    return (
-        full_mask,
-        (x1, y1, x2, y2),
-    )
+    full_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    full_mask[y1:y2, x1:x2] = combined
+    return cv2.GaussianBlur(full_mask, (3, 3), 0), (x1, y1, x2, y2)
 
 
-# ============================================================
-# GRABCUT FALLBACK
-# ============================================================
-
-def fallback_grabcut(
-    crop,
-    outline,
-):
-    h, w = crop.shape[:2]
-
-    mask = np.full(
-        (h, w),
-        cv2.GC_PR_BGD,
-        dtype=np.uint8,
-    )
-
-    # Border is definite background.
-    border = max(
-        2,
-        int(min(h, w) * 0.025),
-    )
-
-    mask[
-        :border,
-        :,
-    ] = cv2.GC_BGD
-
-    mask[
-        -border:,
-        :,
-    ] = cv2.GC_BGD
-
-    mask[
-        :,
-        :border,
-    ] = cv2.GC_BGD
-
-    mask[
-        :,
-        -border:,
-    ] = cv2.GC_BGD
-
-    # Dark outline is probable foreground.
-    mask[
-        outline > 0
-    ] = cv2.GC_PR_FGD
-
-    # A very small dilation gives GrabCut a useful region
-    # without making the entire bbox foreground.
-    seed = cv2.dilate(
-        outline,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (9, 9),
-        ),
-        iterations=1,
-    )
-
-    mask[
-        seed > 0
-    ] = cv2.GC_PR_FGD
-
-    bg_model = np.zeros(
-        (1, 65),
-        np.float64,
-    )
-
-    fg_model = np.zeros(
-        (1, 65),
-        np.float64,
-    )
-
-    try:
-        cv2.grabCut(
-            crop,
-            mask,
-            None,
-            bg_model,
-            fg_model,
-            5,
-            cv2.GC_INIT_WITH_MASK,
-        )
-
-        result = np.where(
-            (
-                (mask == cv2.GC_FGD)
-                |
-                (mask == cv2.GC_PR_FGD)
-            ),
-            255,
-            0,
-        ).astype(np.uint8)
-
-        # Keep only the largest component.
-        result = largest_component(
-            result
-        )
-
-        return result
-
-    except Exception:
-        return np.zeros_like(
-            outline
-        )
-
-
-# ============================================================
-# BACKGROUND PLATE
-# ============================================================
-
-def create_background_plate(
-    image,
-    character_mask,
-):
-    """
-    Remove ONLY the extracted character.
-
-    The surrounding decorations remain untouched.
-
-    This is important for the user's scene:
-    the hearts / coloured shapes should still exist in the
-    restored background.
-    """
-
-    hard_mask = np.where(
-        character_mask > 30,
-        255,
-        0,
-    ).astype(np.uint8)
-
+def create_background_plate(image, character_mask):
+    hard_mask = np.where(character_mask > 30, 255, 0).astype(np.uint8)
     h, w = hard_mask.shape
 
-    # Remove a small halo around the character.
-    dilation_size = int(
-        np.clip(
-            min(h, w) * 0.012,
-            5,
-            25,
-        )
-    )
-
+    dilation_size = int(np.clip(min(h, w) * 0.012, 5, 25))
     if dilation_size % 2 == 0:
         dilation_size += 1
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (
-            dilation_size,
-            dilation_size,
-        ),
-    )
-
-    removal_mask = cv2.dilate(
-        hard_mask,
-        kernel,
-        iterations=1,
-    )
-
-    # --------------------------------------------------------
-    # Inpaint.
-    # --------------------------------------------------------
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_size, dilation_size))
+    removal_mask = cv2.dilate(hard_mask, kernel, iterations=1)
 
     try:
-        plate = cv2.inpaint(
-            image,
-            removal_mask,
-            5,
-            cv2.INPAINT_TELEA,
-        )
+        plate = cv2.inpaint(image, removal_mask, 5, cv2.INPAINT_TELEA)
     except Exception:
         plate = image.copy()
 
-    # --------------------------------------------------------
-    # Keep original pixels outside the removed character.
-    # --------------------------------------------------------
-
-    soft = cv2.GaussianBlur(
-        removal_mask,
-        (9, 9),
-        0,
-    ).astype(np.float32) / 255.0
-
+    soft = cv2.GaussianBlur(removal_mask, (9, 9), 0).astype(np.float32) / 255.0
     soft = soft[:, :, None]
 
-    plate = (
-        plate.astype(np.float32) * soft
-        +
-        image.astype(np.float32) * (1.0 - soft)
-    )
-
-    return np.clip(
-        plate,
-        0,
-        255,
-    ).astype(np.uint8)
+    plate = plate.astype(np.float32) * soft + image.astype(np.float32) * (1.0 - soft)
+    return np.clip(plate, 0, 255).astype(np.uint8)
 
 
-# ============================================================
-# CHARACTER CROP
-# ============================================================
-
-def crop_character(
-    image,
-    mask,
-    padding_ratio=0.08,
-):
-    ys, xs = np.where(
-        mask > 20
-    )
-
+def crop_character(image, mask, padding_ratio=0.08):
+    ys, xs = np.where(mask > 20)
     if len(xs) == 0:
-        return (
-            None,
-            None,
-            None,
-            None,
-        )
+        return None, None, None, None
 
-    x1 = int(xs.min())
-    x2 = int(xs.max()) + 1
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    width, height = x2 - x1, y2 - y1
 
-    y1 = int(ys.min())
-    y2 = int(ys.max()) + 1
+    px = max(4, int(width * padding_ratio))
+    py = max(4, int(height * padding_ratio))
 
-    width = x2 - x1
-    height = y2 - y1
+    x1 = max(0, x1 - px)
+    y1 = max(0, y1 - py)
+    x2 = min(image.shape[1], x2 + px)
+    y2 = min(image.shape[0], y2 + py)
 
-    px = max(
-        4,
-        int(width * padding_ratio),
-    )
-
-    py = max(
-        4,
-        int(height * padding_ratio),
-    )
-
-    x1 = max(
-        0,
-        x1 - px,
-    )
-
-    y1 = max(
-        0,
-        y1 - py,
-    )
-
-    x2 = min(
-        image.shape[1],
-        x2 + px,
-    )
-
-    y2 = min(
-        image.shape[0],
-        y2 + py,
-    )
-
-    crop = image[
-        y1:y2,
-        x1:x2,
-    ].copy()
-
-    alpha = mask[
-        y1:y2,
-        x1:x2,
-    ].copy()
-
-    center = (
-        (x1 + x2) / 2.0,
-        (y1 + y2) / 2.0,
-    )
-
-    return (
-        crop,
-        alpha,
-        center,
-        (x1, y1, x2, y2),
-    )
+    crop = image[y1:y2, x1:x2].copy()
+    alpha = mask[y1:y2, x1:x2].copy()
+    center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    return crop, alpha, center, (x1, y1, x2, y2)
 
 
 # ============================================================
-# ALPHA COMPOSITING
+# ACCURATE COLOR SEPARATION (PREVENTS BACKGROUND SELECTION)
 # ============================================================
 
-def paste_layer(
-    canvas,
-    crop,
-    alpha,
-    center_x,
-    center_y,
-):
-    if crop is None or alpha is None:
-        return canvas
+def get_color_name(rgb):
+    r, g, b = [int(x) for x in rgb]
+    pixel = np.uint8([[[b, g, r]]])
+    hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
+    hue, sat, val = int(hsv[0]), int(hsv[1]), int(hsv[2])
 
-    h, w = canvas.shape[:2]
+    if sat < 35:
+        return "Paper / Background Neutral"
+    if hue < 10 or hue >= 170:
+        return "Light Pink" if val > 180 and sat < 140 else "Dark Red / Pink"
+    elif hue < 25:
+        return "Orange"
+    elif hue < 35:
+        return "Yellow"
+    elif hue < 85:
+        return "Green"
+    elif hue < 130:
+        return "Blue"
+    elif hue < 155:
+        return "Purple"
+    else:
+        return "Pink"
+
+
+def extract_dominant_colors(image, max_colors=8):
+    small = cv2.resize(image, (150, 150), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+
+    valid_pixels = small[hsv[:, :, 1] > 35].reshape(-1, 3)
+    if len(valid_pixels) < 50:
+        valid_pixels = small.reshape(-1, 3)
+
+    pixels = valid_pixels.astype(np.float32)
+    k = min(max_colors, max(2, len(pixels) // 60))
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 25, 1.0)
+    _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+
+    counts = np.bincount(labels.flatten())
+    total = sum(counts)
+
+    detected = []
+    for idx, center in enumerate(centers):
+        b, g, r = [int(x) for x in center]
+        hex_code = f"#{r:02x}{g:02x}{b:02x}"
+        c_name = get_color_name((r, g, b))
+
+        if "Paper" in c_name:
+            continue
+
+        label = f"{c_name} ({hex_code}) — {counts[idx]/total*100:.1f}%"
+        detected.append({
+            "label": label,
+            "rgb": (r, g, b),
+            "bgr": (b, g, r),
+            "hex": hex_code,
+            "coverage": counts[idx] / total,
+        })
+
+    if not detected:
+        for idx, center in enumerate(centers):
+            b, g, r = [int(x) for x in center]
+            hex_code = f"#{r:02x}{g:02x}{b:02x}"
+            detected.append({
+                "label": f"Color ({hex_code})",
+                "rgb": (r, g, b),
+                "bgr": (b, g, r),
+                "hex": hex_code,
+                "coverage": counts[idx] / total,
+            })
+
+    detected.sort(key=lambda x: x["coverage"], reverse=True)
+    return detected
+
+
+def make_precise_color_mask(image, target_bgr, sharpness=25):
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    target_pixel = np.uint8([[[target_bgr[0], target_bgr[1], target_bgr[2]]]])
+    target_hsv = cv2.cvtColor(target_pixel, cv2.COLOR_BGR2HSV)[0][0]
+
+    hue_tol = max(4, int(sharpness * 0.25))
+    sat_tol = max(20, int(sharpness * 0.8))
+    val_tol = max(20, int(sharpness * 0.8))
+
+    min_sat = max(35, int(target_hsv[1]) - sat_tol)
+
+    lower_bound = np.array([
+        max(0, int(target_hsv[0]) - hue_tol),
+        min_sat,
+        max(20, int(target_hsv[2]) - val_tol),
+    ], dtype=np.uint8)
+
+    upper_bound = np.array([
+        min(179, int(target_hsv[0]) + hue_tol),
+        min(255, int(target_hsv[1]) + sat_tol),
+        min(255, int(target_hsv[2]) + val_tol),
+    ], dtype=np.uint8)
+
+    mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
+
+    if np.count_nonzero(mask) > (image.shape[0] * image.shape[1] * 0.40):
+        lower_bound[1] = max(60, lower_bound[1])
+        mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+
+# ============================================================
+# LAYER TRANSFORMATIONS & RENDERING ENGINE
+# ============================================================
+
+def transform_layer(crop, alpha, scale_x, scale_y, angle, pivot):
+    h, w = crop.shape[:2]
+    new_w, new_h = max(2, int(w * max(0.05, float(scale_x)))), max(2, int(h * max(0.05, float(scale_y))))
+
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    resized_alpha = cv2.resize(alpha, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    px, py = (pivot[0] / float(w)) * new_w, (pivot[1] / float(h)) * new_h
+
+    M = cv2.getRotationMatrix2D((px, py), angle, 1.0)
+    cos, sin = abs(M[0, 0]), abs(M[0, 1])
+    bw, bh = max(2, int(new_h * sin + new_w * cos)), max(2, int(new_h * cos + new_w * sin))
+
+    M[0, 2] += bw / 2 - px
+    M[1, 2] += bh / 2 - py
+
+    warped_c = cv2.warpAffine(resized, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    warped_a = cv2.warpAffine(resized_alpha, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped_c, warped_a
+
+
+def paste_layer(canvas, crop, alpha, cx, cy):
+    if canvas.shape[2] == 3:
+        canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
+
     ch, cw = crop.shape[:2]
+    x1, y1 = int(round(cx - cw / 2.0)), int(round(cy - ch / 2.0))
+    x2, y2 = x1 + cw, y1 + ch
 
-    x1 = int(
-        round(center_x - cw / 2)
-    )
-
-    y1 = int(
-        round(center_y - ch / 2)
-    )
-
-    x2 = x1 + cw
-    y2 = y1 + ch
-
-    if (
-        x2 <= 0
-        or y2 <= 0
-        or x1 >= w
-        or y1 >= h
-    ):
+    if x2 <= 0 or y2 <= 0 or x1 >= canvas.shape[1] or y1 >= canvas.shape[0]:
         return canvas
 
-    cx1 = max(0, x1)
-    cy1 = max(0, y1)
+    cx1, cy1 = max(0, x1), max(0, y1)
+    cx2, cy2 = min(canvas.shape[1], x2), min(canvas.shape[0], y2)
 
-    cx2 = min(w, x2)
-    cy2 = min(h, y2)
+    src_x1, src_y1 = cx1 - x1, cy1 - y1
+    src_x2, src_y2 = src_x1 + (cx2 - cx1), src_y1 + (cy2 - cy1)
 
-    sx1 = cx1 - x1
-    sy1 = cy1 - y1
+    c_crop = crop[src_y1:src_y2, src_x1:src_x2]
+    a_crop = alpha[src_y1:src_y2, src_x1:src_x2]
 
-    sx2 = sx1 + (cx2 - cx1)
-    sy2 = sy1 + (cy2 - cy1)
+    if c_crop.shape[2] == 3:
+        c_crop = cv2.cvtColor(c_crop, cv2.COLOR_BGR2BGRA)
+        c_crop[:, :, 3] = a_crop
 
-    src = crop[
-        sy1:sy2,
-        sx1:sx2,
-    ].astype(np.float32)
+    a = (a_crop.astype(np.float32) / 255.0)[:, :, None]
+    bg_crop = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
 
-    a = alpha[
-        sy1:sy2,
-        sx1:sx2,
-    ].astype(np.float32) / 255.0
+    result = c_crop.astype(np.float32) * a + bg_crop * (1.0 - a)
+    result[:, :, 3] = np.maximum(bg_crop[:, :, 3], a_crop.astype(np.float32))
 
-    a = a[:, :, None]
-
-    dst = canvas[
-        cy1:cy2,
-        cx1:cx2,
-    ].astype(np.float32)
-
-    result = (
-        src * a
-        +
-        dst * (1.0 - a)
-    )
-
-    canvas[
-        cy1:cy2,
-        cx1:cx2,
-    ] = np.clip(
-        result,
-        0,
-        255,
-    ).astype(np.uint8)
-
+    canvas[cy1:cy2, cx1:cx2] = np.clip(result, 0, 255).astype(np.uint8)
     return canvas
 
 
-def transform_character(
-    crop,
-    alpha,
-    scale_x=1.0,
-    scale_y=1.0,
-    angle=0.0,
-):
-    h, w = crop.shape[:2]
-
-    new_w = max(
-        2,
-        int(w * scale_x),
-    )
-
-    new_h = max(
-        2,
-        int(h * scale_y),
-    )
-
-    resized = cv2.resize(
-        crop,
-        (
-            new_w,
-            new_h,
-        ),
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    resized_alpha = cv2.resize(
-        alpha,
-        (
-            new_w,
-            new_h,
-        ),
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    center = (
-        new_w / 2.0,
-        new_h / 2.0,
-    )
-
-    matrix = cv2.getRotationMatrix2D(
-        center,
-        angle,
-        1.0,
-    )
-
-    cos = abs(matrix[0, 0])
-    sin = abs(matrix[0, 1])
-
-    bound_w = max(
-        2,
-        int(
-            new_h * sin
-            +
-            new_w * cos
-        ),
-    )
-
-    bound_h = max(
-        2,
-        int(
-            new_h * cos
-            +
-            new_w * sin
-        ),
-    )
-
-    matrix[0, 2] += (
-        bound_w / 2
-        - center[0]
-    )
-
-    matrix[1, 2] += (
-        bound_h / 2
-        - center[1]
-    )
-
-    warped = cv2.warpAffine(
-        resized,
-        matrix,
-        (
-            bound_w,
-            bound_h,
-        ),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(255, 255, 255),
-    )
-
-    warped_alpha = cv2.warpAffine(
-        resized_alpha,
-        matrix,
-        (
-            bound_w,
-            bound_h,
-        ),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-    return (
-        warped,
-        warped_alpha,
-    )
-
-
-# ============================================================
-# EASING
-# ============================================================
-
 def ease_in_out(t):
-    t = float(
-        np.clip(
-            t,
-            0.0,
-            1.0,
-        )
-    )
-
-    return (
-        0.5
-        -
-        0.5
-        *
-        math.cos(
-            math.pi * t
-        )
-    )
+    t = float(np.clip(t, 0.0, 1.0))
+    return 0.5 - 0.5 * math.cos(math.pi * t)
 
 
-def smoothstep(t):
-    t = float(
-        np.clip(
-            t,
-            0.0,
-            1.0,
-        )
-    )
-
-    return (
-        t * t
-        *
-        (
-            3.0
-            -
-            2.0 * t
-        )
-    )
-
-
-def lerp(a, b, t):
-    return (
-        a
-        +
-        (b - a) * t
-    )
-
-
-# ============================================================
-# SLOW WALK MOTION
-# ============================================================
-
-def walking_pose(
-    local_t,
-    mode,
-    step_count,
-    bob_amount,
-    sway_amount,
+def render_sequential_frame(
+    original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+    global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength, transparent_mode=False
 ):
-    phase = (
-        local_t
-        * step_count
-        * math.pi
-        * 2.0
-    )
+    h, w = original_img.shape[:2]
 
-    if mode == "Walk Only":
-        bob = 0.0
-        sway = 0.0
-        scale_y = 1.0
+    # PHASE 1: WALK-IN
+    if global_t < walk_frac:
+        local_t = global_t / max(1e-6, walk_frac)
+        movement = ease_in_out(local_t)
+        cur_x = -char_crop.shape[1] + (home_center[0] - (-char_crop.shape[1])) * movement
+        phase = local_t * cycles * math.pi * 2
+        bob = math.sin(phase) * bob_amt
+        sway = math.sin(phase + math.pi / 2) * sway_amt
 
-    elif mode == "Slow Walk + Soft Bounce":
-        bob = (
-            math.sin(phase)
-            * bob_amount
+        warped_c, warped_a = transform_layer(
+            char_crop, alpha_crop, 1.0, 1.0, sway, (char_crop.shape[1] / 2.0, char_crop.shape[0] / 2.0)
         )
 
-        sway = (
-            math.sin(
-                phase
-                +
-                math.pi / 2.0
-            )
-            * sway_amount
-        )
+        if transparent_mode:
+            canvas = np.zeros((h, w, 4), dtype=np.uint8)
+            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+        else:
+            canvas = paper_bg.copy()
+            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
-        scale_y = (
-            1.0
-            +
-            math.sin(phase)
-            * 0.004
-        )
-
-    elif mode == "Slow Walk + Subtle Breathing":
-        bob = (
-            math.sin(phase)
-            * bob_amount
-            * 0.55
-        )
-
-        sway = (
-            math.sin(
-                phase * 0.5
-            )
-            * sway_amount
-        )
-
-        scale_y = (
-            1.0
-            +
-            math.sin(
-                phase * 0.5
-            )
-            * 0.009
-        )
-
+    # PHASE 2: CROSS-FADE TO ORIGINAL & IN-SCENE COLOR MOTION
     else:
-        bob = (
-            math.sin(phase)
-            * bob_amount
-        )
-
-        sway = (
-            math.sin(
-                phase
-                +
-                math.pi / 2.0
-            )
-            * sway_amount
-        )
-
-        scale_y = (
-            1.0
-            +
-            math.sin(phase)
-            * 0.003
-        )
-
-    scale_x = (
-        1.0 / max(
-            0.98,
-            scale_y,
-        )
-    )
-
-    return (
-        bob,
-        sway,
-        scale_x,
-        scale_y,
-    )
-
-
-# ============================================================
-# FRAME RENDER
-# ============================================================
-
-def render_frame(
-    original,
-    background_plate,
-    char_crop,
-    char_alpha,
-    home_center,
-    t,
-    walk_fraction,
-    settle_fraction,
-    mode,
-    step_count,
-    bob_amount,
-    sway_amount,
-    entrance_side,
-    merge_smoothness,
-):
-    h, w = original.shape[:2]
-
-    walk_end = np.clip(
-        walk_fraction,
-        0.20,
-        0.80,
-    )
-
-    settle_end = min(
-        0.92,
-        walk_end
-        +
-        np.clip(
-            settle_fraction,
-            0.03,
-            0.25,
-        ),
-    )
-
-    char_w = char_crop.shape[1]
-
-    if entrance_side == "Left":
-        start_x = -char_w * 0.85
-    else:
-        start_x = (
-            w
-            +
-            char_w * 0.85
-        )
-
-    target_x = home_center[0]
-    target_y = home_center[1]
-
-    # --------------------------------------------------------
-    # WALK
-    # --------------------------------------------------------
-
-    if t < walk_end:
-
-        p = smoothstep(
-            t
-            /
-            max(
-                1e-6,
-                walk_end,
-            )
-        )
-
-        current_x = lerp(
-            start_x,
-            target_x,
-            p,
-        )
-
-        bob, sway, sx, sy = walking_pose(
-            p,
-            mode,
-            step_count,
-            bob_amount,
-            sway_amount,
-        )
-
-        current_y = (
-            target_y
-            +
-            bob
-        )
-
-        warped_c, warped_a = transform_character(
-            char_crop,
-            char_alpha,
-            sx,
-            sy,
-            sway,
-        )
-
-        frame = (
-            background_plate.copy()
-        )
-
-        return paste_layer(
-            frame,
-            warped_c,
-            warped_a,
-            current_x,
-            current_y,
-        )
-
-    # --------------------------------------------------------
-    # SETTLE
-    # --------------------------------------------------------
-
-    if t < settle_end:
-
-        p = smoothstep(
-            (
-                t
-                -
-                walk_end
-            )
-            /
-            max(
-                1e-6,
-                settle_end
-                -
-                walk_end,
-            )
-        )
-
-        remaining = (
-            1.0 - p
-        )
-
-        bob, sway, sx, sy = walking_pose(
-            remaining,
-            mode,
-            step_count,
-            bob_amount * remaining,
-            sway_amount * remaining,
-        )
-
-        current_y = (
-            target_y
-            +
-            bob
-        )
-
-        warped_c, warped_a = transform_character(
-            char_crop,
-            char_alpha,
-            sx,
-            sy,
-            sway,
-        )
-
-        frame = (
-            background_plate.copy()
-        )
-
-        return paste_layer(
-            frame,
-            warped_c,
-            warped_a,
-            target_x,
-            current_y,
-        )
-
-    # --------------------------------------------------------
-    # MERGE INTO ORIGINAL
-    # --------------------------------------------------------
-
-    p = smoothstep(
-        (
-            t
-            -
-            settle_end
-        )
-        /
-        max(
-            1e-6,
-            1.0
-            -
-            settle_end,
-        )
-    )
-
-    # More smoothness = slower initial merge.
-    exponent = np.interp(
-        merge_smoothness,
-        [1, 10],
-        [1.0, 0.45],
-    )
-
-    merge = p ** exponent
-
-    # Hold the character almost fully visible at the beginning
-    # of the merge, then restore the real artwork.
-    merge = smoothstep(
-        np.clip(
-            merge * 1.15,
-            0.0,
-            1.0,
-        )
-    )
-
-    moving = (
-        background_plate.copy()
-    )
-
-    character_factor = (
-        1.0
-        -
-        merge
-    )
-
-    warped_c, warped_a = transform_character(
-        char_crop,
-        char_alpha,
-        1.0,
-        1.0,
-        0.0,
-    )
-
-    warped_a = np.clip(
-        warped_a.astype(
-            np.float32
-        )
-        *
-        character_factor,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    moving = paste_layer(
-        moving,
-        warped_c,
-        warped_a,
-        target_x,
-        target_y,
-    )
-
-    frame = (
-        moving.astype(
-            np.float32
-        )
-        *
-        (1.0 - merge)
-        +
-        original.astype(
-            np.float32
-        )
-        *
-        merge
-    )
-
-    return np.clip(
-        frame,
-        0,
-        255,
-    ).astype(np.uint8)
-
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-def build_gif(
-    frames,
-    fps,
-):
-    buffer = io.BytesIO()
-
-    prepared = [
-        Image.fromarray(
-            cv2.cvtColor(
-                frame,
-                cv2.COLOR_BGR2RGB,
-            )
-        )
-        for frame in frames
-    ]
-
-    duration = max(
-        20,
-        int(
-            1000
-            /
-            max(
-                1,
-                fps,
-            )
-        ),
-    )
-
-    prepared[0].save(
-        buffer,
-        format="GIF",
-        save_all=True,
-        append_images=prepared[1:],
-        duration=duration,
-        loop=0,
-        disposal=2,
-    )
-
-    return buffer.getvalue()
-
-
-def build_apng(
-    frames,
-    fps,
-):
-    buffer = io.BytesIO()
-
-    prepared = [
-        Image.fromarray(
-            cv2.cvtColor(
-                frame,
-                cv2.COLOR_BGR2RGB,
-            )
-        ).convert("RGB")
-        for frame in frames
-    ]
-
-    duration = max(
-        20,
-        int(
-            1000
-            /
-            max(
-                1,
-                fps,
-            )
-        ),
-    )
-
-    prepared[0].save(
-        buffer,
-        format="PNG",
-        save_all=True,
-        append_images=prepared[1:],
-        duration=duration,
-        loop=0,
-        disposal=2,
-    )
-
-    return buffer.getvalue()
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.header("🎬 Timing")
-
-fps = st.sidebar.select_slider(
-    "FPS",
-    options=[
-        8,
-        10,
-        12,
-        15,
-        20,
-        24,
-    ],
-    value=12,
-)
-
-duration = st.sidebar.slider(
-    "Total duration (seconds)",
-    5.0,
-    16.0,
-    9.0,
-    0.5,
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.header("🚶 Slow Walk")
-
-walk_percent = st.sidebar.slider(
-    "Walking time (%)",
-    25,
-    65,
-    45,
-)
-
-settle_percent = st.sidebar.slider(
-    "Settle time (%)",
-    5,
-    25,
-    12,
-)
-
-entrance_side = st.sidebar.selectbox(
-    "Entrance side",
-    [
-        "Left",
-        "Right",
-    ],
-)
-
-step_count = st.sidebar.slider(
-    "Walking steps",
-    2,
-    12,
-    4,
-)
-
-bob_amount = st.sidebar.slider(
-    "Vertical motion",
-    0.0,
-    10.0,
-    2.5,
-    0.5,
-)
-
-sway_amount = st.sidebar.slider(
-    "Body sway",
-    0.0,
-    5.0,
-    1.2,
-    0.25,
-)
-
-motion_mode = st.sidebar.selectbox(
-    "Motion style",
-    MOTION_MODES,
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.header("✂️ Clean Extraction")
-
-outline_sensitivity = st.sidebar.slider(
-    "Outline sensitivity",
-    0,
-    100,
-    55,
-    help=(
-        "Higher values detect lighter/broken hand-drawn outlines. "
-        "If paper texture becomes selected, lower this."
-    ),
-)
-
-detail_strength = st.sidebar.slider(
-    "Interior colour/detail",
-    0,
-    100,
-    45,
-    help=(
-        "Controls how much coloured/pencil detail is retained "
-        "inside the detected character silhouette."
-    ),
-)
-
-padding = st.sidebar.slider(
-    "Character edge padding (%)",
-    2,
-    20,
-    8,
-)
-
-st.sidebar.markdown(
-    """
-**Recommended for your llama drawing**
-
-- Outline sensitivity: **45–60**
-- Interior colour/detail: **35–50**
-- Bounding box: tightly around the llama
-- Walking steps: **4**
-- Vertical motion: **2–3**
-- Body sway: **1–1.5**
-- Duration: **9–10 seconds**
-"""
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.header("🌅 Scene Merge")
-
-merge_smoothness = st.sidebar.slider(
-    "Merge smoothness",
-    1,
-    10,
-    7,
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.header("✨ Optional Colour Polish")
-
-enable_enhancement = st.sidebar.checkbox(
-    "Enable mild warmth",
-    value=False,
-)
-
-temp_shift = st.sidebar.slider(
-    "Warmth",
-    0,
-    20,
-    5,
-)
-
-
-# ============================================================
-# UPLOAD
-# ============================================================
-
-uploaded_files = st.file_uploader(
-    "Upload one or more drawings",
-    type=[
-        "jpg",
-        "jpeg",
-        "png",
-        "webp",
-    ],
-    accept_multiple_files=True,
-)
-
-if not uploaded_files:
-    st.info(
-        "Upload a drawing. Put the X/Y bounding box around the "
-        "character, not around the whole scene."
-    )
-    st.stop()
-
-
-# ============================================================
-# PROCESS
-# ============================================================
-
-zip_export_files = {}
-
-for idx, uploaded in enumerate(
-    uploaded_files
-):
-
-    st.markdown("---")
-
-    st.subheader(
-        f"🖼️ Drawing {idx + 1}: {uploaded.name}"
-    )
-
-    uploaded.seek(0)
-
-    file_bytes = np.asarray(
-        bytearray(
-            uploaded.read()
-        ),
-        dtype=np.uint8,
-    )
-
-    raw = cv2.imdecode(
-        file_bytes,
-        cv2.IMREAD_COLOR,
-    )
-
-    if raw is None:
-        st.error(
-            f"Could not read {uploaded.name}."
-        )
-        continue
-
-    raw = auto_rotate_vertical(
-        raw
-    )
-
-    if enable_enhancement:
-        image = enhance_color_temperature_and_warmth(
-            raw,
-            temp_shift=temp_shift,
-            saturation_boost=1.03,
-        )
-    else:
-        image = raw.copy()
-
-    image = resize_image(
-        image
-    )
-
-    # --------------------------------------------------------
-    # BOUNDING BOX
-    # --------------------------------------------------------
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        x_range = st.slider(
-            f"Character X range #{idx + 1}",
-            0,
-            100,
-            (15, 85),
-            key=f"x_{idx}_{uploaded.name}",
-        )
-
-    with c2:
-        y_range = st.slider(
-            f"Character Y range #{idx + 1}",
-            0,
-            100,
-            (10, 90),
-            key=f"y_{idx}_{uploaded.name}",
-        )
-
-    bbox_pct = [
-        x_range[0],
-        y_range[0],
-        x_range[1],
-        y_range[1],
-    ]
-
-    # --------------------------------------------------------
-    # EXTRACT
-    # --------------------------------------------------------
-
-    mask_preview, bbox = extract_character_mask(
-        image,
-        bbox_pct,
-        outline_sensitivity=outline_sensitivity,
-        detail_strength=detail_strength,
-    )
-
-    char_preview, alpha_preview, home_preview, char_bbox = crop_character(
-        image,
-        mask_preview,
-        padding_ratio=padding / 100.0,
-    )
-
-    # --------------------------------------------------------
-    # PREVIEWS
-    # --------------------------------------------------------
-
-    p1, p2, p3 = st.columns(3)
-
-    with p1:
-        st.image(
-            cv2.cvtColor(
-                image,
-                cv2.COLOR_BGR2RGB,
-            ),
-            caption="Original artwork",
-            width="stretch",
-        )
-
-    with p2:
-
-        overlay = image.copy()
-
-        red = np.zeros_like(
-            image
-        )
-
-        # OpenCV BGR: channel 2 is red.
-        red[:, :, 2] = 255
-
-        m = (
-            mask_preview.astype(
-                np.float32
-            )
-            /
-            255.0
-        )
-
-        m = m[:, :, None]
-
-        overlay = (
-            overlay.astype(
-                np.float32
-            )
-            *
-            (1.0 - 0.52 * m)
-            +
-            red.astype(
-                np.float32
-            )
-            *
-            (0.52 * m)
-        )
-
-        overlay = np.clip(
-            overlay,
-            0,
-            255,
-        ).astype(np.uint8)
-
-        st.image(
-            cv2.cvtColor(
-                overlay,
-                cv2.COLOR_BGR2RGB,
-            ),
-            caption=(
-                "Extraction preview — red = character"
-            ),
-            width="stretch",
-        )
-
-    with p3:
-
-        if char_preview is not None:
-
-            white = np.ones_like(
-                char_preview
-            ) * 255
-
-            a = (
-                alpha_preview.astype(
-                    np.float32
-                )
-                /
-                255.0
-            )
-
-            a = a[:, :, None]
-
-            isolated = (
-                char_preview.astype(
-                    np.float32
-                )
-                *
-                a
-                +
-                white.astype(
-                    np.float32
-                )
-                *
-                (1.0 - a)
-            )
-
-            isolated = np.clip(
-                isolated,
-                0,
-                255,
+        local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
+        fade_alpha = ease_in_out(min(1.0, local_t * 2.5))
+
+        if transparent_mode:
+            base_canvas = np.zeros((h, w, 4), dtype=np.uint8)
+            base_canvas = paste_layer(base_canvas, char_crop, alpha_crop, home_center[0], home_center[1])
+        else:
+            canvas_p1 = paste_layer(paper_bg.copy(), char_crop, alpha_crop, home_center[0], home_center[1])
+            if canvas_p1.shape[2] == 3:
+                canvas_p1 = cv2.cvtColor(canvas_p1, cv2.COLOR_BGR2BGRA)
+            orig_rgba = cv2.cvtColor(original_img, cv2.COLOR_BGR2BGRA) if original_img.shape[2] == 3 else original_img.copy()
+
+            base_canvas = np.clip(
+                canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + orig_rgba.astype(np.float32) * fade_alpha,
+                0, 255
             ).astype(np.uint8)
 
-            st.image(
-                cv2.cvtColor(
-                    isolated,
-                    cv2.COLOR_BGR2RGB,
-                ),
-                caption="Isolated character",
-                width="stretch",
-            )
+        ys, xs = np.where(color_mask > 20)
+        if len(xs) == 0:
+            return base_canvas
 
+        x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+        crop_c = original_img[y1:y2, x1:x2].copy()
+        crop_a = color_mask[y1:y2, x1:x2].copy()
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        pivot = (cx - x1, cy - y1)
+        phase_c = local_t * speed * math.pi * 2
+
+        if color_mode == "Seamless Wiggle & Sway":
+            angle = math.sin(phase_c) * strength
+            warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
+        elif color_mode == "Rhythmic Bounce & Stretch":
+            bounce = abs(math.sin(phase_c)) * strength * 0.5
+            scale_y = 1.0 + math.sin(phase_c) * (strength * 0.02)
+            scale_x = 1.0 - math.sin(phase_c) * (strength * 0.01)
+            warped_c, warped_a = transform_layer(
+                crop_c, crop_a, scale_x, scale_y, math.sin(phase_c * 0.5) * strength * 0.3, pivot
+            )
+            cy -= bounce
         else:
-            st.error(
-                "No character was detected."
-            )
+            angle = math.sin(phase_c * 0.5) * strength
+            warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
 
-    # --------------------------------------------------------
-    # MASK QUALITY INDICATOR
-    # --------------------------------------------------------
+        return paste_layer(base_canvas, warped_c, warped_a, cx, cy)
 
-    selected_ratio = (
-        np.count_nonzero(
-            mask_preview > 30
-        )
-        /
-        max(
-            1,
-            image.shape[0]
-            *
-            image.shape[1],
-        )
+
+def build_gif(frames, fps):
+    buffer = io.BytesIO()
+    prepared = [
+        Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGRA2RGBA if f.shape[2] == 4 else cv2.COLOR_BGR2RGB))
+        for f in frames
+    ]
+    duration = max(20, int(1000 / max(1, fps)))
+    prepared[0].save(
+        buffer, format="GIF", save_all=True, append_images=prepared[1:], duration=duration, loop=0, disposal=2
     )
-
-    if selected_ratio > 0.35:
-        st.warning(
-            "⚠️ The selected area is very large. "
-            "Tighten the X/Y bounding box or lower Outline sensitivity."
-        )
-
-    elif selected_ratio < 0.003:
-        st.warning(
-            "⚠️ Very little was selected. "
-            "Increase Outline sensitivity or slightly widen the bounding box."
-        )
-
-    else:
-        st.success(
-            f"✓ Character mask size looks reasonable "
-            f"({selected_ratio * 100:.1f}% of image)."
-        )
-
-    # --------------------------------------------------------
-    # PROCESS BUTTON
-    # --------------------------------------------------------
-
-    process = st.button(
-        f"🎬 Animate {uploaded.name}",
-        key=f"process_{idx}_{uploaded.name}",
-        type="primary",
-        width="stretch",
-    )
-
-    if not process:
-        continue
-
-    if char_preview is None:
-        st.error(
-            "The character could not be isolated."
-        )
-        continue
-
-    # --------------------------------------------------------
-    # BACKGROUND PLATE
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Creating clean background plate..."
-    ):
-        background_plate = create_background_plate(
-            image,
-            mask_preview,
-        )
-
-    st.image(
-        cv2.cvtColor(
-            background_plate,
-            cv2.COLOR_BGR2RGB,
-        ),
-        caption=(
-            "Background plate — only the character removed"
-        ),
-        width="stretch",
-    )
-
-    # --------------------------------------------------------
-    # CHARACTER
-    # --------------------------------------------------------
-
-    char_crop, char_alpha, home_center, char_bbox = crop_character(
-        image,
-        mask_preview,
-        padding_ratio=padding / 100.0,
-    )
-
-    if char_crop is None:
-        st.error(
-            "Character crop failed."
-        )
-        continue
-
-    frame_count = max(
-        12,
-        int(
-            round(
-                fps
-                *
-                duration
-            )
-        ),
-    )
-
-    walk_fraction = (
-        walk_percent
-        /
-        100.0
-    )
-
-    settle_fraction = (
-        settle_percent
-        /
-        100.0
-    )
-
-    progress = st.progress(
-        0,
-        text="Rendering slow walk...",
-    )
-
-    frames = []
-
-    for i in range(
-        frame_count
-    ):
-
-        t = (
-            i
-            /
-            max(
-                1,
-                frame_count - 1,
-            )
-        )
-
-        frame = render_frame(
-            original=image,
-            background_plate=background_plate,
-            char_crop=char_crop,
-            char_alpha=char_alpha,
-            home_center=home_center,
-            t=t,
-            walk_fraction=walk_fraction,
-            settle_fraction=settle_fraction,
-            mode=motion_mode,
-            step_count=step_count,
-            bob_amount=bob_amount,
-            sway_amount=sway_amount,
-            entrance_side=entrance_side,
-            merge_smoothness=merge_smoothness,
-        )
-
-        frames.append(frame)
-
-        progress.progress(
-            (i + 1)
-            /
-            frame_count,
-            text=(
-                f"Rendering frame "
-                f"{i + 1}/{frame_count}"
-            ),
-        )
-
-    progress.empty()
-
-    # --------------------------------------------------------
-    # EXPORT
-    # --------------------------------------------------------
-
-    gif_data = build_gif(
-        frames,
-        fps,
-    )
-
-    apng_data = build_apng(
-        frames,
-        fps,
-    )
-
-    base_name = os.path.splitext(
-        uploaded.name
-    )[0]
-
-    gif_name = (
-        f"natural_walk_{base_name}.gif"
-    )
-
-    apng_name = (
-        f"natural_walk_{base_name}.png"
-    )
-
-    zip_export_files[
-        gif_name
-    ] = gif_data
-
-    zip_export_files[
-        apng_name
-    ] = apng_data
-
-    st.markdown(
-        "### 🎬 Final animation"
-    )
-
-    st.image(
-        gif_data,
-        caption=(
-            "Slow walk → settle → merge into original artwork"
-        ),
-        width="stretch",
-    )
-
-    d1, d2 = st.columns(2)
-
-    with d1:
-        st.download_button(
-            "⬇️ Download GIF",
-            data=gif_data,
-            file_name=gif_name,
-            mime="image/gif",
-            key=f"gif_{idx}_{uploaded.name}",
-            width="stretch",
-        )
-
-    with d2:
-        st.download_button(
-            "⬇️ Download High-Quality APNG",
-            data=apng_data,
-            file_name=apng_name,
-            mime="image/png",
-            key=f"apng_{idx}_{uploaded.name}",
-            width="stretch",
-        )
+    return buffer.getvalue()
 
 
 # ============================================================
-# ZIP
+# STREAMLIT UI & CONTROLS
 # ============================================================
 
-if zip_export_files:
+st.sidebar.header("🎬 Global Animation Controls")
+fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
+duration = st.sidebar.slider("Total Sequence Duration (sec)", 4.0, 14.0, 7.0, 0.5)
 
+st.sidebar.markdown("---")
+st.sidebar.header("🚶 Gait Controls (Walk-In)")
+walk_percent = st.sidebar.slider("Walk-In Duration (%)", 30, 70, 50)
+bob_amount = st.sidebar.slider("Vertical Bobbing", 0.0, 10.0, 2.5)
+sway_amount = st.sidebar.slider("Body Sway Angle", 0.0, 5.0, 1.2)
+cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
+
+st.sidebar.markdown("---")
+st.sidebar.header("✂️ Clean Extraction")
+outline_sensitivity = st.sidebar.slider("Outline sensitivity", 0, 100, 55)
+detail_strength = st.sidebar.slider("Interior detail strength", 0, 100, 45)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎨 In-Scene Color Motion")
+color_mode = st.sidebar.selectbox("Color Motion Style", COLOR_ANIMATION_MODES)
+speed = st.sidebar.slider("Color Motion Speed", 1, 8, 4)
+strength = st.sidebar.slider("Motion Intensity", 1, 20, 8)
+
+uploaded_files = st.file_uploader(
+    "Upload Drawings (Select Multiple Files)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
+)
+
+if uploaded_files:
     st.markdown("---")
+    process_all = st.button("🚀 Process & Animate ALL Uploaded Files", type="primary", width="stretch")
 
-    st.subheader(
-        "📦 Bulk Download"
-    )
+    zip_export_files = {}
 
-    zip_buffer = io.BytesIO()
+    for idx, file in enumerate(uploaded_files):
+        st.markdown("---")
+        st.subheader(f"🖼️ Drawing {idx + 1}: {file.name}")
 
-    with zipfile.ZipFile(
-        zip_buffer,
-        "w",
-        zipfile.ZIP_DEFLATED,
-    ) as z:
+        file.seek(0)
+        file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+        raw_image = auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
+        image = resize_image(raw_image)
 
-        for name, data in zip_export_files.items():
-            z.writestr(
-                name,
-                data,
+        col_box1, col_box2 = st.columns(2)
+        with col_box1:
+            x_range = st.slider(f"Horizontal Bounding Box (X %) #{idx+1}", 0, 100, (15, 85), key=f"x_{idx}_{file.name}")
+        with col_box2:
+            y_range = st.slider(f"Vertical Bounding Box (Y %) #{idx+1}", 0, 100, (10, 90), key=f"y_{idx}_{file.name}")
+
+        bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
+
+        mask_preview, bbox = extract_character_mask(
+            image, bbox_pct, outline_sensitivity=outline_sensitivity, detail_strength=detail_strength
+        )
+        char_crop, alpha_crop, home_center, _ = crop_character(image, mask_preview)
+
+        detected_colors = extract_dominant_colors(image)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Artwork", width="stretch")
+        with c2:
+            selected_label = st.selectbox(
+                f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}_{file.name}"
+            )
+            selected_color = next(c for c in detected_colors if c["label"] == selected_label)
+            sharpness = st.slider(f"Color Sharpness #{idx+1}", 10, 60, 25, key=f"tol_{idx}_{file.name}")
+            color_mask = make_precise_color_mask(image, selected_color["bgr"], sharpness)
+            st.image(
+                cv2.cvtColor(cv2.bitwise_and(image, image, mask=color_mask), cv2.COLOR_BGR2RGB),
+                caption="Isolated Color Region", width="stretch"
             )
 
-    st.download_button(
-        "📦 Download All Animations",
-        data=zip_buffer.getvalue(),
-        file_name="natural_walk_animations.zip",
-        mime="application/zip",
-        type="primary",
-        width="stretch",
-    )
+        single_click = st.button(f"✨ Process & Animate ({file.name})", key=f"btn_{idx}_{file.name}", width="stretch")
 
+        if process_all or single_click:
+            with st.spinner(f"Processing {file.name}..."):
+                paper_bg = create_background_plate(image, mask_preview)
+
+            if char_crop is None:
+                st.error(f"Could not extract character from {file.name}.")
+                continue
+
+            frame_count = max(8, int(fps * duration))
+            walk_frac = walk_percent / 100.0
+
+            progress = st.progress(0, text=f"Rendering Full Scene for {file.name}...")
+            full_frames = []
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame = render_sequential_frame(
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=False
+                )
+                full_frames.append(frame)
+                progress.progress((i + 1) / frame_count)
+
+            progress.empty()
+
+            progress_trans = st.progress(0, text=f"Rendering Transparent Overlay for {file.name}...")
+            transparent_frames = []
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame_t = render_sequential_frame(
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=True
+                )
+                transparent_frames.append(frame_t)
+                progress_trans.progress((i + 1) / frame_count)
+
+            progress_trans.empty()
+
+            full_gif = build_gif(full_frames, fps)
+            trans_gif = build_gif(transparent_frames, fps)
+
+            st.session_state[f"res_full_{idx}_{file.name}"] = full_gif
+            st.session_state[f"res_trans_{idx}_{file.name}"] = trans_gif
+
+        if f"res_full_{idx}_{file.name}" in st.session_state:
+            full_gif = st.session_state[f"res_full_{idx}_{file.name}"]
+            trans_gif = st.session_state[f"res_trans_{idx}_{file.name}"]
+
+            zip_export_files[f"full_scene_{file.name}.gif"] = full_gif
+            zip_export_files[f"transparent_overlay_{file.name}.gif"] = trans_gif
+
+            st.subheader("🎬 Generated Previews & Downloads")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.markdown("**1. Full Scene Animated Sequence**")
+                st.image(full_gif, width="stretch")
+                st.download_button(
+                    "⬇️ Download Full Scene GIF", full_gif, f"full_scene_{file.name}.gif", "image/gif", key=f"dl_full_{idx}_{file.name}", width="stretch"
+                )
+            with p2:
+                st.markdown("**2. Transparent Overlay Sequence**")
+                st.image(trans_gif, width="stretch")
+                st.download_button(
+                    "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", key=f"dl_trans_{idx}_{file.name}", width="stretch"
+                )
+
+    if zip_export_files:
+        st.markdown("---")
+        st.subheader("📦 Bulk Download All Generated Animations")
+        
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_name, file_bytes in zip_export_files.items():
+                zip_file.writestr(file_name, file_bytes)
+
+        st.download_button(
+            "📦 Download All Animations (ZIP Archive)",
+            data=zip_buffer.getvalue(),
+            file_name="all_animated_drawings.zip",
+            mime="application/zip",
+            type="primary",
+            width="stretch",
+        )
