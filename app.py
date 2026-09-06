@@ -14,7 +14,7 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Hand-Drawn Walk Away Animator",
+    page_title="Hand-Drawn Character Walk Away Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -24,10 +24,15 @@ st.title("🎨 Hand-Drawn Character Walk-Away Animator")
 
 st.markdown(
     """
-Turn a single hand-drawn character into a simple frame-by-frame animation.
+Turn one hand-drawn scene into a simple frame-by-frame animation.
 
-**The character is separated from the background, then walks away from the
-canvas until it completely disappears.**
+### Animation concept
+
+**Character enters → stays → walks away → disappears**
+
+The character is separated from the background, while the original
+character location is reconstructed so there is no duplicate character
+left behind.
 
 No AI model is required.
 """
@@ -59,10 +64,11 @@ BACKGROUND_MODES = [
 
 
 # ============================================================
-# IMAGE HELPERS
+# BASIC IMAGE HELPERS
 # ============================================================
 
 def resize_image(image, max_size=MAX_IMAGE_SIZE):
+
     h, w = image.shape[:2]
 
     if max(h, w) <= max_size:
@@ -85,26 +91,26 @@ def bgr_to_rgb(image):
 
 
 # ============================================================
-# BACKGROUND ESTIMATION
+# BACKGROUND COLOR ESTIMATION
 # ============================================================
 
 def get_border_pixels(image, border_size=12):
-    """
-    Collect pixels from the outside border of the image.
-    These are assumed to mostly represent the paper/background.
-    """
 
     h, w = image.shape[:2]
 
     border_size = max(
         2,
-        min(border_size, h // 4, w // 4)
+        min(
+            border_size,
+            h // 4,
+            w // 4
+        )
     )
 
-    top = image[:border_size, :, :]
-    bottom = image[h - border_size:h, :, :]
-    left = image[:, :border_size, :]
-    right = image[:, w - border_size:w, :]
+    top = image[:border_size]
+    bottom = image[h - border_size:h]
+    left = image[:, :border_size]
+    right = image[:, w - border_size:w]
 
     pixels = np.concatenate(
         [
@@ -120,11 +126,6 @@ def get_border_pixels(image, border_size=12):
 
 
 def estimate_background_lab(image):
-    """
-    Estimate background color using the image border.
-    """
-
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
 
     border = get_border_pixels(image)
 
@@ -133,19 +134,32 @@ def estimate_background_lab(image):
         cv2.COLOR_BGR2LAB
     ).reshape(-1, 3)
 
-    median_lab = np.median(
+    return np.median(
         border_lab,
         axis=0
     ).astype(np.float32)
 
-    return median_lab
+
+def estimate_background_gray(image):
+
+    border = get_border_pixels(image)
+
+    border_gray = cv2.cvtColor(
+        border.reshape(-1, 1, 3),
+        cv2.COLOR_BGR2GRAY
+    ).reshape(-1)
+
+    return float(
+        np.median(border_gray)
+    )
 
 
 # ============================================================
-# FOREGROUND EXTRACTION
+# NORMALIZATION
 # ============================================================
 
 def normalize_map(values):
+
     values = values.astype(np.float32)
 
     mn = float(np.min(values))
@@ -156,25 +170,21 @@ def normalize_map(values):
 
     result = (values - mn) / (mx - mn)
 
-    return np.clip(result, 0.0, 1.0)
+    return np.clip(
+        result,
+        0.0,
+        1.0
+    )
 
 
-def build_foreground_mask(
+# ============================================================
+# RAW FOREGROUND SCORE
+# ============================================================
+
+def calculate_foreground_score(
     image,
-    sensitivity=50,
     background_mode="White / Light Paper",
 ):
-    """
-    Extract the complete hand-drawn character.
-
-    This combines:
-
-    - difference from estimated paper color
-    - luminance difference
-    - black-hat morphology
-    - local contrast
-    - edges
-    """
 
     h, w = image.shape[:2]
 
@@ -182,20 +192,34 @@ def build_foreground_mask(
     # LAB COLOR DIFFERENCE
     # --------------------------------------------------------
 
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-
-    bg_lab = estimate_background_lab(image)
-
-    diff = lab.astype(np.float32) - bg_lab.reshape(1, 1, 3)
-
-    color_distance = np.sqrt(
-        np.sum(diff * diff, axis=2)
+    lab = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2LAB
     )
 
-    color_distance = normalize_map(color_distance)
+    bg_lab = estimate_background_lab(
+        image
+    )
+
+    difference = (
+        lab.astype(np.float32)
+        -
+        bg_lab.reshape(1, 1, 3)
+    )
+
+    color_distance = np.sqrt(
+        np.sum(
+            difference * difference,
+            axis=2
+        )
+    )
+
+    color_distance = normalize_map(
+        color_distance
+    )
 
     # --------------------------------------------------------
-    # GRAYSCALE / DARKNESS
+    # GRAYSCALE
     # --------------------------------------------------------
 
     gray = cv2.cvtColor(
@@ -203,19 +227,25 @@ def build_foreground_mask(
         cv2.COLOR_BGR2GRAY
     )
 
-    border = get_border_pixels(image)
-
-    border_gray = cv2.cvtColor(
-        border.reshape(-1, 1, 3),
-        cv2.COLOR_BGR2GRAY
-    ).reshape(-1)
-
-    bg_gray = float(np.median(border_gray))
+    bg_gray = estimate_background_gray(
+        image
+    )
 
     if background_mode == "Dark Background":
-        darkness = gray.astype(np.float32) - bg_gray
+
+        darkness = (
+            gray.astype(np.float32)
+            -
+            bg_gray
+        )
+
     else:
-        darkness = bg_gray - gray.astype(np.float32)
+
+        darkness = (
+            bg_gray
+            -
+            gray.astype(np.float32)
+        )
 
     darkness = np.clip(
         darkness,
@@ -223,27 +253,39 @@ def build_foreground_mask(
         None
     )
 
-    darkness = normalize_map(darkness)
+    darkness = normalize_map(
+        darkness
+    )
 
     # --------------------------------------------------------
     # LOCAL CONTRAST
     # --------------------------------------------------------
 
+    sigma = max(
+        5,
+        min(h, w) / 80
+    )
+
     local_background = cv2.GaussianBlur(
         gray,
         (0, 0),
-        sigmaX=max(5, min(h, w) / 80)
+        sigmaX=sigma
     )
 
     if background_mode == "Dark Background":
+
         local_difference = (
             gray.astype(np.float32)
-            - local_background.astype(np.float32)
+            -
+            local_background.astype(np.float32)
         )
+
     else:
+
         local_difference = (
             local_background.astype(np.float32)
-            - gray.astype(np.float32)
+            -
+            gray.astype(np.float32)
         )
 
     local_difference = np.clip(
@@ -268,7 +310,7 @@ def build_foreground_mask(
     if kernel_size % 2 == 0:
         kernel_size += 1
 
-    blackhat_kernel = cv2.getStructuringElement(
+    kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (kernel_size, kernel_size)
     )
@@ -276,13 +318,15 @@ def build_foreground_mask(
     blackhat = cv2.morphologyEx(
         gray,
         cv2.MORPH_BLACKHAT,
-        blackhat_kernel
+        kernel
     )
 
-    blackhat = normalize_map(blackhat)
+    blackhat = normalize_map(
+        blackhat
+    )
 
     # --------------------------------------------------------
-    # EDGE STRUCTURE
+    # EDGES
     # --------------------------------------------------------
 
     blurred = cv2.GaussianBlur(
@@ -303,18 +347,26 @@ def build_foreground_mask(
         iterations=1
     )
 
-    edges = edges.astype(np.float32) / 255.0
+    edges = (
+        edges.astype(np.float32)
+        /
+        255.0
+    )
 
     # --------------------------------------------------------
-    # COMBINE SIGNALS
+    # COMBINED SCORE
     # --------------------------------------------------------
 
     score = (
         color_distance * 0.40
-        + darkness * 0.28
-        + local_difference * 0.12
-        + blackhat * 0.15
-        + edges * 0.05
+        +
+        darkness * 0.28
+        +
+        local_difference * 0.12
+        +
+        blackhat * 0.15
+        +
+        edges * 0.05
     )
 
     score = cv2.GaussianBlur(
@@ -323,11 +375,26 @@ def build_foreground_mask(
         0
     )
 
-    # --------------------------------------------------------
-    # THRESHOLD
-    # --------------------------------------------------------
+    return score
 
-    # Lower sensitivity = easier extraction
+
+# ============================================================
+# DETECT OBJECT COMPONENTS
+# ============================================================
+
+def detect_objects(
+    image,
+    sensitivity=50,
+    background_mode="White / Light Paper",
+):
+
+    h, w = image.shape[:2]
+
+    score = calculate_foreground_score(
+        image,
+        background_mode
+    )
+
     # Higher sensitivity = more selective
     percentile = np.clip(
         88 - sensitivity * 0.35,
@@ -344,53 +411,100 @@ def build_foreground_mask(
         score >= threshold
     ).astype(np.uint8) * 255
 
-    # --------------------------------------------------------
-    # RECOVER STRONG DARK/COLORED PIXELS
-    # --------------------------------------------------------
+    # Recover strong signals
+    color_distance = np.zeros_like(score)
+
+    lab = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2LAB
+    )
+
+    bg_lab = estimate_background_lab(
+        image
+    )
+
+    difference = (
+        lab.astype(np.float32)
+        -
+        bg_lab.reshape(1, 1, 3)
+    )
+
+    color_distance = normalize_map(
+        np.sqrt(
+            np.sum(
+                difference * difference,
+                axis=2
+            )
+        )
+    )
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    bg_gray = estimate_background_gray(
+        image
+    )
+
+    if background_mode == "Dark Background":
+
+        darkness = (
+            gray.astype(np.float32)
+            -
+            bg_gray
+        )
+
+    else:
+
+        darkness = (
+            bg_gray
+            -
+            gray.astype(np.float32)
+        )
+
+    darkness = normalize_map(
+        np.clip(
+            darkness,
+            0,
+            None
+        )
+    )
 
     strong_signal = (
-        color_distance > 0.22
-    ) | (
-        darkness > 0.20
-    ) | (
-        blackhat > 0.30
+        (color_distance > 0.20)
+        |
+        (darkness > 0.20)
+        |
+        (score > threshold * 0.65)
     )
 
     mask[
         strong_signal
-        & (score > threshold * 0.55)
+        &
+        (score > threshold * 0.50)
     ] = 255
 
     # --------------------------------------------------------
     # MORPHOLOGY
     # --------------------------------------------------------
 
-    close_kernel = np.ones(
-        (5, 5),
-        np.uint8
-    )
-
-    open_kernel = np.ones(
-        (3, 3),
-        np.uint8
-    )
-
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
-        close_kernel,
+        np.ones((5, 5), np.uint8),
         iterations=2
     )
 
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_OPEN,
-        open_kernel,
+        np.ones((3, 3), np.uint8),
         iterations=1
     )
 
     # --------------------------------------------------------
-    # CONNECTED COMPONENT FILTERING
+    # CONNECTED COMPONENTS
     # --------------------------------------------------------
 
     num_labels, labels, stats, centroids = (
@@ -400,192 +514,235 @@ def build_foreground_mask(
         )
     )
 
-    if num_labels <= 1:
-        return mask
-
-    total_area = h * w
-
     components = []
 
-    for i in range(1, num_labels):
+    minimum_area = max(
+        25,
+        int(h * w * 0.000025)
+    )
+
+    for label in range(
+        1,
+        num_labels
+    ):
 
         area = int(
-            stats[i, cv2.CC_STAT_AREA]
+            stats[
+                label,
+                cv2.CC_STAT_AREA
+            ]
         )
 
-        if area < max(
-            20,
-            int(total_area * 0.00003)
-        ):
+        if area < minimum_area:
             continue
 
-        x = int(stats[i, cv2.CC_STAT_LEFT])
-        y = int(stats[i, cv2.CC_STAT_TOP])
-        cw = int(stats[i, cv2.CC_STAT_WIDTH])
-        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        x = int(
+            stats[
+                label,
+                cv2.CC_STAT_LEFT
+            ]
+        )
 
-        cx, cy = centroids[i]
+        y = int(
+            stats[
+                label,
+                cv2.CC_STAT_TOP
+            ]
+        )
+
+        cw = int(
+            stats[
+                label,
+                cv2.CC_STAT_WIDTH
+            ]
+        )
+
+        ch = int(
+            stats[
+                label,
+                cv2.CC_STAT_HEIGHT
+            ]
+        )
+
+        cx, cy = centroids[label]
 
         components.append(
             {
-                "label": i,
+                "label": label,
                 "area": area,
                 "x": x,
                 "y": y,
                 "w": cw,
                 "h": ch,
-                "cx": cx,
-                "cy": cy,
+                "cx": float(cx),
+                "cy": float(cy),
             }
         )
 
-    if not components:
-        return mask
-
     components.sort(
-        key=lambda x: x["area"],
+        key=lambda c: c["area"],
         reverse=True
     )
 
-    # --------------------------------------------------------
-    # CHARACTER COMPONENT SELECTION
-    # --------------------------------------------------------
+    return mask, labels, components
 
-    largest_area = components[0]["area"]
 
-    selected = []
+# ============================================================
+# BUILD OBJECT PREVIEW
+# ============================================================
 
-    center_x = w / 2
-    center_y = h / 2
+def make_object_preview(
+    image,
+    labels,
+    components
+):
 
-    for comp in components:
+    preview = image.copy()
 
-        area_ratio = (
-            comp["area"]
-            / max(1, largest_area)
+    display_components = components[:20]
+
+    for index, comp in enumerate(
+        display_components
+    ):
+
+        x = comp["x"]
+        y = comp["y"]
+        w = comp["w"]
+        h = comp["h"]
+
+        # Bounding box
+        cv2.rectangle(
+            preview,
+            (x, y),
+            (x + w, y + h),
+            (0, 0, 255),
+            2
         )
 
-        distance = math.sqrt(
+        text_x = x + 5
+        text_y = max(
+            25,
+            y + 25
+        )
+
+        # Filled label background
+        cv2.rectangle(
+            preview,
             (
-                comp["cx"] - center_x
-            ) ** 2
-            +
+                text_x - 3,
+                text_y - 22
+            ),
             (
-                comp["cy"] - center_y
-            ) ** 2
+                text_x + 55,
+                text_y + 5
+            ),
+            (255, 255, 255),
+            -1
         )
 
-        normalized_distance = (
-            distance
-            /
-            max(1, math.sqrt(w * w + h * h))
+        cv2.putText(
+            preview,
+            str(index + 1),
+            (
+                text_x,
+                text_y
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
         )
 
-        # Keep large components.
-        if area_ratio >= 0.08:
-            selected.append(comp["label"])
+    return preview
+
+
+# ============================================================
+# CREATE SELECTED CHARACTER MASK
+# ============================================================
+
+def create_character_mask(
+    labels,
+    components,
+    selected_indices
+):
+
+    mask = np.zeros(
+        labels.shape,
+        dtype=np.uint8
+    )
+
+    for index in selected_indices:
+
+        if index < 0:
             continue
 
-        # Keep reasonably large components close
-        # to the main character.
-        if (
-            area_ratio >= 0.015
-            and normalized_distance < 0.35
-        ):
-            selected.append(comp["label"])
+        if index >= len(components):
+            continue
 
-    if not selected:
-        selected = [
-            components[0]["label"]
-        ]
+        label = components[index]["label"]
 
-    clean_mask = np.zeros_like(mask)
-
-    for label in selected:
-        clean_mask[
+        mask[
             labels == label
         ] = 255
 
-    # --------------------------------------------------------
-    # CONTOUR FILL
-    # --------------------------------------------------------
-
-    contours, _ = cv2.findContours(
-        clean_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    filled = np.zeros_like(
-        clean_mask
-    )
-
-    for contour in contours:
-
-        area = cv2.contourArea(
-            contour
-        )
-
-        if area < 20:
-            continue
-
-        cv2.drawContours(
-            filled,
-            [contour],
-            -1,
-            255,
-            thickness=cv2.FILLED
-        )
-
-    # Combine original fine details with filled body.
-    combined = cv2.bitwise_or(
-        clean_mask,
-        filled
-    )
-
-    # --------------------------------------------------------
-    # FINAL SMOOTHING
-    # --------------------------------------------------------
-
-    combined = cv2.morphologyEx(
-        combined,
-        cv2.MORPH_CLOSE,
-        np.ones((5, 5), np.uint8),
-        iterations=1
-    )
-
-    return combined
+    return mask
 
 
 # ============================================================
-# MASK REFINEMENT
+# IMPROVE CHARACTER MASK
 # ============================================================
 
-def refine_mask(mask, feather=2):
-    mask = mask.astype(np.uint8)
+def refine_character_mask(
+    mask,
+    dilation=2,
+    feather=2
+):
 
-    # Remove tiny holes.
+    mask = mask.astype(
+        np.uint8
+    )
+
+    # Connect nearby pieces
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
         np.ones((5, 5), np.uint8),
-        iterations=1
+        iterations=2
     )
 
-    # Small dilation prevents cutting off outlines.
-    mask = cv2.dilate(
-        mask,
-        np.ones((3, 3), np.uint8),
-        iterations=1
-    )
+    # Slightly expand to preserve outlines
+    if dilation > 0:
 
-    # Feather edge.
+        kernel_size = (
+            dilation * 2 + 1
+        )
+
+        mask = cv2.dilate(
+            mask,
+            np.ones(
+                (
+                    kernel_size,
+                    kernel_size
+                ),
+                np.uint8
+            ),
+            iterations=1
+        )
+
+    # Smooth edges
     if feather > 0:
-        kernel = feather * 2 + 1
+
+        kernel_size = (
+            feather * 2 + 1
+        )
 
         mask = cv2.GaussianBlur(
             mask,
-            (kernel, kernel),
+            (
+                kernel_size,
+                kernel_size
+            ),
             0
         )
 
@@ -593,7 +750,7 @@ def refine_mask(mask, feather=2):
 
 
 # ============================================================
-# CHARACTER EXTRACTION
+# EXTRACT CHARACTER
 # ============================================================
 
 def extract_character(
@@ -601,9 +758,6 @@ def extract_character(
     mask,
     margin=20
 ):
-    """
-    Return cropped BGR image + alpha mask.
-    """
 
     ys, xs = np.where(
         mask > 20
@@ -632,7 +786,7 @@ def extract_character(
         int(np.max(ys)) + margin + 1
     )
 
-    crop = image[
+    character = image[
         y1:y2,
         x1:x2
     ].copy()
@@ -642,58 +796,95 @@ def extract_character(
         x1:x2
     ].copy()
 
-    return crop, alpha, (
+    bbox = (
         x1,
         y1,
         x2,
         y2
     )
 
+    return (
+        character,
+        alpha,
+        bbox
+    )
+
 
 # ============================================================
-# BACKGROUND RECONSTRUCTION
+# RECONSTRUCT EMPTY BACKGROUND
 # ============================================================
 
 def reconstruct_background(
     image,
-    mask,
-    strength=7
+    character_mask,
+    inpaint_strength=7,
+    extra_margin=8
 ):
-    """
-    Remove the character from its original location
-    using OpenCV inpainting.
-    """
 
-    inpaint_mask = mask.copy()
+    # IMPORTANT:
+    # Only the MAIN CHARACTER gets removed.
+    # Other selected background objects are untouched.
 
-    inpaint_mask = cv2.dilate(
-        inpaint_mask,
-        np.ones((7, 7), np.uint8),
-        iterations=2
-    )
+    mask = character_mask.copy()
 
-    # Don't attempt absurdly large inpainting areas.
+    if extra_margin > 0:
+
+        kernel_size = (
+            extra_margin * 2 + 1
+        )
+
+        mask = cv2.dilate(
+            mask,
+            np.ones(
+                (
+                    kernel_size,
+                    kernel_size
+                ),
+                np.uint8
+            ),
+            iterations=1
+        )
+
     coverage = (
-        np.count_nonzero(inpaint_mask)
+        np.count_nonzero(mask)
         /
-        float(inpaint_mask.size)
+        float(mask.size)
     )
 
-    if coverage > 0.65:
+    # Safety check
+    if coverage > 0.70:
         return image.copy()
 
+    # First Telea pass
     background = cv2.inpaint(
         image,
-        inpaint_mask,
-        strength,
+        mask,
+        inpaint_strength,
         cv2.INPAINT_TELEA
     )
+
+    # Second gentle Navier-Stokes pass
+    # helps larger white-paper areas
+    try:
+
+        background = cv2.inpaint(
+            background,
+            mask,
+            max(
+                3,
+                inpaint_strength // 2
+            ),
+            cv2.INPAINT_NS
+        )
+
+    except Exception:
+        pass
 
     return background
 
 
 # ============================================================
-# TRANSPARENT CHARACTER PREVIEW
+# CHECKERBOARD
 # ============================================================
 
 def checkerboard(
@@ -701,26 +892,49 @@ def checkerboard(
     height,
     square=20
 ):
+
     result = np.zeros(
-        (height, width, 3),
+        (
+            height,
+            width,
+            3
+        ),
         dtype=np.uint8
     )
 
-    for y in range(0, height, square):
-        for x in range(0, width, square):
+    for y in range(
+        0,
+        height,
+        square
+    ):
+
+        for x in range(
+            0,
+            width,
+            square
+        ):
 
             if (
                 (x // square + y // square)
                 % 2
                 == 0
             ):
+
                 value = 225
+
             else:
+
                 value = 245
 
             result[
-                y:min(y + square, height),
-                x:min(x + square, width)
+                y:min(
+                    y + square,
+                    height
+                ),
+                x:min(
+                    x + square,
+                    width
+                )
             ] = value
 
     return result
@@ -730,6 +944,7 @@ def composite_character_preview(
     character,
     alpha
 ):
+
     h, w = character.shape[:2]
 
     bg = checkerboard(
@@ -739,17 +954,20 @@ def composite_character_preview(
 
     a = (
         alpha.astype(np.float32)
-        / 255.0
+        /
+        255.0
     )
 
     a = a[:, :, None]
 
     result = (
         character.astype(np.float32)
-        * a
+        *
+        a
         +
         bg.astype(np.float32)
-        * (1 - a)
+        *
+        (1 - a)
     )
 
     return np.clip(
@@ -764,6 +982,7 @@ def composite_character_preview(
 # ============================================================
 
 def smoothstep(t):
+
     t = np.clip(
         t,
         0.0,
@@ -776,6 +995,7 @@ def smoothstep(t):
 
 
 def ease_in_out(t):
+
     t = np.clip(
         t,
         0.0,
@@ -787,82 +1007,144 @@ def ease_in_out(t):
         -
         0.5
         *
-        math.cos(math.pi * t)
+        math.cos(
+            math.pi * t
+        )
     )
 
 
 # ============================================================
-# WALK TRAJECTORY
+# POSITION HELPERS
 # ============================================================
 
-def get_start_center(
-    bbox,
-    canvas_w,
-    canvas_h
+def direction_vector(
+    direction
 ):
+
+    vectors = {
+
+        "Right": (1, 0),
+
+        "Left": (-1, 0),
+
+        "Down": (0, 1),
+
+        "Up": (0, -1),
+
+        "Diagonal Down-Right": (
+            1,
+            1
+        ),
+
+        "Diagonal Down-Left": (
+            -1,
+            1
+        ),
+
+        "Diagonal Up-Right": (
+            1,
+            -1
+        ),
+
+        "Diagonal Up-Left": (
+            -1,
+            -1
+        ),
+    }
+
+    return vectors.get(
+        direction,
+        (1, 0)
+    )
+
+
+def get_original_center(
+    bbox
+):
+
     x1, y1, x2, y2 = bbox
 
     return (
-        (x1 + x2) / 2,
-        (y1 + y2) / 2
+        (x1 + x2) / 2.0,
+        (y1 + y2) / 2.0
     )
 
 
-def get_exit_center(
-    start_x,
-    start_y,
+def get_outside_position(
+    center,
     char_w,
     char_h,
     canvas_w,
     canvas_h,
-    direction
+    direction,
+    extra_distance=1.5
 ):
-    margin_x = char_w * 1.4
-    margin_y = char_h * 1.4
+
+    cx, cy = center
+
+    margin_x = (
+        char_w
+        *
+        extra_distance
+    )
+
+    margin_y = (
+        char_h
+        *
+        extra_distance
+    )
 
     if direction == "Right":
+
         return (
             canvas_w + margin_x,
-            start_y
+            cy
         )
 
     if direction == "Left":
+
         return (
             -margin_x,
-            start_y
+            cy
         )
 
     if direction == "Down":
+
         return (
-            start_x,
+            cx,
             canvas_h + margin_y
         )
 
     if direction == "Up":
+
         return (
-            start_x,
+            cx,
             -margin_y
         )
 
     if direction == "Diagonal Down-Right":
+
         return (
             canvas_w + margin_x,
             canvas_h + margin_y
         )
 
     if direction == "Diagonal Down-Left":
+
         return (
             -margin_x,
             canvas_h + margin_y
         )
 
     if direction == "Diagonal Up-Right":
+
         return (
             canvas_w + margin_x,
             -margin_y
         )
 
     if direction == "Diagonal Up-Left":
+
         return (
             -margin_x,
             -margin_y
@@ -870,67 +1152,285 @@ def get_exit_center(
 
     return (
         canvas_w + margin_x,
-        start_y
+        cy
     )
 
 
-def walking_position(
-    t,
-    start,
-    exit_pos,
+# ============================================================
+# WALKING SEQUENCE
+# ============================================================
+
+def sequence_position(
+    global_t,
+    original_center,
+    char_w,
+    char_h,
+    canvas_w,
+    canvas_h,
+    direction,
+    walk_in_fraction,
+    stay_fraction,
+    walk_out_fraction,
     bob_amount,
     sway_amount,
-    cycles
+    cycles,
+    start_scale,
+    end_scale,
 ):
-    """
-    Calculate character center for a frame.
-    """
 
-    motion_t = ease_in_out(t)
+    # --------------------------------------------------------
+    # NORMALIZE SECTIONS
+    # --------------------------------------------------------
 
-    sx, sy = start
-    ex, ey = exit_pos
+    total = (
+        walk_in_fraction
+        +
+        stay_fraction
+        +
+        walk_out_fraction
+    )
+
+    if total <= 0:
+        total = 1.0
+
+    walk_in_end = (
+        walk_in_fraction
+        /
+        total
+    )
+
+    stay_end = (
+        (
+            walk_in_fraction
+            +
+            stay_fraction
+        )
+        /
+        total
+    )
+
+    # --------------------------------------------------------
+    # POSITIONS
+    # --------------------------------------------------------
+
+    outside = get_outside_position(
+        original_center,
+        char_w,
+        char_h,
+        canvas_w,
+        canvas_h,
+        direction,
+        extra_distance=1.7
+    )
+
+    # --------------------------------------------------------
+    # WALK IN
+    # --------------------------------------------------------
+
+    if global_t < walk_in_end:
+
+        local_t = (
+            global_t
+            /
+            max(
+                walk_in_end,
+                1e-6
+            )
+        )
+
+        movement = ease_in_out(
+            local_t
+        )
+
+        x = (
+            outside[0]
+            +
+            (
+                original_center[0]
+                -
+                outside[0]
+            )
+            *
+            movement
+        )
+
+        y = (
+            outside[1]
+            +
+            (
+                original_center[1]
+                -
+                outside[1]
+            )
+            *
+            movement
+        )
+
+        phase = (
+            local_t
+            *
+            cycles
+            *
+            math.pi
+            *
+            2
+        )
+
+        bob = (
+            math.sin(phase)
+            *
+            bob_amount
+        )
+
+        sway = (
+            math.sin(
+                phase
+                +
+                math.pi / 2
+            )
+            *
+            sway_amount
+        )
+
+        scale = start_scale
+
+        return (
+            x,
+            y + bob,
+            sway,
+            scale
+        )
+
+    # --------------------------------------------------------
+    # STAY
+    # --------------------------------------------------------
+
+    if global_t < stay_end:
+
+        local_t = (
+            (
+                global_t
+                -
+                walk_in_end
+            )
+            /
+            max(
+                stay_end
+                -
+                walk_in_end,
+                1e-6
+            )
+        )
+
+        # Very subtle breathing while standing
+        breathing = (
+            math.sin(
+                local_t
+                *
+                math.pi
+                *
+                2
+            )
+            *
+            min(
+                bob_amount * 0.18,
+                3
+            )
+        )
+
+        return (
+            original_center[0],
+            original_center[1] + breathing,
+            0.0,
+            start_scale
+        )
+
+    # --------------------------------------------------------
+    # WALK OUT
+    # --------------------------------------------------------
+
+    local_t = (
+        (
+            global_t
+            -
+            stay_end
+        )
+        /
+        max(
+            1.0
+            -
+            stay_end,
+            1e-6
+        )
+    )
+
+    movement = ease_in_out(
+        local_t
+    )
 
     x = (
-        sx
+        original_center[0]
         +
-        (ex - sx)
-        * motion_t
+        (
+            outside[0]
+            -
+            original_center[0]
+        )
+        *
+        movement
     )
 
     y = (
-        sy
+        original_center[1]
         +
-        (ey - sy)
-        * motion_t
+        (
+            outside[1]
+            -
+            original_center[1]
+        )
+        *
+        movement
     )
 
-    # Walking bob.
-    # It gradually becomes less noticeable near the end.
-    bob_fade = 1.0 - smoothstep(
-        max(0.0, (t - 0.75) / 0.25)
+    phase = (
+        local_t
+        *
+        cycles
+        *
+        math.pi
+        *
+        2
+    )
+
+    # Less bobbing near the exit
+    bob_fade = (
+        1.0
+        -
+        smoothstep(
+            max(
+                0.0,
+                (
+                    local_t
+                    -
+                    0.70
+                )
+                /
+                0.30
+            )
+        )
     )
 
     bob = (
-        math.sin(
-            2
-            * math.pi
-            * cycles
-            * t
-        )
-        * bob_amount
-        * bob_fade
+        math.sin(phase)
+        *
+        bob_amount
+        *
+        bob_fade
     )
 
-    y += bob
-
-    # Small body sway.
     sway = (
         math.sin(
-            2
-            * math.pi
-            * cycles
-            * t
+            phase
             +
             math.pi / 2
         )
@@ -940,11 +1440,28 @@ def walking_position(
         bob_fade
     )
 
-    return x, y, sway
+    scale = (
+        start_scale
+        +
+        (
+            end_scale
+            -
+            start_scale
+        )
+        *
+        ease_in_out(local_t)
+    )
+
+    return (
+        x,
+        y + bob,
+        sway,
+        scale
+    )
 
 
 # ============================================================
-# CHARACTER TRANSFORMATION
+# TRANSFORM CHARACTER
 # ============================================================
 
 def transform_character(
@@ -953,7 +1470,13 @@ def transform_character(
     scale,
     angle
 ):
+
     h, w = character.shape[:2]
+
+    scale = max(
+        0.05,
+        float(scale)
+    )
 
     new_w = max(
         2,
@@ -967,19 +1490,25 @@ def transform_character(
 
     resized = cv2.resize(
         character,
-        (new_w, new_h),
+        (
+            new_w,
+            new_h
+        ),
         interpolation=cv2.INTER_LINEAR
     )
 
     resized_alpha = cv2.resize(
         alpha,
-        (new_w, new_h),
+        (
+            new_w,
+            new_h
+        ),
         interpolation=cv2.INTER_LINEAR
     )
 
     center = (
-        new_w / 2,
-        new_h / 2
+        new_w / 2.0,
+        new_h / 2.0
     )
 
     matrix = cv2.getRotationMatrix2D(
@@ -988,19 +1517,30 @@ def transform_character(
         1.0
     )
 
-    cos = abs(matrix[0, 0])
-    sin = abs(matrix[0, 1])
-
-    bound_w = int(
-        new_h * sin
-        +
-        new_w * cos
+    cos = abs(
+        matrix[0, 0]
     )
 
-    bound_h = int(
-        new_h * cos
-        +
-        new_w * sin
+    sin = abs(
+        matrix[0, 1]
+    )
+
+    bound_w = max(
+        2,
+        int(
+            new_h * sin
+            +
+            new_w * cos
+        )
+    )
+
+    bound_h = max(
+        2,
+        int(
+            new_h * cos
+            +
+            new_w * sin
+        )
     )
 
     matrix[0, 2] += (
@@ -1015,29 +1555,38 @@ def transform_character(
         center[1]
     )
 
-    rotated = cv2.warpAffine(
+    transformed = cv2.warpAffine(
         resized,
         matrix,
-        (bound_w, bound_h),
+        (
+            bound_w,
+            bound_h
+        ),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255)
     )
 
-    rotated_alpha = cv2.warpAffine(
+    transformed_alpha = cv2.warpAffine(
         resized_alpha,
         matrix,
-        (bound_w, bound_h),
+        (
+            bound_w,
+            bound_h
+        ),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0
     )
 
-    return rotated, rotated_alpha
+    return (
+        transformed,
+        transformed_alpha
+    )
 
 
 # ============================================================
-# COMPOSITING
+# COMPOSITE CHARACTER
 # ============================================================
 
 def paste_character(
@@ -1048,24 +1597,35 @@ def paste_character(
     center_y,
     fade=1.0
 ):
+
     canvas = background.copy()
 
-    h, w = character.shape[:2]
+    char_h, char_w = character.shape[:2]
 
     x1 = int(
-        round(center_x - w / 2)
+        round(
+            center_x
+            -
+            char_w / 2
+        )
     )
 
     y1 = int(
-        round(center_y - h / 2)
+        round(
+            center_y
+            -
+            char_h / 2
+        )
     )
 
-    x2 = x1 + w
-    y2 = y1 + h
+    x2 = x1 + char_w
+    y2 = y1 + char_h
 
-    canvas_h, canvas_w = canvas.shape[:2]
+    canvas_h, canvas_w = (
+        canvas.shape[:2]
+    )
 
-    # Completely outside.
+    # Completely outside
     if (
         x2 <= 0
         or
@@ -1075,18 +1635,48 @@ def paste_character(
         or
         y1 >= canvas_h
     ):
+
         return canvas
 
-    # Clip to canvas.
-    cx1 = max(0, x1)
-    cy1 = max(0, y1)
-    cx2 = min(canvas_w, x2)
-    cy2 = min(canvas_h, y2)
+    # Clip
+    cx1 = max(
+        0,
+        x1
+    )
+
+    cy1 = max(
+        0,
+        y1
+    )
+
+    cx2 = min(
+        canvas_w,
+        x2
+    )
+
+    cy2 = min(
+        canvas_h,
+        y2
+    )
 
     src_x1 = cx1 - x1
     src_y1 = cy1 - y1
-    src_x2 = src_x1 + (cx2 - cx1)
-    src_y2 = src_y1 + (cy2 - cy1)
+
+    src_x2 = (
+        src_x1
+        +
+        (
+            cx2 - cx1
+        )
+    )
+
+    src_y2 = (
+        src_y1
+        +
+        (
+            cy2 - cy1
+        )
+    )
 
     char_crop = character[
         src_y1:src_y2,
@@ -1099,36 +1689,40 @@ def paste_character(
     ]
 
     a = (
-        alpha_crop.astype(np.float32)
-        / 255.0
+        alpha_crop.astype(
+            np.float32
+        )
+        /
+        255.0
     )
 
     a *= float(
         np.clip(
             fade,
-            0,
-            1
+            0.0,
+            1.0
         )
     )
 
     a = a[:, :, None]
 
-    background_crop = canvas[
+    bg_crop = canvas[
         cy1:cy2,
         cx1:cx2
-    ].astype(np.float32)
-
-    foreground = (
-        char_crop.astype(np.float32)
-        * a
+    ].astype(
+        np.float32
     )
 
     result = (
-        foreground
-        +
-        background_crop
+        char_crop.astype(
+            np.float32
+        )
         *
-        (1 - a)
+        a
+        +
+        bg_crop
+        *
+        (1.0 - a)
     )
 
     canvas[
@@ -1138,52 +1732,61 @@ def paste_character(
         result,
         0,
         255
-    ).astype(np.uint8)
+    ).astype(
+        np.uint8
+    )
 
     return canvas
 
 
 # ============================================================
-# RENDER ONE FRAME
+# RENDER FRAME
 # ============================================================
 
-def render_walk_frame(
+def render_frame(
     background,
     character,
     alpha,
-    t,
-    start,
-    exit_pos,
-    end_scale,
+    global_t,
+    original_center,
+    char_w,
+    char_h,
+    canvas_w,
+    canvas_h,
+    direction,
+    walk_in_fraction,
+    stay_fraction,
+    walk_out_fraction,
     bob_amount,
     sway_amount,
     cycles,
+    start_scale,
+    end_scale,
     fade_at_end,
 ):
-    canvas_h, canvas_w = background.shape[:2]
 
-    x, y, walking_sway = walking_position(
-        t,
-        start,
-        exit_pos,
+    (
+        x,
+        y,
+        angle,
+        scale
+    ) = sequence_position(
+        global_t,
+        original_center,
+        char_w,
+        char_h,
+        canvas_w,
+        canvas_h,
+        direction,
+        walk_in_fraction,
+        stay_fraction,
+        walk_out_fraction,
         bob_amount,
         sway_amount,
-        cycles
+        cycles,
+        start_scale,
+        end_scale
     )
-
-    # Scale changes from 100% to user-selected end scale.
-    scale = (
-        1.0
-        +
-        (
-            end_scale
-            - 1.0
-        )
-        * ease_in_out(t)
-    )
-
-    # Slight walking rotation.
-    angle = walking_sway
 
     transformed_character, transformed_alpha = (
         transform_character(
@@ -1194,14 +1797,22 @@ def render_walk_frame(
         )
     )
 
-    # Optional disappearance fade.
-    if fade_at_end and t > 0.82:
-        fade = 1.0 - (
-            (t - 0.82)
-            / 0.18
+    # Optional fade ONLY near final exit.
+    fade = 1.0
+
+    if fade_at_end and global_t > 0.92:
+
+        fade = (
+            1.0
+            -
+            (
+                global_t
+                -
+                0.92
+            )
+            /
+            0.08
         )
-    else:
-        fade = 1.0
 
     return paste_character(
         background,
@@ -1220,23 +1831,25 @@ def render_walk_frame(
 def make_contact_sheet(
     frames,
     columns=4,
+    thumb_width=260,
     max_width=1000
 ):
+
     if not frames:
         return None
 
     thumbs = []
 
     for frame in frames:
+
         h, w = frame.shape[:2]
 
-        thumb_w = 260
         thumb_h = max(
             1,
             int(
                 h
                 *
-                thumb_w
+                thumb_width
                 /
                 max(1, w)
             )
@@ -1244,24 +1857,31 @@ def make_contact_sheet(
 
         thumb = cv2.resize(
             frame,
-            (thumb_w, thumb_h),
+            (
+                thumb_width,
+                thumb_h
+            ),
             interpolation=cv2.INTER_AREA
         )
 
-        thumbs.append(thumb)
+        thumbs.append(
+            thumb
+        )
 
     rows = math.ceil(
-        len(thumbs) / columns
+        len(thumbs)
+        /
+        columns
     )
 
     cell_h = max(
-        x.shape[0]
-        for x in thumbs
+        t.shape[0]
+        for t in thumbs
     )
 
     cell_w = max(
-        x.shape[1]
-        for x in thumbs
+        t.shape[1]
+        for t in thumbs
     )
 
     sheet = np.ones(
@@ -1273,13 +1893,24 @@ def make_contact_sheet(
         dtype=np.uint8
     ) * 255
 
-    for i, thumb in enumerate(thumbs):
+    for i, thumb in enumerate(
+        thumbs
+    ):
 
         row = i // columns
         col = i % columns
 
-        y = row * cell_h
-        x = col * cell_w
+        x = (
+            col
+            *
+            cell_w
+        )
+
+        y = (
+            row
+            *
+            cell_h
+        )
 
         sheet[
             y:y + thumb.shape[0],
@@ -1297,8 +1928,16 @@ def make_contact_sheet(
         sheet = cv2.resize(
             sheet,
             (
-                int(sheet.shape[1] * scale),
-                int(sheet.shape[0] * scale)
+                int(
+                    sheet.shape[1]
+                    *
+                    scale
+                ),
+                int(
+                    sheet.shape[0]
+                    *
+                    scale
+                )
             ),
             interpolation=cv2.INTER_AREA
         )
@@ -1307,13 +1946,14 @@ def make_contact_sheet(
 
 
 # ============================================================
-# GIF EXPORT
+# GIF
 # ============================================================
 
 def build_gif(
     frames,
     fps
 ):
+
     if not frames:
         return None
 
@@ -1323,7 +1963,9 @@ def build_gif(
 
     duration = max(
         20,
-        int(1000 / fps)
+        int(
+            1000 / fps
+        )
     )
 
     for frame in frames:
@@ -1335,9 +1977,14 @@ def build_gif(
 
         pil = Image.fromarray(
             rgb
-        ).convert("P", palette=Image.ADAPTIVE)
+        ).convert(
+            "P",
+            palette=Image.ADAPTIVE
+        )
 
-        prepared.append(pil)
+        prepared.append(
+            pil
+        )
 
     prepared[0].save(
         buffer,
@@ -1353,13 +2000,14 @@ def build_gif(
 
 
 # ============================================================
-# MP4 EXPORT
+# MP4
 # ============================================================
 
 def build_mp4(
     frames,
     fps
 ):
+
     if not frames:
         return None
 
@@ -1382,14 +2030,20 @@ def build_mp4(
             temp_path,
             fourcc,
             fps,
-            (w, h)
+            (
+                w,
+                h
+            )
         )
 
         if not writer.isOpened():
             return None
 
         for frame in frames:
-            writer.write(frame)
+
+            writer.write(
+                frame
+            )
 
         writer.release()
 
@@ -1397,16 +2051,23 @@ def build_mp4(
             temp_path,
             "rb"
         ) as f:
+
             return f.read()
 
     except Exception:
+
         return None
 
     finally:
 
-        if os.path.exists(temp_path):
+        if os.path.exists(
+            temp_path
+        ):
+
             try:
-                os.remove(temp_path)
+                os.remove(
+                    temp_path
+                )
             except Exception:
                 pass
 
@@ -1431,23 +2092,59 @@ fps = st.sidebar.select_slider(
         12,
         15,
         20,
-        24,
-        30,
+        24
     ],
     value=12
 )
 
 duration = st.sidebar.slider(
-    "Animation Duration",
-    min_value=1.0,
-    max_value=8.0,
-    value=3.0,
+    "Total Animation Duration",
+    min_value=2.0,
+    max_value=10.0,
+    value=5.0,
     step=0.5
 )
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("🚶 Walking Motion")
+st.sidebar.header(
+    "🚶 Character Timing"
+)
+
+walk_in_percent = st.sidebar.slider(
+    "Walk In",
+    min_value=0,
+    max_value=50,
+    value=25,
+    step=5
+)
+
+stay_percent = st.sidebar.slider(
+    "Stay In Scene",
+    min_value=0,
+    max_value=70,
+    value=30,
+    step=5
+)
+
+walk_out_percent = st.sidebar.slider(
+    "Walk Out",
+    min_value=10,
+    max_value=70,
+    value=45,
+    step=5
+)
+
+st.sidebar.caption(
+    "The percentages are automatically normalized. "
+    "For example: 25% walk in → 30% stay → 45% walk out."
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.header(
+    "🚶 Walking Motion"
+)
 
 bob_amount = st.sidebar.slider(
     "Walking Bob",
@@ -1466,13 +2163,15 @@ sway_amount = st.sidebar.slider(
 cycles = st.sidebar.slider(
     "Walking Steps",
     min_value=1,
-    max_value=12,
-    value=5
+    max_value=15,
+    value=6
 )
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("📏 Walking Away")
+st.sidebar.header(
+    "📏 Walking Away"
+)
 
 end_scale_percent = st.sidebar.slider(
     "Final Character Size",
@@ -1483,18 +2182,20 @@ end_scale_percent = st.sidebar.slider(
 )
 
 st.sidebar.caption(
-    "100% = same size while walking out. "
-    "Smaller values create a stronger 'walking away into distance' effect."
+    "100% = character keeps the same size. "
+    "Smaller values make the character appear to walk into the distance."
 )
 
 fade_at_end = st.sidebar.checkbox(
-    "Fade slightly at the very end",
+    "Fade at very end",
     value=False
 )
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("🎨 Character Extraction")
+st.sidebar.header(
+    "🎨 Character Extraction"
+)
 
 background_mode = st.sidebar.selectbox(
     "Background Type",
@@ -1510,8 +2211,8 @@ sensitivity = st.sidebar.slider(
 )
 
 st.sidebar.caption(
-    "Increase sensitivity if too much background is being selected. "
-    "Decrease it if parts of the character are missing."
+    "Higher values select less background. "
+    "Lower values help recover faint parts of the character."
 )
 
 
@@ -1520,7 +2221,7 @@ st.sidebar.caption(
 # ============================================================
 
 uploaded = st.file_uploader(
-    "Upload your hand-drawn character",
+    "Upload your hand-drawn scene",
     type=[
         "jpg",
         "jpeg",
@@ -1531,7 +2232,7 @@ uploaded = st.file_uploader(
 
 
 # ============================================================
-# MAIN PROCESSING
+# MAIN APPLICATION
 # ============================================================
 
 if uploaded is not None:
@@ -1555,9 +2256,11 @@ if uploaded is not None:
         )
 
         if image is None:
+
             st.error(
                 "Could not read the uploaded image."
             )
+
             st.stop()
 
         image = resize_image(
@@ -1568,41 +2271,29 @@ if uploaded is not None:
         h, w = image.shape[:2]
 
         # ----------------------------------------------------
-        # EXTRACT CHARACTER
+        # DETECT OBJECTS
         # ----------------------------------------------------
 
         with st.spinner(
-            "🔍 Separating character from background..."
+            "🔍 Detecting objects in the drawing..."
         ):
 
-            mask = build_foreground_mask(
-                image,
-                sensitivity=sensitivity,
-                background_mode=background_mode
-            )
-
-            mask = refine_mask(
-                mask,
-                feather=2
-            )
-
-            character, alpha, bbox = (
-                extract_character(
+            raw_mask, labels, components = (
+                detect_objects(
                     image,
-                    mask,
-                    margin=20
+                    sensitivity=sensitivity,
+                    background_mode=background_mode
                 )
             )
 
-        if character is None:
+        if not components:
 
             st.error(
-                "❌ I could not detect a character in this image."
+                "❌ No foreground objects could be detected."
             )
 
             st.info(
-                "Try lowering Foreground Sensitivity or "
-                "using a clearer image with a light background."
+                "Try lowering Foreground Sensitivity."
             )
 
             st.image(
@@ -1613,51 +2304,215 @@ if uploaded is not None:
             st.stop()
 
         # ----------------------------------------------------
-        # CHARACTER SIZE CHECK
+        # OBJECT PREVIEW
         # ----------------------------------------------------
 
-        char_h, char_w = character.shape[:2]
-
-        character_area = (
-            char_w
-            *
-            char_h
+        st.subheader(
+            "🎯 Choose the Main Character"
         )
 
-        image_area = (
-            w
-            *
-            h
+        st.markdown(
+            """
+The numbered boxes below are detected foreground objects.
+
+**Select ONLY the objects that belong to the character.**
+
+Everything else will remain in the scene as a stationary
+background object.
+"""
         )
 
-        if character_area > image_area * 0.95:
+        object_preview = make_object_preview(
+            image,
+            labels,
+            components
+        )
 
-            st.warning(
-                "⚠️ The detected character occupies almost "
-                "the entire image. Background separation "
-                "may need adjustment."
+        st.image(
+            bgr_to_rgb(object_preview),
+            use_container_width=True
+        )
+
+        # ----------------------------------------------------
+        # OBJECT SELECTOR
+        # ----------------------------------------------------
+
+        max_objects = min(
+            len(components),
+            20
+        )
+
+        object_options = []
+
+        for i in range(
+            max_objects
+        ):
+
+            comp = components[i]
+
+            object_options.append(
+                (
+                    f"Object {i + 1} "
+                    f"— area {comp['area']} "
+                    f"— {comp['w']}×{comp['h']}"
+                )
             )
 
+        # Automatically suggest largest central object(s)
+        center_x = w / 2.0
+        center_y = h / 2.0
+
+        suggested = []
+
+        for i, comp in enumerate(
+            components[:max_objects]
+        ):
+
+            distance = math.sqrt(
+                (
+                    comp["cx"]
+                    -
+                    center_x
+                ) ** 2
+                +
+                (
+                    comp["cy"]
+                    -
+                    center_y
+                ) ** 2
+            )
+
+            normalized_distance = (
+                distance
+                /
+                max(
+                    1,
+                    math.sqrt(
+                        w * w
+                        +
+                        h * h
+                    )
+                )
+            )
+
+            area_ratio = (
+                comp["area"]
+                /
+                max(
+                    1,
+                    components[0]["area"]
+                )
+            )
+
+            if (
+                i == 0
+                or
+                (
+                    area_ratio > 0.12
+                    and
+                    normalized_distance < 0.40
+                )
+            ):
+
+                suggested.append(
+                    object_options[i]
+                )
+
+        selected_object_labels = st.multiselect(
+            "Main Character Objects",
+            object_options,
+            default=suggested,
+            help=(
+                "Select all detected pieces that belong "
+                "to the character. Trees, chairs, balls, "
+                "houses, etc. that are not selected will "
+                "stay in the background."
+            )
+        )
+
+        selected_indices = [
+            object_options.index(label)
+            for label in selected_object_labels
+        ]
+
         # ----------------------------------------------------
-        # BACKGROUND RECONSTRUCTION
+        # WARNING
+        # ----------------------------------------------------
+
+        if not selected_indices:
+
+            st.warning(
+                "⚠️ Select at least one object as the main character."
+            )
+
+            st.stop()
+
+        # ----------------------------------------------------
+        # BUILD CHARACTER MASK
+        # ----------------------------------------------------
+
+        character_mask = create_character_mask(
+            labels,
+            components,
+            selected_indices
+        )
+
+        # Slightly connect selected character pieces
+        character_mask = refine_character_mask(
+            character_mask,
+            dilation=2,
+            feather=2
+        )
+
+        # ----------------------------------------------------
+        # EXTRACT CHARACTER
         # ----------------------------------------------------
 
         with st.spinner(
-            "🧹 Reconstructing background..."
+            "✂️ Extracting complete character..."
+        ):
+
+            character, alpha, bbox = (
+                extract_character(
+                    image,
+                    character_mask,
+                    margin=20
+                )
+            )
+
+        if character is None:
+
+            st.error(
+                "❌ Could not extract the selected character."
+            )
+
+            st.stop()
+
+        char_h, char_w = character.shape[:2]
+
+        # ----------------------------------------------------
+        # RECONSTRUCT BACKGROUND
+        # ----------------------------------------------------
+
+        with st.spinner(
+            "🧹 Removing the character from the original scene..."
         ):
 
             background = reconstruct_background(
                 image,
-                mask,
-                strength=7
+                character_mask,
+                inpaint_strength=7,
+                extra_margin=8
             )
 
         # ----------------------------------------------------
         # PREVIEWS
         # ----------------------------------------------------
 
+        st.markdown("---")
+
         st.subheader(
-            "🔍 Extraction Preview"
+            "🔍 Scene Separation"
         )
 
         c1, c2, c3 = st.columns(3)
@@ -1665,7 +2520,7 @@ if uploaded is not None:
         with c1:
 
             st.markdown(
-                "**Original**"
+                "**Original Scene**"
             )
 
             st.image(
@@ -1676,23 +2531,27 @@ if uploaded is not None:
         with c2:
 
             st.markdown(
-                "**Detected Character**"
+                "**Extracted Main Character**"
             )
 
-            preview = composite_character_preview(
-                character,
-                alpha
+            character_preview = (
+                composite_character_preview(
+                    character,
+                    alpha
+                )
             )
 
             st.image(
-                bgr_to_rgb(preview),
+                bgr_to_rgb(
+                    character_preview
+                ),
                 use_container_width=True
             )
 
         with c3:
 
             st.markdown(
-                "**Clean Background**"
+                "**Character Removed / Clean Background**"
             )
 
             st.image(
@@ -1701,39 +2560,54 @@ if uploaded is not None:
             )
 
         # ----------------------------------------------------
-        # EXTRACTION QUALITY INFORMATION
+        # IMPORTANT INFORMATION
+        # ----------------------------------------------------
+
+        st.info(
+            "🧠 The animation uses the CLEAN BACKGROUND as its base. "
+            "The extracted character is then placed on top of it "
+            "frame-by-frame. This prevents the original character "
+            "from remaining behind when it walks away."
+        )
+
+        # ----------------------------------------------------
+        # METRICS
         # ----------------------------------------------------
 
         st.markdown("---")
 
-        info1, info2, info3, info4 = st.columns(4)
+        frame_count = max(
+            8,
+            int(
+                fps * duration
+            )
+        )
 
-        with info1:
+        m1, m2, m3, m4 = st.columns(4)
+
+        with m1:
+
             st.metric(
                 "Canvas",
                 f"{w} × {h}"
             )
 
-        with info2:
+        with m2:
+
             st.metric(
                 "Character",
                 f"{char_w} × {char_h}"
             )
 
-        with info3:
-            frame_count = max(
-                8,
-                int(
-                    fps * duration
-                )
-            )
+        with m3:
 
             st.metric(
                 "Frames",
                 frame_count
             )
 
-        with info4:
+        with m4:
+
             st.metric(
                 "FPS",
                 fps
@@ -1744,7 +2618,7 @@ if uploaded is not None:
         # ----------------------------------------------------
 
         generate = st.button(
-            "✨ Generate Walk-Away Animation",
+            "✨ Generate Walk-In → Stay → Walk-Out",
             type="primary",
             use_container_width=True
         )
@@ -1757,38 +2631,16 @@ if uploaded is not None:
             )
 
             # ------------------------------------------------
-            # START / EXIT POSITIONS
+            # ORIGINAL CHARACTER CENTER
             # ------------------------------------------------
 
-            start_x, start_y = (
-                get_start_center(
-                    bbox,
-                    w,
-                    h
+            original_center = (
+                get_original_center(
+                    bbox
                 )
             )
 
-            exit_x, exit_y = (
-                get_exit_center(
-                    start_x,
-                    start_y,
-                    char_w,
-                    char_h,
-                    w,
-                    h,
-                    direction
-                )
-            )
-
-            start = (
-                start_x,
-                start_y
-            )
-
-            exit_pos = (
-                exit_x,
-                exit_y
-            )
+            start_scale = 1.0
 
             end_scale = (
                 end_scale_percent
@@ -1796,8 +2648,38 @@ if uploaded is not None:
                 100.0
             )
 
+            # Normalize timing
+            total_timing = (
+                walk_in_percent
+                +
+                stay_percent
+                +
+                walk_out_percent
+            )
+
+            if total_timing <= 0:
+                total_timing = 100.0
+
+            walk_in_fraction = (
+                walk_in_percent
+                /
+                total_timing
+            )
+
+            stay_fraction = (
+                stay_percent
+                /
+                total_timing
+            )
+
+            walk_out_fraction = (
+                walk_out_percent
+                /
+                total_timing
+            )
+
             # ------------------------------------------------
-            # RENDER FRAMES
+            # RENDER
             # ------------------------------------------------
 
             frames = []
@@ -1807,27 +2689,40 @@ if uploaded is not None:
             ):
 
                 if frame_count <= 1:
+
                     t = 1.0
+
                 else:
+
                     t = (
                         i
                         /
                         (
-                            frame_count - 1
+                            frame_count
+                            -
+                            1
                         )
                     )
 
-                frame = render_walk_frame(
+                frame = render_frame(
                     background=background,
                     character=character,
                     alpha=alpha,
-                    t=t,
-                    start=start,
-                    exit_pos=exit_pos,
-                    end_scale=end_scale,
+                    global_t=t,
+                    original_center=original_center,
+                    char_w=char_w,
+                    char_h=char_h,
+                    canvas_w=w,
+                    canvas_h=h,
+                    direction=direction,
+                    walk_in_fraction=walk_in_fraction,
+                    stay_fraction=stay_fraction,
+                    walk_out_fraction=walk_out_fraction,
                     bob_amount=bob_amount,
                     sway_amount=sway_amount,
                     cycles=cycles,
+                    start_scale=start_scale,
+                    end_scale=end_scale,
                     fade_at_end=fade_at_end,
                 )
 
@@ -1836,7 +2731,9 @@ if uploaded is not None:
                 )
 
                 progress.progress(
-                    (i + 1)
+                    (
+                        i + 1
+                    )
                     /
                     frame_count,
                     text=(
@@ -1852,7 +2749,7 @@ if uploaded is not None:
             # ------------------------------------------------
 
             st.subheader(
-                "🎞️ Frame-by-Frame Movement"
+                "🎞️ Frame-by-Frame Animation"
             )
 
             contact = make_contact_sheet(
@@ -1917,8 +2814,14 @@ if uploaded is not None:
             safe_direction = (
                 direction
                 .lower()
-                .replace(" ", "_")
-                .replace("-", "_")
+                .replace(
+                    " ",
+                    "_"
+                )
+                .replace(
+                    "-",
+                    "_"
+                )
             )
 
             with d1:
@@ -1929,7 +2832,9 @@ if uploaded is not None:
                         "⬇️ Download GIF",
                         data=gif_data,
                         file_name=(
-                            f"character_walk_"
+                            "character_"
+                            "walk_in_stay_"
+                            f"walk_out_"
                             f"{safe_direction}.gif"
                         ),
                         mime="image/gif",
@@ -1944,7 +2849,9 @@ if uploaded is not None:
                         "🎞️ Download MP4",
                         data=mp4_data,
                         file_name=(
-                            f"character_walk_"
+                            "character_"
+                            "walk_in_stay_"
+                            "walk_out_"
                             f"{safe_direction}.mp4"
                         ),
                         mime="video/mp4",
@@ -1952,19 +2859,34 @@ if uploaded is not None:
                     )
 
             # ------------------------------------------------
-            # FINAL INFORMATION
+            # SUCCESS
             # ------------------------------------------------
 
             st.success(
                 "✅ Animation generated! "
-                "The character progressively leaves the canvas, "
-                "while the reconstructed background remains behind."
+                "The character walks into the scene, stays, "
+                "and then walks completely away while the "
+                "original character location remains a "
+                "reconstructed background."
             )
 
-            st.info(
-                "💡 For a stronger 'walking away into the distance' "
-                "effect, try Final Character Size = 50–70%. "
-                "For simply walking out of the scene, keep it at 100%."
+            st.markdown(
+                """
+### 💡 Recommended settings
+
+For a natural little story animation:
+
+- **Walk In:** 20–30%
+- **Stay:** 25–35%
+- **Walk Out:** 40–50%
+- **FPS:** 12–15
+- **Walking Steps:** 5–7
+- **Final Character Size:** 100% for simply leaving the scene
+- **Final Character Size:** 50–70% for a stronger "walking into distance" effect
+
+If your character should simply enter, pause, and then leave,
+keep the final size at **100%**.
+"""
             )
 
     except Exception as e:
