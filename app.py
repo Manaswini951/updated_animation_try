@@ -28,7 +28,8 @@ st.markdown(
 1. **Clean Extraction:** Isolates character outline cleanly without grabbing paper textures or scenery.
 2. **Smooth Walk-In & Merge:** Starts on a pure white canvas, character walks in, then cross-fades slowly into the real scene.
 3. **Targeted In-Scene Color Motion:** Wiggles/bounces ONLY the selected color pixels with HSV discrimination.
-4. **Dual Export & Bulk ZIP:** Generates both Full Scene and Transparent Overlay GIFs, plus a bulk ZIP download.
+4. **Decorative Overlays:** Floating butterflies drifting randomly across the scene.
+5. **Dual Export & Bulk ZIP:** Generates both Full Scene and Transparent Overlay GIFs, plus a bulk ZIP download.
 """
 )
 
@@ -405,6 +406,52 @@ def make_precise_color_mask(image, target_bgr, sharpness=25):
 
 
 # ============================================================
+# PROCEDURAL BUTTERFLY OVERLAY
+# ============================================================
+
+def draw_butterflies_overlay(canvas, global_t, num_butterflies=5, seed=42):
+    """
+    Draws procedurally animated floating butterflies over the canvas.
+    No extra asset files needed—drawn directly using OpenCV shapes.
+    """
+    h, w = canvas.shape[:2]
+    np.random.seed(seed)
+    
+    # Define a few butterfly colors (BGR)
+    colors = [
+        (238, 130, 238),  # Soft Purple / Pink
+        (255, 191, 0),    # Gold / Yellow
+        (255, 144, 30),   # Light Blue
+        (180, 105, 255),  # Hot Pink
+    ]
+
+    for i in range(num_butterflies):
+        base_x = (0.15 + 0.7 * np.random.rand()) * w
+        base_y = (0.15 + 0.7 * np.random.rand()) * h
+        color = colors[i % len(colors)]
+        scale = 0.6 + 0.5 * np.random.rand()
+        
+        freq_x = 1.2 + 0.5 * i
+        freq_y = 0.8 + 0.4 * i
+        offset_x = math.sin(global_t * math.pi * 2 * freq_x + i) * (0.12 * w)
+        offset_y = math.cos(global_t * math.pi * 2 * freq_y + i * 2) * (0.08 * h)
+
+        cx = int(base_x + offset_x)
+        cy = int(base_y + offset_y)
+
+        flap = abs(math.sin(global_t * math.pi * 14 + i * 3))
+        wing_w = max(2, int(14 * scale * flap))
+        wing_h = max(2, int(10 * scale))
+
+        if 0 < cx < w and 0 < cy < h:
+            cv2.ellipse(canvas, (cx - wing_w // 2, cy - 2), (wing_w, wing_h), -15, 0, 360, color, -1)
+            cv2.ellipse(canvas, (cx + wing_w // 2, cy - 2), (wing_w, wing_h), 15, 0, 360, color, -1)
+            cv2.line(canvas, (cx, cy - wing_h), (cx, cy + wing_h), (40, 40, 40), max(1, int(2 * scale)))
+
+    return canvas
+
+
+# ============================================================
 # LAYER TRANSFORMATIONS & RENDERING ENGINE
 # ============================================================
 
@@ -470,7 +517,8 @@ def ease_in_out(t):
 
 def render_sequential_frame(
     original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask,
-    global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength, transparent_mode=False
+    global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength,
+    enable_butterflies=True, num_butterflies=5, transparent_mode=False
 ):
     h, w = original_img.shape[:2]
 
@@ -489,11 +537,10 @@ def render_sequential_frame(
 
         if transparent_mode:
             canvas = np.zeros((h, w, 4), dtype=np.uint8)
-            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+            frame = paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
         else:
-            # Start on a completely white canvas (255, 255, 255)
             canvas = np.full((h, w, 3), 255, dtype=np.uint8)
-            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+            frame = paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
 
     # PHASE 2: CROSS-FADE FROM WHITE CANVAS TO REAL IMAGE & IN-SCENE COLOR MOTION
     else:
@@ -504,14 +551,12 @@ def render_sequential_frame(
             base_canvas = np.zeros((h, w, 4), dtype=np.uint8)
             base_canvas = paste_layer(base_canvas, char_crop, alpha_crop, home_center[0], home_center[1])
         else:
-            # Prepare pure white base with character in home position
             white_bg = np.full((h, w, 3), 255, dtype=np.uint8)
             canvas_p1 = paste_layer(white_bg, char_crop, alpha_crop, home_center[0], home_center[1])
             if canvas_p1.shape[2] == 3:
                 canvas_p1 = cv2.cvtColor(canvas_p1, cv2.COLOR_BGR2BGRA)
             orig_rgba = cv2.cvtColor(original_img, cv2.COLOR_BGR2BGRA) if original_img.shape[2] == 3 else original_img.copy()
 
-            # Cross-fade from white_bg+char (canvas_p1) to original image (orig_rgba)
             base_canvas = np.clip(
                 canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + orig_rgba.astype(np.float32) * fade_alpha,
                 0, 255
@@ -519,34 +564,40 @@ def render_sequential_frame(
 
         ys, xs = np.where(color_mask > 20)
         if len(xs) == 0:
-            return base_canvas
+            frame = base_canvas
+        else:
+            x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+            crop_c = original_img[y1:y2, x1:x2].copy()
+            crop_a = color_mask[y1:y2, x1:x2].copy()
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            pivot = (cx - x1, cy - y1)
+            phase_c = local_t * speed * math.pi * 2
 
-        x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
-        crop_c = original_img[y1:y2, x1:x2].copy()
-        crop_a = color_mask[y1:y2, x1:x2].copy()
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        pivot = (cx - x1, cy - y1)
-        phase_c = local_t * speed * math.pi * 2
+            if color_mode == "Seamless Wiggle & Sway":
+                angle = math.sin(phase_c) * strength
+                warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
+            elif color_mode == "Rhythmic Bounce & Stretch":
+                bounce = abs(math.sin(phase_c)) * strength * 0.5
+                scale_y = 1.0 + math.sin(phase_c) * (strength * 0.02)
+                scale_x = 1.0 - math.sin(phase_c) * (strength * 0.01)
+                warped_c, warped_a = transform_layer(
+                    crop_c, crop_a, scale_x, scale_y, math.sin(phase_c * 0.5) * strength * 0.3, pivot
+                )
+                cy -= bounce
+            elif color_mode == "Glowing Zoom In/Out":
+                scale = 1.0 + math.sin(phase_c) * (strength * 0.015)
+                warped_c, warped_a = transform_layer(crop_c, crop_a, scale, scale, 0.0, pivot)
+            else: # Storytelling Speech Cadence
+                angle = math.sin(phase_c * 0.5) * strength
+                warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
 
-        if color_mode == "Seamless Wiggle & Sway":
-            angle = math.sin(phase_c) * strength
-            warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
-        elif color_mode == "Rhythmic Bounce & Stretch":
-            bounce = abs(math.sin(phase_c)) * strength * 0.5
-            scale_y = 1.0 + math.sin(phase_c) * (strength * 0.02)
-            scale_x = 1.0 - math.sin(phase_c) * (strength * 0.01)
-            warped_c, warped_a = transform_layer(
-                crop_c, crop_a, scale_x, scale_y, math.sin(phase_c * 0.5) * strength * 0.3, pivot
-            )
-            cy -= bounce
-        elif color_mode == "Glowing Zoom In/Out":
-            scale = 1.0 + math.sin(phase_c) * (strength * 0.015)
-            warped_c, warped_a = transform_layer(crop_c, crop_a, scale, scale, 0.0, pivot)
-        else: # Storytelling Speech Cadence
-            angle = math.sin(phase_c * 0.5) * strength
-            warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
+            frame = paste_layer(base_canvas, warped_c, warped_a, cx, cy)
 
-        return paste_layer(base_canvas, warped_c, warped_a, cx, cy)
+    # OVERLAY BUTTERFLIES
+    if enable_butterflies:
+        frame = draw_butterflies_overlay(frame, global_t, num_butterflies=num_butterflies)
+
+    return frame
 
 
 def build_gif(frames, fps):
@@ -587,6 +638,11 @@ st.sidebar.header("🎨 In-Scene Color Motion")
 color_mode = st.sidebar.selectbox("Color Motion Style", COLOR_ANIMATION_MODES)
 speed = st.sidebar.slider("Color Motion Speed", 1, 8, 4)
 strength = st.sidebar.slider("Motion Intensity", 1, 20, 8)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🦋 Decorative Overlays")
+enable_butterflies = st.sidebar.checkbox("Overlay Flying Butterflies", value=True)
+num_butterflies = st.sidebar.slider("Number of Butterflies", 1, 10, 5)
 
 uploaded_files = st.file_uploader(
     "Upload Drawings (Select Multiple Files)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
@@ -655,7 +711,8 @@ if uploaded_files:
                 t = i / max(1, frame_count - 1)
                 frame = render_sequential_frame(
                     image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
-                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=False
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength,
+                    enable_butterflies=enable_butterflies, num_butterflies=num_butterflies, transparent_mode=False
                 )
                 full_frames.append(frame)
                 progress.progress((i + 1) / frame_count)
@@ -668,7 +725,8 @@ if uploaded_files:
                 t = i / max(1, frame_count - 1)
                 frame_t = render_sequential_frame(
                     image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
-                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=True
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength,
+                    enable_butterflies=enable_butterflies, num_butterflies=num_butterflies, transparent_mode=True
                 )
                 transparent_frames.append(frame_t)
                 progress_trans.progress((i + 1) / frame_count)
