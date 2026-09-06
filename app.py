@@ -10,38 +10,31 @@ from PIL import Image
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="Hand-Drawn Character Merge & Reveal Animator",
-    page_icon="🎨",
+    page_icon="🦒",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Character Merge & Reveal Animator")
+st.title("🦒 Hand-Drawn Character Precise Merge Animator")
 
 st.markdown(
     """
-Animate one or two drawn characters walking in slowly from opposite directions, 
-meeting at their original spots, and then cross-fading smoothly into your complete hand-drawn scene!
+Upload your hand-drawn drawing (like a giraffe!). The character will walk smoothly onto 
+a clean canvas from off-screen, settle into its exact drawn position, and seamlessly cross-fade into your original paper drawing.
 """
 )
 
+MAX_IMAGE_SIZE = 1000
+
 
 # ============================================================
-# CONSTANTS & UTILITIES
+# ROBUST CHARACTER EXTRACTION
 # ============================================================
-
-MAX_IMAGE_SIZE = 1100
-
-BACKGROUND_MODES = [
-    "White / Light Paper",
-    "Dark Background",
-    "Automatic",
-]
-
 
 def resize_image(image, max_size=MAX_IMAGE_SIZE):
     h, w = image.shape[:2]
@@ -51,101 +44,71 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
     return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def bgr_to_rgb(image):
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-
-def ease_in_out(t):
-    t = np.clip(t, 0.0, 1.0)
-    return 0.5 - 0.5 * math.cos(math.pi * t)
-
-
-# ============================================================
-# BACKGROUND ESTIMATION & FOREGROUND DETECTION
-# ============================================================
-
-def estimate_background_lab(image):
+def extract_paper_background(image):
+    """Samples edge pixels to reconstruct a uniform paper canvas."""
     h, w = image.shape[:2]
-    border_size = max(2, min(12, h // 4, w // 4))
-    pixels = np.concatenate(
-        [
-            image[:border_size].reshape(-1, 3),
-            image[h - border_size:].reshape(-1, 3),
-            image[:, :border_size].reshape(-1, 3),
-            image[:, w - border_size:].reshape(-1, 3),
-        ],
-        axis=0,
-    )
-    border_lab = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3)
-    return np.median(border_lab, axis=0).astype(np.float32)
+    border_pixels = np.concatenate([
+        image[:15, :].reshape(-1, 3),
+        image[-15:, :].reshape(-1, 3),
+        image[:, :15].reshape(-1, 3),
+        image[:, -15:].reshape(-1, 3)
+    ], axis=0)
+    bg_color = np.median(border_pixels, axis=0).astype(np.uint8)
+    canvas = np.full_like(image, bg_color)
+    return canvas
 
 
-def detect_objects(image, sensitivity=50, background_mode="White / Light Paper"):
-    h, w = image.shape[:2]
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    bg_lab = estimate_background_lab(image)
-
-    diff = lab.astype(np.float32) - bg_lab.reshape(1, 1, 3)
-    color_dist = np.sqrt(np.sum(diff * diff, axis=2))
-    color_dist = (color_dist - color_dist.min()) / max(1e-6, (color_dist.max() - color_dist.min()))
-
+def extract_character_robust(image):
+    """Extracts high-contrast line art + colored fills (e.g. yellow giraffe + black lines)."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    bg_gray = np.median(gray)
-
-    darkness = bg_gray - gray.astype(np.float32) if background_mode != "Dark Background" else gray.astype(np.float32) - bg_gray
-    darkness = np.clip(darkness, 0, None)
-    darkness = (darkness - darkness.min()) / max(1e-6, (darkness.max() - darkness.min()))
-
-    score = cv2.GaussianBlur(color_dist * 0.6 + darkness * 0.4, (5, 5), 0)
-    percentile = np.clip(88 - sensitivity * 0.35, 65, 90)
-    threshold = np.percentile(score, percentile)
-
-    mask = (score >= threshold).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    components = []
-    min_area = max(25, int(h * w * 0.000025))
-
-    for label in range(1, num_labels):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < min_area:
-            continue
-        x, y = int(stats[label, cv2.CC_STAT_LEFT]), int(stats[label, cv2.CC_STAT_TOP])
-        cw, ch = int(stats[label, cv2.CC_STAT_WIDTH]), int(stats[label, cv2.CC_STAT_HEIGHT])
-        cx, cy = centroids[label]
-        components.append({"label": label, "area": area, "x": x, "y": y, "w": cw, "h": ch, "cx": float(cx), "cy": float(cy)})
-
-    components.sort(key=lambda c: c["area"], reverse=True)
-    return labels, components
-
-
-def extract_single_character(image, labels, comp):
-    mask = (labels == comp["label"]).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
-    mask = cv2.GaussianBlur(mask, (5, 5), 0)
-
-    x1, y1 = max(0, comp["x"] - 15), max(0, comp["y"] - 15)
-    x2, y2 = min(image.shape[1], comp["x"] + comp["w"] + 15), min(image.shape[0], comp["y"] + comp["h"] + 15)
-
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    
+    # Adaptive thresholding to catch outlines + dark spots
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 3
+    )
+    
+    # HSV thresholding for vivid fills (Yellow, Brown, Red, etc.)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    _, sat_thresh = cv2.threshold(sat, 35, 255, cv2.THRESH_BINARY)
+    
+    # Combine lines and color regions
+    combined_mask = cv2.bitwise_or(thresh, sat_thresh)
+    
+    # Morphological closing to fill gaps inside the drawing
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    closed_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    
+    # Get largest connected component (Main Character)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed_mask)
+    if num_labels <= 1:
+        return None, None, None, None
+        
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    char_mask = (labels == largest_label).astype(np.uint8) * 255
+    
+    # Smooth edges
+    char_mask = cv2.GaussianBlur(char_mask, (5, 5), 0)
+    
+    ys, xs = np.where(char_mask > 20)
+    if len(xs) == 0:
+        return None, None, None, None
+        
+    x1, y1 = max(0, np.min(xs) - 5), max(0, np.min(ys) - 5)
+    x2, y2 = min(image.shape[1], np.max(xs) + 5), min(image.shape[0], np.max(ys) + 5)
+    
     char_crop = image[y1:y2, x1:x2].copy()
-    alpha_crop = mask[y1:y2, x1:x2].copy()
-
-    return {"crop": char_crop, "alpha": alpha_crop, "center": (comp["cx"], comp["cy"]), "w": x2 - x1, "h": y2 - y1}
-
-
-def build_estimated_background(image, labels, selected_labels):
-    mask = np.zeros(labels.shape, dtype=np.uint8)
-    for lbl in selected_labels:
-        mask[labels == lbl] = 255
-    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=2)
-    return cv2.inpaint(image, mask, 7, cv2.INPAINT_TELEA)
+    alpha_crop = char_mask[y1:y2, x1:x2].copy()
+    
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+    
+    return char_crop, alpha_crop, (center_x, center_y), (x1, y1, x2, y2)
 
 
 # ============================================================
-# RENDERING ENGINE
+# TRANSFORMATION & COMPOSITING
 # ============================================================
 
 def transform_crop(crop, alpha, scale, angle):
@@ -189,149 +152,102 @@ def paste_crop(canvas, crop, alpha, cx, cy):
     return canvas
 
 
-def render_combined_frame(
-    original_img, estimated_bg, char_data_list, global_t, walk_in_frac, bob_amount, sway_amount, cycles
-):
+def ease_in_out(t):
+    t = np.clip(t, 0.0, 1.0)
+    return 0.5 - 0.5 * math.cos(math.pi * t)
+
+
+def render_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, global_t, walk_frac, bob_amt, sway_amt, cycles):
     h, w = original_img.shape[:2]
-    canvas = estimated_bg.copy()
+    canvas = paper_bg.copy()
 
-    fade_frac = 1.0 - walk_in_frac
-
-    if global_t < walk_in_frac:
-        # Phase 1: Walking In slowly toward home positions
-        local_t = global_t / max(1e-6, walk_in_frac)
+    if global_t < walk_frac:
+        # Phase 1: Slow walking from off-screen left to exact home position
+        local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
 
+        start_x = -char_crop.shape[1]
+        target_x, target_y = home_center
+
+        cur_x = start_x + (target_x - start_x) * movement
+        cur_y = target_y
+
         phase = local_t * cycles * math.pi * 2
-        bob = math.sin(phase) * bob_amount
-        sway = math.sin(phase + math.pi / 2) * sway_amount
+        bob = math.sin(phase) * bob_amt
+        sway = math.sin(phase + math.pi / 2) * sway_amt
 
-        for i, cdata in enumerate(char_data_list):
-            # Calculate start positions outside canvas borders
-            if len(char_data_list) == 2:
-                start_x = -cdata["w"] if i == 0 else w + cdata["w"]
-            else:
-                start_x = -cdata["w"]
-            start_y = cdata["center"][1]
-
-            target_x, target_y = cdata["center"]
-            cur_x = start_x + (target_x - start_x) * movement
-            cur_y = start_y + (target_y - start_y) * movement
-
-            warped_c, warped_a = transform_crop(cdata["crop"], cdata["alpha"], 1.0, sway)
-            canvas = paste_crop(canvas, warped_c, warped_a, cur_x, cur_y + bob)
-
+        warped_c, warped_a = transform_crop(char_crop, alpha_crop, 1.0, sway)
+        canvas = paste_crop(canvas, warped_c, warped_a, cur_x, cur_y + bob)
         return canvas
 
     else:
-        # Phase 2: Stay at home spot & slowly cross-fade to original full image
-        local_t = (global_t - walk_in_frac) / max(1e-6, fade_frac)
+        # Phase 2: Settle at home position & cross-fade to original hand-drawn image
+        local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(local_t)
 
-        for cdata in char_data_list:
-            canvas = paste_crop(canvas, cdata["crop"], cdata["alpha"], cdata["center"][0], cdata["center"][1])
-
-        # Blend canvas with the original hand-drawn image
+        canvas = paste_crop(canvas, char_crop, alpha_crop, home_center[0], home_center[1])
         blended = canvas.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha
         return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 # ============================================================
-# SIDEBAR CONTROLS
+# CONTROLS & STREAMLIT UI
 # ============================================================
 
-st.sidebar.header("🎬 Slow Walk & Reveal Options")
-
+st.sidebar.header("🎬 Animation Controls")
 fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
-duration = st.sidebar.slider("Animation Duration (sec)", 3.0, 12.0, 6.0, 0.5)
+duration = st.sidebar.slider("Total Duration (sec)", 3.0, 10.0, 6.0, 0.5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("🚶 Slow Walking Parameters")
+st.sidebar.header("🚶 Gait Controls")
+walk_percent = st.sidebar.slider("Walk-In Duration (%)", 40, 80, 65)
+bob_amount = st.sidebar.slider("Vertical Bob", 0, 20, 5)
+sway_amount = st.sidebar.slider("Body Sway", 0, 10, 3)
+cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
 
-walk_in_percent = st.sidebar.slider("Walk-In Duration (%)", 40, 80, 65)
-bob_amount = st.sidebar.slider("Gait Bob (Vertical)", 0, 15, 4)
-sway_amount = st.sidebar.slider("Gait Sway (Angle)", 0, 10, 2)
-cycles = st.sidebar.slider("Total Walk Steps", 1, 10, 4)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🎨 Extractions")
-background_mode = st.sidebar.selectbox("Background Color Mode", BACKGROUND_MODES, index=0)
-sensitivity = st.sidebar.slider("Extraction Sensitivity", 20, 80, 50)
-
-
-# ============================================================
-# MAIN FLOW
-# ============================================================
-
-uploaded = st.file_uploader("Upload your hand-drawn scene", type=["jpg", "jpeg", "png", "webp"])
+uploaded = st.file_uploader("Upload Drawing", type=["jpg", "jpeg", "png", "webp"])
 
 if uploaded is not None:
-    try:
-        file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
-        image = resize_image(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR), MAX_IMAGE_SIZE)
+    file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
+    image = resize_image(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
 
-        labels, components = detect_objects(image, sensitivity=sensitivity, background_mode=background_mode)
+    with st.spinner("Extracting character..."):
+        char_crop, alpha_crop, home_center, bbox = extract_character_robust(image)
+        paper_bg = extract_paper_background(image)
 
-        if not components:
-            st.error("❌ Could not isolate any drawn character.")
-            st.stop()
+    if char_crop is None:
+        st.error("Could not extract character from image.")
+        st.stop()
 
-        st.subheader("🎯 Choose Characters (Select 1 or 2)")
-        st.caption("If 2 are chosen, they walk in from opposite sides and meet at their places before fading into the full scene.")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("🖼️ Original Image")
+        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-        options = [f"Object {i + 1} (Area {c['area']})" for i, c in enumerate(components[:10])]
-        selected = st.multiselect("Select Character Objects", options, default=options[:min(2, len(options))])
+    with col2:
+        st.subheader("✂️ Extracted Character")
+        preview = paste_crop(paper_bg.copy(), char_crop, alpha_crop, char_crop.shape[1] // 2 + 10, char_crop.shape[0] // 2 + 10)
+        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-        if not selected or len(selected) > 2:
-            st.warning("Please select either 1 or 2 character objects.")
-            st.stop()
+    if st.button("✨ Render Smooth Animation", type="primary", use_container_width=True):
+        frame_count = max(8, int(fps * duration))
+        walk_frac = walk_percent / 100.0
 
-        indices = [options.index(s) for s in selected]
-        selected_components = [components[i] for i in indices]
-        selected_labels = [c["label"] for c in selected_components]
+        progress = st.progress(0, text="Rendering frames...")
+        frames = []
 
-        # Extract individual character crops
-        char_data_list = [extract_single_character(image, labels, c) for c in selected_components]
-        estimated_bg = build_estimated_background(image, labels, selected_labels)
+        for i in range(frame_count):
+            t = i / max(1, frame_count - 1)
+            frame = render_frame(image, paper_bg, char_crop, alpha_crop, home_center, t, walk_frac, bob_amount, sway_amount, cycles)
+            frames.append(frame)
+            progress.progress((i + 1) / frame_count)
 
-        st.markdown("---")
-        generate = st.button("✨ Generate Walk-In & Merge Animation", type="primary", use_container_width=True)
+        progress.empty()
 
-        if generate:
-            frame_count = max(8, int(fps * duration))
-            walk_in_frac = walk_in_percent / 100.0
+        # Build GIF
+        buffer = io.BytesIO()
+        pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE) for f in frames]
+        pil_frames[0].save(buffer, format="GIF", save_all=True, append_images=pil_frames[1:], duration=int(1000 / fps), loop=0)
 
-            progress = st.progress(0, text="Rendering animation frames...")
-            frames = []
-
-            for i in range(frame_count):
-                t = i / max(1, frame_count - 1)
-                frame = render_combined_frame(
-                    image, estimated_bg, char_data_list, t, walk_in_frac, bob_amount, sway_amount, cycles
-                )
-                frames.append(frame)
-                progress.progress((i + 1) / frame_count)
-
-            progress.empty()
-
-            # GIF Compilation
-            buffer = io.BytesIO()
-            pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE) for f in frames]
-            pil_frames[0].save(
-                buffer, format="GIF", save_all=True, append_images=pil_frames[1:], duration=int(1000 / fps), loop=0
-            )
-
-            st.subheader("🎬 Final Animation")
-            st.image(buffer.getvalue(), use_container_width=True)
-
-            st.download_button(
-                "⬇️ Download Animation GIF",
-                data=buffer.getvalue(),
-                file_name="hand_drawn_merge_animation.gif",
-                mime="image/gif",
-                use_container_width=True,
-            )
-
-    except Exception as e:
-        st.error(f"❌ Error during execution: {e}")
-        st.exception(e)
+        st.subheader("🎬 Final Animation")
+        st.image(buffer.getvalue(), use_container_width=True)
