@@ -335,6 +335,12 @@ def make_color_mask(image, color):
 
 def component_boundary(mask):
 
+    # Cast to uint8 binary mask if passing a boolean array
+    if mask.dtype == bool:
+        mask = mask.astype(np.uint8) * 255
+    elif mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+
     contours, _ = cv2.findContours(
         mask,
         cv2.RETR_EXTERNAL,
