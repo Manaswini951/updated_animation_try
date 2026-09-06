@@ -198,4 +198,264 @@ def transform_layer(crop, alpha, scale_x, scale_y, angle, pivot):
     M[1, 2] += bh / 2 - py
 
     warped_c = cv2.warpAffine(resized, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    warped_a = cv2.warpAffine(resized
+    warped_a = cv2.warpAffine(resized_alpha, M, (bw, bh), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped_c, warped_a
+
+
+def paste_layer(canvas, crop, alpha, cx, cy):
+    ch, cw = crop.shape[:2]
+    x1, y1 = int(round(cx - cw / 2.0)), int(round(cy - ch / 2.0))
+    x2, y2 = x1 + cw, y1 + ch
+
+    if x2 <= 0 or y2 <= 0 or x1 >= canvas.shape[1] or y1 >= canvas.shape[0]:
+        return canvas
+
+    cx1, cy1 = max(0, x1), max(0, y1)
+    cx2, cy2 = min(canvas.shape[1], x2), min(canvas.shape[0], y2)
+
+    src_x1, src_y1 = cx1 - x1, cy1 - y1
+    src_x2, src_y2 = src_x1 + (cx2 - cx1), src_y1 + (cy2 - cy1)
+
+    c_crop, a_crop = crop[src_y1:src_y2, src_x1:src_x2], alpha[src_y1:src_y2, src_x1:src_x2]
+    a = (a_crop.astype(np.float32) / 255.0)[:, :, None]
+
+    bg_crop = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
+
+    # Dynamic RGBA/RGB Channel Handling to prevent shape mismatch
+    if canvas.shape[2] == 4:
+        if c_crop.shape[2] == 3:
+            c_crop = cv2.cvtColor(c_crop, cv2.COLOR_BGR2BGRA)
+            c_crop[:, :, 3] = a_crop
+        result = c_crop.astype(np.float32) * a + bg_crop * (1.0 - a)
+        result[:, :, 3] = np.maximum(bg_crop[:, :, 3], a_crop.astype(np.float32))
+    else:
+        if c_crop.shape[2] == 4:
+            c_crop = c_crop[:, :, :3]
+        result = c_crop.astype(np.float32) * a + bg_crop * (1.0 - a)
+
+    canvas[cy1:cy2, cx1:cx2] = np.clip(result, 0, 255).astype(np.uint8)
+    return canvas
+
+
+def ease_in_out(t):
+    t = np.clip(t, 0.0, 1.0)
+    return 0.5 - 0.5 * math.cos(math.pi * t)
+
+
+def apply_glow_effect(image, mask, intensity):
+    glow_mask = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
+    glow_layer = np.ones_like(image, dtype=np.float32) * np.array([255, 235, 150], dtype=np.float32)
+    alpha = (glow_mask * intensity)[:, :, None]
+    return np.clip(image.astype(np.float32) * (1.0 - alpha * 0.5) + glow_layer * (alpha * 0.5), 0, 255).astype(np.uint8)
+
+
+# Sequential Master Rendering Function: Walk-In -> Cross-Fade -> Color Animation
+def render_sequential_frame(
+    original_img, paper_bg, char_crop, alpha_crop, home_center, color_mask, 
+    global_t, walk_frac, bob_amt, sway_amt, cycles, color_mode, speed, strength, transparent_mode=False
+):
+    h, w = original_img.shape[:2]
+
+    # --- PHASE 1: WALK-IN FROM OFF-SCREEN ---
+    if global_t < walk_frac:
+        local_t = global_t / max(1e-6, walk_frac)
+        movement = ease_in_out(local_t)
+        cur_x = -char_crop.shape[1] + (home_center[0] - (-char_crop.shape[1])) * movement
+        phase = local_t * cycles * math.pi * 2
+        bob = math.sin(phase) * bob_amt
+        sway = math.sin(phase + math.pi / 2) * sway_amt
+        
+        warped_c, warped_a = transform_layer(
+            char_crop, alpha_crop, 1.0, 1.0, sway, (char_crop.shape[1] / 2.0, char_crop.shape[0] / 2.0)
+        )
+
+        if transparent_mode:
+            canvas = np.zeros((h, w, 4), dtype=np.uint8)
+            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+        else:
+            canvas = paper_bg.copy()
+            return paste_layer(canvas, warped_c, warped_a, cur_x, home_center[1] + bob)
+
+    # --- PHASE 2: CROSS-FADE & MANDATORY IN-SCENE COLOR ANIMATION ---
+    else:
+        local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
+        fade_alpha = ease_in_out(min(1.0, local_t * 2.5))  # Smooth cross-fade to full scene
+
+        # Base Canvas State
+        if transparent_mode:
+            base_img = np.zeros((h, w, 4), dtype=np.uint8)
+            base_canvas = paste_layer(base_img, char_crop, alpha_crop, home_center[0], home_center[1])
+        else:
+            canvas_p1 = paste_layer(paper_bg.copy(), char_crop, alpha_crop, home_center[0], home_center[1])
+            base_canvas = np.clip(
+                canvas_p1.astype(np.float32) * (1.0 - fade_alpha) + original_img.astype(np.float32) * fade_alpha, 
+                0, 255
+            ).astype(np.uint8)
+
+        # Apply In-Scene Color Animation
+        ys, xs = np.where(color_mask > 20)
+        if len(xs) == 0:
+            return base_canvas
+
+        x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+        crop_c = original_img[y1:y2, x1:x2].copy()
+        crop_a = color_mask[y1:y2, x1:x2].copy()
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        pivot = (cx - x1, cy - y1)
+        phase_c = local_t * speed * math.pi * 2
+
+        if color_mode == "Seamless Wiggle & Sway":
+            angle = math.sin(phase_c) * strength
+            warped_c, warped_a = transform_layer(crop_c, crop_a, 1.0, 1.0, angle, pivot)
+        elif color_mode == "Rhythmic Bounce & Stretch":
+            bounce = abs(math.sin(phase_c)) * strength * 0.5
+            scale_y = 1.0 + math.sin(phase_c) * (strength * 0.02)
+            scale_x = 1.0 - math.sin(phase_c) * (strength * 0.01)
+            warped_c, warped_a = transform_layer(
+                crop_c, crop_a, scale_x, scale_y, math.sin(phase_c * 0.5) * strength * 0.3, pivot
+            )
+            cy -= bounce
+        elif color_mode == "Glowing Zoom In/Out":
+            zoom = 1.0 + math.sin(phase_c) * (strength * 0.02)
+            if not transparent_mode:
+                base_canvas = apply_glow_effect(
+                    base_canvas, color_mask, (math.sin(phase_c) + 1.0) / 2.0 * (strength * 0.04)
+                )
+            warped_c, warped_a = transform_layer(crop_c, crop_a, zoom, zoom, 0.0, pivot)
+        elif color_mode == "Storytelling Speech Cadence":
+            angle = math.sin(phase_c * 0.5) * strength
+            nod = abs(math.sin(phase_c * 2.0)) * strength * 0.8
+            warped_c, warped_a = transform_layer(
+                crop_c, crop_a, 1.0 - math.sin(phase_c * 3.0) * 0.02, 1.0 + math.sin(phase_c * 3.0) * 0.03, angle, pivot
+            )
+            cy -= nod
+
+        return paste_layer(base_canvas, warped_c, warped_a, cx, cy)
+
+
+def build_gif(frames, fps):
+    buffer = io.BytesIO()
+    prepared = [
+        Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGRA2RGBA if f.shape[2] == 4 else cv2.COLOR_BGR2RGB)) 
+        for f in frames
+    ]
+    prepared[0].save(
+        buffer, format="GIF", save_all=True, append_images=prepared[1:], duration=int(1000 / fps), loop=0, disposal=2
+    )
+    return buffer.getvalue()
+
+
+# ============================================================
+# STREAMLIT UI & CONTROLS
+# ============================================================
+
+st.sidebar.header("🎬 Global Animation Controls")
+fps = st.sidebar.select_slider("FPS", options=[8, 10, 12, 15, 20, 24], value=12)
+duration = st.sidebar.slider("Total Sequence Duration (sec)", 4.0, 14.0, 7.0, 0.5)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🚶 Gait Controls (Walk-In)")
+walk_percent = st.sidebar.slider("Walk-In Duration (%)", 30, 70, 50)
+bob_amount = st.sidebar.slider("Vertical Bobbing", 0, 20, 5)
+sway_amount = st.sidebar.slider("Body Sway Angle", 0, 10, 3)
+cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎨 In-Scene Color Motion")
+color_mode = st.sidebar.selectbox("Color Motion Style", COLOR_ANIMATION_MODES)
+speed = st.sidebar.slider("Color Motion Speed", 1, 8, 4)
+strength = st.sidebar.slider("Motion / Zoom / Glow Intensity", 1, 20, 8)
+
+uploaded_files = st.file_uploader(
+    "Upload Drawings (Select Multiple Files)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
+)
+
+if uploaded_files:
+    for idx, file in enumerate(uploaded_files):
+        st.markdown("---")
+        st.subheader(f"🖼️ Drawing {idx + 1}: {file.name}")
+
+        file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+        image = resize_image(auto_rotate_vertical(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)))
+
+        col_box1, col_box2 = st.columns(2)
+        with col_box1:
+            x_range = st.slider(f"Horizontal Bounding Box (X %) #{idx+1}", 0, 100, (15, 85))
+        with col_box2:
+            y_range = st.slider(f"Vertical Bounding Box (Y %) #{idx+1}", 0, 100, (10, 90))
+
+        bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
+
+        detected_colors = extract_dominant_colors(image)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Processed Image", use_container_width=True)
+        with c2:
+            selected_label = st.selectbox(
+                f"Identified Colors to Animate #{idx+1}", [c["label"] for c in detected_colors], key=f"col_{idx}"
+            )
+            selected_color = next(c for c in detected_colors if c["label"] == selected_label)
+            tolerance = st.slider(f"Color Tolerance #{idx+1}", 10, 80, 45, key=f"tol_{idx}")
+            color_mask = make_color_mask(image, selected_color["bgr"], tolerance)
+            st.image(
+                cv2.cvtColor(cv2.bitwise_and(image, image, mask=color_mask), cv2.COLOR_BGR2RGB), 
+                caption="Isolated Color Motion Region", use_container_width=True
+            )
+
+        if st.button(f"✨ Process & Animate Sequence ({file.name})", key=f"btn_{idx}", type="primary", use_container_width=True):
+            with st.spinner("Extracting character & preparing pipeline..."):
+                char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
+                paper_bg = extract_paper_background(image)
+
+            if char_crop is None:
+                st.error(f"Could not extract character from {file.name}.")
+                continue
+
+            frame_count = max(8, int(fps * duration))
+            walk_frac = walk_percent / 100.0
+
+            # --- RENDER FULL SCENE ---
+            progress = st.progress(0, text="Rendering Full Scene Sequence...")
+            full_frames = []
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame = render_sequential_frame(
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=False
+                )
+                full_frames.append(frame)
+                progress.progress((i + 1) / frame_count)
+
+            progress.empty()
+
+            # --- RENDER TRANSPARENT OVERLAY ---
+            progress_trans = st.progress(0, text="Rendering Transparent Overlay Sequence...")
+            transparent_frames = []
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame_t = render_sequential_frame(
+                    image, paper_bg, char_crop, alpha_crop, home_center, color_mask,
+                    t, walk_frac, bob_amount, sway_amount, cycles, color_mode, speed, strength, transparent_mode=True
+                )
+                transparent_frames.append(frame_t)
+                progress_trans.progress((i + 1) / frame_count)
+
+            progress_trans.empty()
+
+            full_gif = build_gif(full_frames, fps)
+            trans_gif = build_gif(transparent_frames, fps)
+
+            st.subheader("🎬 Generated Previews & Downloads")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.markdown("**1. Full Scene Animated Sequence**")
+                st.image(full_gif, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download Full Scene GIF", full_gif, f"full_scene_{file.name}.gif", "image/gif", use_container_width=True
+                )
+            with p2:
+                st.markdown("**2. Transparent Overlay Sequence (For Video Editors)**")
+                st.image(trans_gif, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download Transparent GIF", trans_gif, f"transparent_overlay_{file.name}.gif", "image/gif", use_container_width=True
+                )
