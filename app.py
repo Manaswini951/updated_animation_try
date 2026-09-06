@@ -13,18 +13,18 @@ from PIL import Image
 # ============================================================
 
 st.set_page_config(
-    page_title="Interactive Hand-Drawn Character Animator",
+    page_title="Multi-Image Character Separator & Animator",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🎨 Hand-Drawn Character Precise Separator & Animator")
+st.title("🎨 Multi-Image Character Separator & Animator")
 
 st.markdown(
     """
-Select your main character from complex hand-drawn artwork (ignoring grass, trees, and sky). 
-The character will walk into the frame, settle into place, and seamlessly cross-fade into your complete drawing.
+Upload one or multiple hand-drawn scenes. The script automatically handles orientation, 
+extracts the main character from each drawing, and generates walk-in animations that cross-fade back into the full artwork.
 """
 )
 
@@ -35,6 +35,14 @@ MAX_IMAGE_SIZE = 1000
 # HELPER FUNCTIONS
 # ============================================================
 
+def auto_rotate_vertical(image):
+    """Automatically rotates landscape/horizontal images vertically."""
+    h, w = image.shape[:2]
+    if w > h:
+        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return image
+
+
 def resize_image(image, max_size=MAX_IMAGE_SIZE):
     h, w = image.shape[:2]
     if max(h, w) <= max_size:
@@ -44,7 +52,7 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 
 def extract_paper_background(image):
-    """Samples edge pixels to build a uniform background canvas."""
+    """Samples edge pixels to create a clean canvas for movement."""
     h, w = image.shape[:2]
     border_pixels = np.concatenate([
         image[:15, :].reshape(-1, 3),
@@ -57,13 +65,9 @@ def extract_paper_background(image):
 
 
 def extract_character_interactive(image, bbox_pct):
-    """
-    Extracts the main character inside a user-defined percentage bounding box 
-    using OpenCV GrabCut, removing surrounding scenery.
-    """
+    """Extracts character using GrabCut inside percentage bounding box coordinates."""
     h, w = image.shape[:2]
     
-    # Unpack percentage coordinates [x_min, y_min, x_max, y_max]
     xmin = int((bbox_pct[0] / 100.0) * w)
     ymin = int((bbox_pct[1] / 100.0) * h)
     xmax = int((bbox_pct[2] / 100.0) * w)
@@ -71,10 +75,8 @@ def extract_character_interactive(image, bbox_pct):
     
     rect_w = max(10, xmax - xmin)
     rect_h = max(10, ymax - ymin)
-    
     rect = (xmin, ymin, rect_w, rect_h)
     
-    # Initialize GrabCut mask
     gc_mask = np.zeros((h, w), np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
@@ -83,16 +85,13 @@ def extract_character_interactive(image, bbox_pct):
         cv2.grabCut(image, gc_mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
         char_mask = np.where((gc_mask == 2) | (gc_mask == 0), 0, 255).astype(np.uint8)
     except Exception:
-        # Fallback to simple rectangle crop if GrabCut fails
         char_mask = np.zeros((h, w), np.uint8)
         char_mask[ymin:ymax, xmin:xmax] = 255
 
-    # Smooth edges
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     char_mask = cv2.morphologyEx(char_mask, cv2.MORPH_CLOSE, kernel)
     char_mask = cv2.GaussianBlur(char_mask, (3, 3), 0)
 
-    # Crop out character
     ys, xs = np.where(char_mask > 20)
     if len(xs) == 0:
         return None, None, None
@@ -161,7 +160,6 @@ def render_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, glo
     canvas = paper_bg.copy()
 
     if global_t < walk_frac:
-        # Phase 1: Slow walking from off-screen left to exact home position
         local_t = global_t / max(1e-6, walk_frac)
         movement = ease_in_out(local_t)
 
@@ -178,9 +176,7 @@ def render_frame(original_img, paper_bg, char_crop, alpha_crop, home_center, glo
         warped_c, warped_a = transform_crop(char_crop, alpha_crop, sway)
         canvas = paste_crop(canvas, warped_c, warped_a, cur_x, cur_y + bob)
         return canvas
-
     else:
-        # Phase 2: Arrive at home position & cross-fade to reveal full drawing with all scenery
         local_t = (global_t - walk_frac) / max(1e-6, 1.0 - walk_frac)
         fade_alpha = ease_in_out(local_t)
 
@@ -204,67 +200,76 @@ bob_amount = st.sidebar.slider("Vertical Bobbing", 0, 20, 5)
 sway_amount = st.sidebar.slider("Body Sway Angle", 0, 10, 3)
 cycles = st.sidebar.slider("Walk Steps", 1, 10, 4)
 
-uploaded = st.file_uploader("Upload Drawing", type=["jpg", "jpeg", "png", "webp"])
+uploaded_files = st.file_uploader(
+    "Upload Drawings (Select Multiple Files)", 
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True
+)
 
-if uploaded is not None:
-    file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
-    image = resize_image(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR))
-
-    st.subheader("🎯 Bounding Box Character Selector")
-    st.caption("Adjust sliders so the red bounding box covers ONLY your main character (rabbit, boy, or family).")
+if uploaded_files:
+    st.info(f"📁 {len(uploaded_files)} file(s) loaded. Set the character bounding box area for batch extraction:")
 
     col_box1, col_box2 = st.columns(2)
     with col_box1:
-        x_range = st.slider("Horizontal Range (X %)", 0, 100, (20, 80))
+        x_range = st.slider("Horizontal Range (X %)", 0, 100, (15, 85))
     with col_box2:
         y_range = st.slider("Vertical Range (Y %)", 0, 100, (10, 90))
 
     bbox_pct = [x_range[0], y_range[0], x_range[1], y_range[1]]
 
-    # Draw live preview rectangle
-    h, w = image.shape[:2]
-    preview_img = image.copy()
-    p_x1, p_y1 = int((bbox_pct[0] / 100.0) * w), int((bbox_pct[1] / 100.0) * h)
-    p_x2, p_y2 = int((bbox_pct[2] / 100.0) * w), int((bbox_pct[3] / 100.0) * h)
-    cv2.rectangle(preview_img, (p_x1, p_y1), (p_x2, p_y2), (0, 0, 255), 3)
+    if st.button("✨ Process & Animate All Drawings", type="primary", use_container_width=True):
+        
+        for idx, uploaded_file in enumerate(uploaded_files):
+            st.markdown("---")
+            st.subheader(f"🖼️ Drawing {idx + 1}: {uploaded_file.name}")
 
-    st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+            raw_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-    if st.button("✨ Extract Character & Animate", type="primary", use_container_width=True):
-        with st.spinner("Extracting selected character with GrabCut..."):
-            char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
-            paper_bg = extract_paper_background(image)
+            # Auto-rotate horizontal images to vertical
+            image = auto_rotate_vertical(raw_image)
+            image = resize_image(image)
 
-        if char_crop is None:
-            st.error("Could not extract character from selected region.")
-            st.stop()
+            with st.spinner(f"Extracting character from {uploaded_file.name}..."):
+                char_crop, alpha_crop, home_center = extract_character_interactive(image, bbox_pct)
+                paper_bg = extract_paper_background(image)
 
-        frame_count = max(8, int(fps * duration))
-        walk_frac = walk_percent / 100.0
+            if char_crop is None:
+                st.error(f"Could not extract character from {uploaded_file.name}.")
+                continue
 
-        progress = st.progress(0, text="Rendering animation frames...")
-        frames = []
+            frame_count = max(8, int(fps * duration))
+            walk_frac = walk_percent / 100.0
 
-        for i in range(frame_count):
-            t = i / max(1, frame_count - 1)
-            frame = render_frame(image, paper_bg, char_crop, alpha_crop, home_center, t, walk_frac, bob_amount, sway_amount, cycles)
-            frames.append(frame)
-            progress.progress((i + 1) / frame_count)
+            progress = st.progress(0, text=f"Rendering animation for {uploaded_file.name}...")
+            frames = []
 
-        progress.empty()
+            for i in range(frame_count):
+                t = i / max(1, frame_count - 1)
+                frame = render_frame(image, paper_bg, char_crop, alpha_crop, home_center, t, walk_frac, bob_amount, sway_amount, cycles)
+                frames.append(frame)
+                progress.progress((i + 1) / frame_count)
 
-        # Build GIF
-        buffer = io.BytesIO()
-        pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE) for f in frames]
-        pil_frames[0].save(buffer, format="GIF", save_all=True, append_images=pil_frames[1:], duration=int(1000 / fps), loop=0)
+            progress.empty()
 
-        st.subheader("🎬 Final Animation")
-        st.image(buffer.getvalue(), use_container_width=True)
+            # Compile GIF
+            buffer = io.BytesIO()
+            pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE) for f in frames]
+            pil_frames[0].save(buffer, format="GIF", save_all=True, append_images=pil_frames[1:], duration=int(1000 / fps), loop=0)
 
-        st.download_button(
-            "⬇️ Download GIF",
-            data=buffer.getvalue(),
-            file_name="character_walk_in.gif",
-            mime="image/gif",
-            use_container_width=True,
-        )
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Processed Drawing**")
+                st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+            with c2:
+                st.markdown("**Animation Preview**")
+                st.image(buffer.getvalue(), use_container_width=True)
+
+            st.download_button(
+                f"⬇️ Download GIF ({uploaded_file.name})",
+                data=buffer.getvalue(),
+                file_name=f"animated_{uploaded_file.name}.gif",
+                mime="image/gif",
+                use_container_width=True,
+            )
