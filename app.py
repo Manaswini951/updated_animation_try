@@ -1,4 +1,4 @@
-````python
+
 import io
 import json
 import math
@@ -3333,4 +3333,3 @@ st.caption(
     "Gemini supplies anatomy geometry only. "
     "No AI redraw is used for the animation artwork."
 )
-````
