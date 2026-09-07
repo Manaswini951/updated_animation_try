@@ -47,9 +47,8 @@ def detect_character_skeleton(image_bytes, api_key):
     """
 
     try:
-        # Updated model identifier to gemini-3.6-flash
         response = client.models.generate_content(
-            model='gemini-3.6-flash',
+            model='gemini-3.7-flash',
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                 prompt
@@ -69,35 +68,47 @@ def detect_character_skeleton(image_bytes, api_key):
 
 def bend_limb_mesh(image, joint_start, joint_mid, joint_end, bend_angle_deg):
     """
-    Uses Piecewise Affine Transformation to deform image mesh around a joint (e.g. Knee/Elbow).
+    Uses Piecewise Affine Transformation to deform image mesh around a joint.
     """
     h, w = image.shape[:2]
     
-    # Map normalized coordinates to pixel values
     p_start = np.array([joint_start[0] * w / 100.0, joint_start[1] * h / 100.0])
     p_mid   = np.array([joint_mid[0] * w / 100.0,   joint_mid[1] * h / 100.0])
     p_end   = np.array([joint_end[0] * w / 100.0,   joint_end[1] * h / 100.0])
 
-    # Calculate rotation for the lower part of the limb
     angle_rad = math.radians(bend_angle_deg)
     rot_matrix = np.array([
         [math.cos(angle_rad), -math.sin(angle_rad)],
         [math.sin(angle_rad),  math.cos(angle_rad)]
     ])
 
-    # Rotate end joint relative to mid joint (knee/elbow)
     p_end_bent = p_mid + np.dot(rot_matrix, (p_end - p_mid))
 
-    # Construct Source and Destination Control Points
     src_points = np.array([p_start, p_mid, p_end, [0, 0], [w, 0], [0, h], [w, h]])
     dst_points = np.array([p_start, p_mid, p_end_bent, [0, 0], [w, 0], [0, h], [w, h]])
 
-    # Warp image texture along control mesh
     tform = PiecewiseAffineTransform()
     tform.estimate(dst_points, src_points)
     
     warped = warp(image, tform, output_shape=(h, w))
     return (warped * 255).astype(np.uint8)
+
+def create_gif_from_frames(frames, fps=12):
+    """
+    Compiles a list of RGB numpy image frames into a GIF byte stream.
+    """
+    pil_frames = [Image.fromarray(f) for f in frames]
+    buffer = io.BytesIO()
+    duration = int(1000 / fps)
+    pil_frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration,
+        loop=0
+    )
+    return buffer.getvalue()
 
 # ============================================================
 # PHASE 3: STREAMLIT WORKFLOW
@@ -124,32 +135,63 @@ if uploaded_file and GEMINI_API_KEY:
             st.json(skeleton_data["joints"])
 
     if "skeleton" in st.session_state:
-        st.markdown("### 🦵 Limb Bending Controls")
+        st.markdown("### 🦵 Animation Controls")
         joints = st.session_state["skeleton"]
 
-        knee_angle = st.slider("Left Knee Bend Angle", -45, 45, 15)
-        elbow_angle = st.slider("Left Elbow Bend Angle", -45, 45, -20)
+        col1, col2 = st.columns(2)
+        with col1:
+            max_knee_angle = st.slider("Max Knee Bend Angle", 0, 45, 25)
+            max_elbow_angle = st.slider("Max Elbow Bend Angle", 0, 45, 20)
+        with col2:
+            num_frames = st.slider("Total Animation Frames", 12, 48, 24)
+            fps = st.slider("Frames Per Second (FPS)", 6, 24, 12)
 
-        if st.button("🎬 Render Pose Bends"):
-            # Bend Left Leg (Hip -> Knee -> Ankle)
-            frame = image_rgb.copy()
-            if "left_hip" in joints and "left_knee" in joints and "left_ankle" in joints:
-                frame = bend_limb_mesh(
-                    frame, 
-                    joints["left_hip"], 
-                    joints["left_knee"], 
-                    joints["left_ankle"], 
-                    knee_angle
-                )
+        if st.button("🎬 Generate & Render GIF Animation", type="primary"):
+            frames = []
+            progress_bar = st.progress(0, text="Rendering animation sequence...")
 
-            # Bend Left Arm (Shoulder -> Elbow -> Wrist)
-            if "left_shoulder" in joints and "left_elbow" in joints and "left_wrist" in joints:
-                frame = bend_limb_mesh(
-                    frame, 
-                    joints["left_shoulder"], 
-                    joints["left_elbow"], 
-                    joints["left_wrist"], 
-                    elbow_angle
-                )
+            for i in range(num_frames):
+                # Calculate smooth cyclical bending using sine waves
+                t = (i / num_frames) * 2 * math.pi
+                cur_knee_angle = math.sin(t) * max_knee_angle
+                cur_elbow_angle = math.sin(t + math.pi / 2) * max_elbow_angle
 
-            st.image(frame, caption="Deformed Character Pose", width=400)
+                frame = image_rgb.copy()
+
+                # Bend Left Leg
+                if "left_hip" in joints and "left_knee" in joints and "left_ankle" in joints:
+                    frame = bend_limb_mesh(
+                        frame, 
+                        joints["left_hip"], 
+                        joints["left_knee"], 
+                        joints["left_ankle"], 
+                        cur_knee_angle
+                    )
+
+                # Bend Left Arm
+                if "left_shoulder" in joints and "left_elbow" in joints and "left_wrist" in joints:
+                    frame = bend_limb_mesh(
+                        frame, 
+                        joints["left_shoulder"], 
+                        joints["left_elbow"], 
+                        joints["left_wrist"], 
+                        cur_elbow_angle
+                    )
+
+                frames.append(frame)
+                progress_bar.progress((i + 1) / num_frames)
+
+            progress_bar.empty()
+
+            # Compile into GIF
+            gif_data = create_gif_from_frames(frames, fps=fps)
+
+            st.markdown("### 🎉 Rendered Animation Result")
+            st.image(gif_data, caption="Animated Hand-Drawn Character", width=400)
+            
+            st.download_button(
+                label="⬇️ Download Animated GIF",
+                data=gif_data,
+                file_name="character_animation.gif",
+                mime="image/gif"
+            )
