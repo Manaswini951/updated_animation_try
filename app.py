@@ -8,7 +8,6 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# Initialize Streamlit Page Config
 st.set_page_config(
     page_title="AI Scene Growth & Character Animator",
     page_icon="🎬",
@@ -19,23 +18,15 @@ st.title("🌱 AI-Powered Scene Growth & Character Animator")
 st.markdown(
     """
 **Pipeline Workflow:**
-1. **AI Segmentation:** Gemini analyzes your drawing, isolates elements (grass, trees, leaves, bunny), and removes backgrounds.
-2. **Sequential Scene Growth:** Animate background elements (grass and trees growing upward/scaling in).
-3. **Character Walk-In:** The main character walks onto the finished scene.
+1. **AI Segmentation:** Gemini identifies individual drawing components (grass, trees, bunny).
+2. **Plate Preserved:** Keeps your original colored background plate intact without blanking it out.
+3. **Sequential Growth & Walk-In:** Scenery elements grow upward into place, and the character walks in.
 """
 )
 
 GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", type="password")
 
-# ============================================================
-# STAGE 1: AI OBJECT & LAYER EXTRACTION (WITH MODEL FALLBACK)
-# ============================================================
-
 def analyze_and_segment_scene(image_bytes, api_key):
-    """
-    Sends the drawing to Gemini to detect individual components 
-    with an automatic model fallback sequence to bypass 503 high-demand errors.
-    """
     if not api_key:
         st.error("Please enter a valid Gemini API Key.")
         return None
@@ -43,10 +34,10 @@ def analyze_and_segment_scene(image_bytes, api_key):
     client = genai.Client(api_key=api_key)
     
     prompt = """
-    Analyze this hand-drawn scene. Identify all individual background and foreground elements 
-    (e.g., grass tufts, trees, bushes, and the main character object).
+    Analyze this hand-drawn scene. Identify distinct visual elements like background bushes, 
+    grass tufts, trees, and the main character bunny.
     Return a JSON object detailing each object, its type ('background_element' or 'character'), 
-    its suggested appearance order (1 for background grass/trees, 2 for leaves, 3 for main character), 
+    its appearance growth order (1 for background scenery/grass, 2 for foreground details, 3 for main character), 
     and its bounding box coordinates normalized from 0 to 100 [ymin, xmin, ymax, xmax].
     
     Return ONLY valid JSON in this exact format:
@@ -68,12 +59,7 @@ def analyze_and_segment_scene(image_bytes, api_key):
     }
     """
 
-    # Automatic fallback list if the primary model is busy (503 error)
-    fallback_models = [
-        'gemini-3.7-flash', 
-        'gemini-3.6-flash', 
-        'gemini-2.5-flash'
-    ]
+    fallback_models = ['gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-2.5-flash']
 
     for model_name in fallback_models:
         try:
@@ -88,23 +74,13 @@ def analyze_and_segment_scene(image_bytes, api_key):
                 )
             )
             return json.loads(response.text)
-        except Exception as e:
-            # If 503 unavailable or model not found, try the next model in the list
-            if "503" in str(e) or "NOT_FOUND" in str(e) or "UNAVAILABLE" in str(e):
-                continue
-            else:
-                # For other errors, log it and try next
-                continue
+        except Exception:
+            continue
 
-    st.error("All available Gemini models are currently experiencing high demand (503). Please try again in a moment.")
+    st.error("All available Gemini models are currently busy (503). Please try again shortly.")
     return None
 
-# ============================================================
-# STAGE 2: PROCEDURAL COMPOSITION & GROWTH ENGINE
-# ============================================================
-
-def extract_sprite_crop(image_np, box):
-    """Extracts a sub-image based on normalized coordinates [ymin, xmin, ymax, xmax]."""
+def extract_element_crop(image_np, box):
     h, w = image_np.shape[:2]
     ymin, xmin, ymax, xmax = box
     
@@ -120,41 +96,22 @@ def extract_sprite_crop(image_np, box):
         return None, (0, 0)
         
     crop = image_np[y1:y2, x1:x2].copy()
-    
-    # Remove paper white background to make it transparent/overlay-ready
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, alpha = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
-    
-    # Fallback if thresholding clears everything
-    if np.count_nonzero(alpha) < 10:
-        alpha = np.full(gray.shape, 255, dtype=np.uint8)
-        
     rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
-    rgba[:, :, 3] = alpha
     return rgba, (x1, y1)
 
-def render_growth_frame(base_canvas, sprites_data, global_progress):
-    """
-    Renders elements appearing sequentially: 
-    Grass/Trees grow first, followed by leaves, then the character walks in.
-    """
-    h, w = base_canvas.shape[:2]
-    frame = base_canvas.copy()
-    if frame.shape[2] == 3:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
-
-    # Sort sprites by growth order
+def render_growth_frame(base_plate, sprites_data, global_progress):
+    h, w = base_plate.shape[:2]
+    
+    # 1. Start with a pristine copy of the original full drawing plate
+    frame = cv2.cvtColor(base_plate, cv2.COLOR_BGR2BGRA)
+    
+    # Sort elements by growth sequence order
     sorted_sprites = sorted(sprites_data, key=lambda x: x['growth_order'])
 
     for item in sorted_sprites:
         order = item['growth_order']
-        start_trigger = (order - 1) * 0.3
-        end_trigger = start_trigger + 0.5
-        
-        if global_progress < start_trigger:
-            continue  
-            
-        element_progress = min(1.0, (global_progress - start_trigger) / max(1e-6, (end_trigger - start_trigger)))
+        start_trigger = (order - 1) * 0.25
+        end_trigger = start_trigger + 0.45
         
         sprite = item['sprite']
         orig_pos = item['position']
@@ -163,16 +120,33 @@ def render_growth_frame(base_canvas, sprites_data, global_progress):
 
         sh, sw = sprite.shape[:2]
 
+        # Before an element's growth window begins, temporarily clear its region from the base plate 
+        # so it can "grow" into position.
+        element_progress = (global_progress - start_trigger) / max(1e-6, (end_trigger - start_trigger))
+        element_progress = float(np.clip(element_progress, 0.0, 1.0))
+
+        if global_progress < start_trigger:
+            # Mask out this region initially (make it blank white/background)
+            frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
+            continue
+
         if item['type'] == 'background_element':
+            # Scale up growth effect from the base position upward
             current_scale = element_progress
             if current_scale <= 0:
+                frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
                 continue
+                
             new_w = max(2, int(sw * current_scale))
             new_h = max(2, int(sh * current_scale))
             
             resized = cv2.resize(sprite, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            # Clear target region first
+            frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
+            
             anchor_x = orig_pos[0]
-            anchor_y = orig_pos[1] + sh - new_h  # Grow upward from base
+            anchor_y = orig_pos[1] + sh - new_h  
             
             frame = paste_rgba(frame, resized, anchor_x, anchor_y)
 
@@ -182,15 +156,18 @@ def render_growth_frame(base_canvas, sprites_data, global_progress):
             target_x = orig_pos[0]
             current_x = int(start_x + (target_x - start_x) * walk_progress)
             
-            bob = int(math.sin(walk_progress * math.pi * 6) * 5) if walk_progress < 1.0 else 0
+            bob = int(math.sin(walk_progress * math.pi * 8) * 4) if walk_progress < 1.0 else 0
             current_y = orig_pos[1] + bob
             
+            # Clear character start path area if walking in
+            if walk_progress < 1.0:
+                frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
+                
             frame = paste_rgba(frame, sprite, current_x, current_y)
 
     return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
 def paste_rgba(canvas, sprite, x, y):
-    """Helper to cleanly paste a transparent RGBA sprite onto an RGBA canvas."""
     ch, cw = sprite.shape[:2]
     x2, y2 = x + cw, y + ch
     
@@ -207,7 +184,6 @@ def paste_rgba(canvas, sprite, x, y):
     a = (s_crop[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
     
     bg_crop = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
-
     blended = s_crop.astype(np.float32) * a + bg_crop * (1.0 - a)
     canvas[cy1:cy2, cx1:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
     return canvas
@@ -222,10 +198,6 @@ def create_gif(frames, fps=12):
     )
     return buffer.getvalue()
 
-# ============================================================
-# STAGE 3: STREAMLIT USER INTERFACE EXECUTION
-# ============================================================
-
 uploaded_file = st.file_uploader("Upload Scene Drawing", type=["png", "jpg", "jpeg"])
 
 if uploaded_file and GEMINI_API_KEY:
@@ -234,28 +206,26 @@ if uploaded_file and GEMINI_API_KEY:
     
     st.image(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB), caption="Original Uploaded Scene", width=500)
 
-    if st.button("🔍 Step 1: Extract Scene Elements with Gemini", type="primary"):
-        with st.spinner("Gemini is analyzing and segmenting objects from your drawing (with auto-fallback)..."):
+    if st.button("🔍 Step 1: Detect Scene Layers with Gemini", type="primary"):
+        with st.spinner("Analyzing artwork structure..."):
             scene_data = analyze_and_segment_scene(file_bytes, GEMINI_API_KEY)
             
         if scene_data and "scene_elements" in scene_data:
             st.session_state["scene_elements"] = scene_data["scene_elements"]
-            st.success(f"Successfully isolated {len(scene_data['scene_elements'])} scene components!")
+            st.success(f"Successfully mapped {len(scene_data['scene_elements'])} visual layers!")
             st.json(scene_data)
 
     if "scene_elements" in st.session_state:
-        st.markdown("### 🎬 Step 2: Render Growth & Walk-In Animation")
+        st.markdown("### 🎬 Step 2: Configure & Render Animation")
         
-        total_frames = st.slider("Animation Frame Count", 12, 60, 30)
+        total_frames = st.slider("Animation Frame Count", 15, 60, 30)
         fps = st.slider("Frames Per Second (FPS)", 6, 24, 12)
 
-        if st.button("🚀 Generate Scene Growth Animation"):
-            with st.spinner("Assembling and rendering growing background elements and character walk-in..."):
-                white_canvas = np.full(image_np.shape, 255, dtype=np.uint8)
-                
+        if st.button("🚀 Render Growth & Walk-In GIF"):
+            with st.spinner("Generating animation sequence..."):
                 processed_sprites = []
                 for element in st.session_state["scene_elements"]:
-                    sprite, pos = extract_sprite_crop(image_np, element["box_2d"])
+                    sprite, pos = extract_element_crop(image_np, element["box_2d"])
                     processed_sprites.append({
                         "name": element["name"],
                         "type": element["type"],
@@ -265,11 +235,11 @@ if uploaded_file and GEMINI_API_KEY:
                     })
 
                 frames = []
-                progress_bar = st.progress(0, text="Rendering growth progression...")
+                progress_bar = st.progress(0, text="Rendering frames...")
                 
                 for i in range(total_frames):
                     progress = i / max(1, total_frames - 1)
-                    frame = render_growth_frame(white_canvas, processed_sprites, progress)
+                    frame = render_growth_frame(image_np, processed_sprites, progress)
                     frames.append(frame)
                     progress_bar.progress((i + 1) / total_frames)
 
@@ -277,11 +247,11 @@ if uploaded_file and GEMINI_API_KEY:
 
                 gif_bytes = create_gif(frames, fps=fps)
 
-                st.markdown("### 🎉 Rendered Animation Output")
-                st.image(gif_bytes, caption="Growing Scene + Character Walk-In", width=500)
+                st.markdown("### 🎉 Result")
+                st.image(gif_bytes, caption="Animation Preview", width=500)
                 
                 st.download_button(
-                    label="⬇️ Download Growth Animation GIF",
+                    label="⬇️ Download Animation GIF",
                     data=gif_bytes,
                     file_name="scene_growth_animation.gif",
                     mime="image/gif"
