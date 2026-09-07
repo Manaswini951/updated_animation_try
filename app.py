@@ -25,7 +25,7 @@ st.set_page_config(
 st.title("🦒 Hand-Drawn Animal Walk Animator")
 st.caption(
     "Gemini identifies the animal and its anatomy. Python creates a "
-    "4-pose walking cycle from the ORIGINAL drawing with auto-model discovery."
+    "4-pose walking cycle from the ORIGINAL drawing."
 )
 
 # ============================================================
@@ -40,16 +40,17 @@ GEMINI_API_KEY = st.sidebar.text_input(
     help="Your Google Gemini API key.",
 )
 
-MODEL = st.sidebar.selectbox(
-    "Gemini model preference",
+MODEL_SELECTION = st.sidebar.selectbox(
+    "Gemini model",
     [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-2.5-pro",
-        "gemini-2.0-pro",
+        "AUTO — use an available vision model",
     ],
     index=0,
+    help=(
+        "The app automatically asks your Gemini API key which models are "
+        "available, then tests them and uses the first working model. "
+        "No obsolete model names are hard-coded as fallbacks."
+    ),
 )
 
 st.sidebar.markdown("---")
@@ -126,7 +127,7 @@ st.sidebar.info(
 
 
 # ============================================================
-# GEMINI ANALYSIS & MODEL DISCOVERY
+# GEMINI ANALYSIS
 # ============================================================
 
 def clean_json_text(text: str) -> str:
@@ -144,47 +145,158 @@ def clean_json_text(text: str) -> str:
     return text
 
 
-def get_available_models(client: genai.Client) -> List[str]:
-    """Dynamically query the Gemini API to see which models support generateContent."""
-    supported_models = []
+def _model_name(model_obj: Any) -> str:
+    """Return a plain model name from a Gemini SDK model object."""
+    name = getattr(model_obj, "name", "") or ""
+    return str(name).strip()
+
+
+def _model_actions(model_obj: Any) -> List[str]:
+    """Return supported actions without assuming a specific SDK version."""
+    actions = getattr(model_obj, "supported_actions", None)
+    if actions is None:
+        actions = getattr(model_obj, "supportedActions", None)
+    if actions is None:
+        return []
     try:
-        for m in client.models.list():
-            model_name = m.name.replace("models/", "")
-            if "flash" in model_name or "pro" in model_name:
-                supported_models.append(model_name)
+        return [str(a) for a in actions]
     except Exception:
-        pass
-    
-    defaults = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-pro"]
-    for d in defaults:
-        if d not in supported_models:
-            supported_models.append(d)
-            
-    return supported_models
+        return []
+
+
+def discover_available_models(client: genai.Client) -> List[str]:
+    """
+    Ask the Gemini API which models are actually available for this API key.
+
+    Google documents models.list() + supported_actions as the way to find
+    models that support generateContent. We intentionally do not rely on a
+    hard-coded list of old model names.
+    """
+    discovered: List[str] = []
+    try:
+        for model_obj in client.models.list():
+            name = _model_name(model_obj)
+            if not name:
+                continue
+
+            actions = _model_actions(model_obj)
+            if actions and "generateContent" not in actions:
+                continue
+
+            # The API normally returns names like "models/gemini-...".
+            # generate_content accepts the model name with or without the
+            # "models/" prefix depending on SDK/API handling, but keeping the
+            # returned name is safest.
+            discovered.append(name)
+    except Exception:
+        return []
+
+    # Remove duplicates while preserving order.
+    unique = []
+    seen = set()
+    for name in discovered:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(name)
+    return unique
+
+
+def model_priority_score(name: str) -> Tuple[int, str]:
+    """
+    Rank currently available models for image understanding.
+
+    This is only a preference order. Availability is determined dynamically
+    from the user's API key, and every candidate is actually tested.
+    """
+    n = name.lower().replace("models/", "")
+
+    # Prefer current fast multimodal Gemini models.
+    if "gemini-3.7-flash" in n:
+        return (0, n)
+    if "gemini-3.6-flash" in n:
+        return (1, n)
+    if "gemini-3.5-flash" in n:
+        return (2, n)
+    if "gemini-3.1-flash" in n and "lite" not in n:
+        return (3, n)
+    if "gemini-3.1-flash-lite" in n:
+        return (4, n)
+    if "gemini-3" in n and "flash" in n:
+        return (5, n)
+    if "gemini-2.5-flash" in n and "lite" not in n:
+        return (6, n)
+    if "gemini-2.5-flash-lite" in n:
+        return (7, n)
+    if "gemini-2.5" in n:
+        return (8, n)
+    if "gemini-2" in n and "flash" in n:
+        return (10, n)
+    if "gemini" in n and "pro" in n:
+        return (15, n)
+    if "gemini" in n and "flash" in n:
+        return (20, n)
+    if "gemini" in n:
+        return (30, n)
+    return (100, n)
+
+
+def ordered_model_candidates(client: genai.Client) -> List[str]:
+    """Return dynamically available generateContent models in best-first order."""
+    available = discover_available_models(client)
+
+    # Prefer Gemini models for this particular image-analysis task.
+    gemini_models = [m for m in available if "gemini" in m.lower()]
+    other_models = [m for m in available if "gemini" not in m.lower()]
+
+    gemini_models.sort(key=model_priority_score)
+    other_models.sort(key=model_priority_score)
+
+    return gemini_models + other_models
+
+
+def _safe_response_text(response: Any) -> str:
+    """Extract response text across small SDK response-shape differences."""
+    text = getattr(response, "text", None)
+    if text:
+        return str(text)
+
+    # Defensive fallback if .text is unavailable.
+    try:
+        pieces = []
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    pieces.append(str(part_text))
+        return "\n".join(pieces).strip()
+    except Exception:
+        return ""
 
 
 def analyze_and_segment_scene(
     image_bytes: bytes,
     api_key: str,
-    preferred_model: str,
+    model_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Analyze the drawing using a model that is actually available to the key.
 
+    IMPORTANT: no obsolete hard-coded fallback model list is used here.
+    The app first calls models.list(), filters for generateContent support,
+    ranks candidates, and then tries them one by one. If a model returns a
+    404/403/unsupported-method error, the next available model is tried.
+    """
     if not api_key:
         st.error("Please enter a Gemini API key.")
         return None
 
     try:
         client = genai.Client(api_key=api_key)
-    except Exception as e:
-        st.error(f"Failed to initialize Gemini client: {e}")
+    except Exception as exc:
+        st.error(f"Could not initialize Gemini: {exc}")
         return None
-
-    discovered_models = get_available_models(client)
-    
-    models_to_try = [preferred_model]
-    for m in discovered_models:
-        if m not in models_to_try:
-            models_to_try.append(m)
 
     prompt = r"""
 You are analyzing a SINGLE hand-drawn animal scene.
@@ -265,37 +377,94 @@ If there is no animal, return:
 }
 """
 
-    last_error = None
+    # Dynamically discover the models available to THIS API key.
+    discovered = ordered_model_candidates(client)
 
-    for current_model in models_to_try:
+    if not discovered:
+        st.error(
+            "Gemini API did not return any models supporting generateContent. "
+            "Check that the API key is valid and that the Gemini API is enabled."
+        )
+        return None
+
+    # If the UI ever supplies a model name, try it first only if it was
+    # actually discovered. Otherwise AUTO mode ignores it and uses discovery.
+    candidates: List[str] = []
+    if model_name:
+        requested = model_name.strip()
+        if requested and requested.lower().startswith("auto"):
+            requested = ""
+        if requested:
+            for available in discovered:
+                if available.lower() == requested.lower() or available.lower().endswith(requested.lower()):
+                    candidates.append(available)
+                    break
+
+    for candidate in discovered:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    st.info(
+        f"🔎 Gemini discovered {len(discovered)} generateContent model(s). "
+        f"Testing the best available model first: `{candidates[0]}`"
+    )
+
+    errors: List[str] = []
+
+    for current_model in candidates:
         try:
-            response = client.models.generate_content(
-                model=current_model,
-                contents=[
-                    types.Part.from_bytes(
-                        data=image_bytes,
-                        mime_type="image/png",
-                    ),
-                    prompt,
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
+            contents = [
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/png",
                 ),
-            )
+                prompt,
+            ]
 
-            text = clean_json_text(response.text)
+            # First try JSON mode. If this particular available model does
+            # not support response_mime_type, retry the SAME model once with
+            # a plain text response before abandoning that model.
+            try:
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+            except Exception as json_mode_error:
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                    ),
+                )
+
+            text = clean_json_text(_safe_response_text(response))
+            if not text:
+                raise ValueError("The model returned an empty response.")
+
             data = json.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("The model response was not a JSON object.")
 
-            if isinstance(data, dict):
-                st.toast(f"Successfully connected using model: `{current_model}`", icon="✅")
-                return data
+            st.success(f"✅ Analysis completed with `{current_model}`")
+            return data
 
         except Exception as exc:
-            last_error = exc
+            error_text = str(exc).replace("\n", " ")
+            errors.append(f"{current_model}: {error_text}")
+            # Continue automatically. This is intentional: a listed model
+            # can still fail because of quota, regional availability,
+            # transient backend errors, unsupported multimodal input, etc.
             continue
 
-    st.error(f"Gemini analysis failed across all attempted models. Last error: {last_error}")
+    st.error("Gemini analysis failed after trying every available model.")
+    with st.expander("Show model attempts"):
+        for error in errors:
+            st.code(error)
     return None
 
 
@@ -405,6 +574,15 @@ def bbox_from_normalized(
     return x1, y1, x2, y2
 
 
+def point_inside_or_near(
+    point: Tuple[int, int],
+    bbox: Tuple[int, int, int, int],
+) -> bool:
+    x, y = point
+    x1, y1, x2, y2 = bbox
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
 # ============================================================
 # IMAGE / ALPHA HELPERS
 # ============================================================
@@ -423,6 +601,7 @@ def rgba_from_masked_crop(
     if crop.size == 0:
         return np.zeros((1, 1, 4), dtype=np.uint8)
 
+    # Slight feathering keeps hand-drawn strokes from getting harsh edges.
     alpha = cv2.GaussianBlur(crop_mask, (3, 3), 0)
 
     rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
@@ -454,6 +633,7 @@ def extract_animal(
         x1, y1, x2, y2 = bbox
         mask[y1:y2, x1:x2] = 255
 
+    # Clean small holes while preserving hand-drawn contours.
     kernel_size = max(3, int(min(h, w) / 250) * 2 + 1)
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -645,6 +825,18 @@ def get_leg_parts(scene_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 # WALK CYCLE
 # ============================================================
 
+# Angles are intentionally gentle.
+# Each leg gets a different phase so the animal does not look like
+# four legs moving simultaneously.
+
+WALK_ANGLES = {
+    "front_left":  +1.0,
+    "front_right": -1.0,
+    "back_left":   -0.9,
+    "back_right":  +0.9,
+}
+
+
 def leg_phase_for_side(side: str) -> float:
     side = side.lower()
 
@@ -658,7 +850,13 @@ def leg_phase_for_side(side: str) -> float:
     if "back_left" in side:
         return math.pi
 
+    # For generic legs, alternate using a deterministic mapping.
     return 0.0
+
+
+def normalized_cycle(t: float) -> float:
+    """Smooth periodic cycle from 0..1."""
+    return t % 1.0
 
 
 def leg_swing(
@@ -668,10 +866,16 @@ def leg_swing(
 ) -> float:
 
     phase = leg_phase_for_side(side)
+
+    # sin gives forward/back movement.
     s = math.sin(
         2.0 * math.pi * cycle_t + phase
     )
+
+    # Cubic-ish smoothing reduces mechanical motion.
     smooth = s * (0.75 + 0.25 * abs(s))
+
+    # Convert normalized stride to degrees.
     return smooth * stride * 100.0
 
 
@@ -681,6 +885,9 @@ def transform_leg_from_joint(
 ) -> Tuple[np.ndarray, int, int]:
 
     sprite = leg["sprite"]
+
+    # Rotate the complete extracted leg around its proximal joint.
+    # This preserves the actual original line drawing.
     proximal = leg["joints"]["proximal"]
 
     rotated, M = rotate_rgba(
@@ -689,12 +896,21 @@ def transform_leg_from_joint(
         center=proximal,
     )
 
+    # Transform the original proximal point so we can place the sprite
+    # at exactly the same anatomical location.
     px, py = proximal
+
     new_px = M[0, 0] * px + M[0, 1] * py + M[0, 2]
     new_py = M[1, 0] * px + M[1, 1] * py + M[1, 2]
 
     global_x, global_y = leg["bbox"][0], leg["bbox"][1]
 
+    target_x = int(global_x + px - (new_px - (new_px - px)))
+    target_y = int(global_y + py - (new_py - (new_py - py)))
+
+    # Simpler and more stable placement:
+    # find where the transformed proximal point sits in rotated image,
+    # then place that point at the original global proximal position.
     tx = int(round(global_x + px - new_px))
     ty = int(round(global_y + py - new_py))
 
@@ -708,3 +924,1016 @@ def erase_original_leg_from_background(
 
     mask = polygon_mask(
         base_bgr.shape[:2],
+        leg.get("polygon", []),
+        dilation=max(4, min(base_bgr.shape[:2]) // 120),
+    )
+
+    if cv2.countNonZero(mask) == 0:
+        return base_bgr
+
+    # Inpainting keeps the background rather than painting a white box.
+    # For simple paper backgrounds this is usually very clean.
+    try:
+        return cv2.inpaint(
+            base_bgr,
+            mask,
+            5,
+            cv2.INPAINT_TELEA,
+        )
+    except Exception:
+        return base_bgr
+
+
+def make_four_keyframes(
+    image_bgr: np.ndarray,
+    prepared_legs: List[Dict[str, Any]],
+    scene_data: Dict[str, Any],
+    stride: float,
+    bob_amount: float,
+) -> List[np.ndarray]:
+
+    if not prepared_legs:
+        return [image_bgr.copy() for _ in range(4)]
+
+    # Remove all animated legs from the original plate first.
+    clean_plate = image_bgr.copy()
+
+    for leg in scene_data.get("parts", []):
+        if not isinstance(leg, dict):
+            continue
+
+        name = str(leg.get("name", "")).lower()
+        if "leg" in name or str(leg.get("type", "")).lower() == "leg":
+            clean_plate = erase_original_leg_from_background(
+                clean_plate,
+                leg,
+            )
+
+    frames = []
+
+    # Four deliberately different key poses.
+    cycle_positions = [0.00, 0.25, 0.50, 0.75]
+
+    for key_index, cycle_t in enumerate(cycle_positions):
+        frame = clean_plate.copy()
+
+        # Very small body bob. This affects the whole assembled animal,
+        # but we keep it subtle because the original drawing is preserved.
+        body_y_shift = int(
+            math.sin(2.0 * math.pi * cycle_t) *
+            image_bgr.shape[0] *
+            bob_amount
+        )
+
+        for leg in prepared_legs:
+            side = leg["side"]
+
+            angle = leg_swing(
+                side,
+                cycle_t,
+                stride,
+            )
+
+            # Different front/back weighting makes the cycle less robotic.
+            if "back" in side.lower():
+                angle *= 0.85
+
+            rotated, x, y = transform_leg_from_joint(
+                leg,
+                angle,
+            )
+
+            y += body_y_shift
+
+            frame = overlay_rgba(
+                frame,
+                rotated,
+                x,
+                y,
+            )
+
+        frames.append(frame)
+
+    return frames
+
+
+# ============================================================
+# SMOOTH INTERPOLATION
+# ============================================================
+
+def ease_in_out(t: float) -> float:
+    return t * t * (3.0 - 2.0 * t)
+
+
+def interpolate_keyframe_images(
+    keyframes: List[np.ndarray],
+    frames_per_segment: int,
+) -> List[np.ndarray]:
+
+    if len(keyframes) < 2:
+        return keyframes
+
+    result = []
+
+    for i in range(len(keyframes)):
+        a = keyframes[i]
+        b = keyframes[(i + 1) % len(keyframes)]
+
+        for j in range(frames_per_segment):
+            t = j / float(frames_per_segment)
+            t = ease_in_out(t)
+
+            blended = cv2.addWeighted(
+                a,
+                1.0 - t,
+                b,
+                t,
+                0,
+            )
+
+            result.append(blended)
+
+    return result
+
+
+# ============================================================
+# WALK-IN / MERGE
+# ============================================================
+
+def resize_rgba(
+    sprite: np.ndarray,
+    scale: float,
+) -> np.ndarray:
+
+    if scale <= 0:
+        return np.zeros((1, 1, 4), dtype=np.uint8)
+
+    h, w = sprite.shape[:2]
+
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+
+    return cv2.resize(
+        sprite,
+        (nw, nh),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+
+def create_animal_walk_in_frame(
+    background: np.ndarray,
+    animal_rgba: np.ndarray,
+    original_bbox: Tuple[int, int, int, int],
+    progress: float,
+) -> np.ndarray:
+
+    frame = background.copy()
+
+    x1, y1, x2, y2 = original_bbox
+    target_x = x1
+    target_y = y1
+
+    ah, aw = animal_rgba.shape[:2]
+
+    # Start just outside the left side.
+    start_x = -aw - 20
+
+    current_x = int(
+        start_x +
+        (target_x - start_x) *
+        ease_in_out(progress)
+    )
+
+    # Small vertical bounce.
+    bob = int(
+        math.sin(progress * math.pi * 6.0) *
+        background.shape[0] *
+        0.008
+    )
+
+    frame = overlay_rgba(
+        frame,
+        animal_rgba,
+        current_x,
+        target_y + bob,
+    )
+
+    return frame
+
+
+def create_merge_frame(
+    animated_frame: np.ndarray,
+    original_frame: np.ndarray,
+    progress: float,
+) -> np.ndarray:
+
+    p = ease_in_out(progress)
+
+    return cv2.addWeighted(
+        animated_frame,
+        1.0 - p,
+        original_frame,
+        p,
+        0,
+    )
+
+
+# ============================================================
+# FULL ANIMATION
+# ============================================================
+
+def build_animation(
+    image_bgr: np.ndarray,
+    animal_rgba: np.ndarray,
+    animal_bbox: Tuple[int, int, int, int],
+    keyframes: List[np.ndarray],
+    total_frames: int,
+    walk_cycles: int,
+    fps: int,
+    mode: str,
+    walk_in_fraction: float,
+    merge_fraction: float,
+) -> List[np.ndarray]:
+
+    original = image_bgr.copy()
+
+    # Use keyframes repeatedly for the in-place walking section.
+    walk_frames = max(
+        8,
+        int(total_frames * 0.60),
+    )
+
+    if walk_cycles > 0:
+        walk_frames = max(
+            walk_frames,
+            walk_cycles * 16,
+        )
+
+    smooth_cycle = interpolate_keyframe_images(
+        keyframes,
+        frames_per_segment=max(2, walk_frames // 4),
+    )
+
+    # Repeat/truncate according to requested cycles.
+    desired_walk_count = max(
+        8,
+        walk_cycles * 16,
+    )
+
+    walk_sequence = []
+
+    for i in range(desired_walk_count):
+        walk_sequence.append(
+            smooth_cycle[i % len(smooth_cycle)].copy()
+        )
+
+    # --------------------------------------------------------
+    # Mode: walk in place only
+    # --------------------------------------------------------
+    if mode == "Walk in place only":
+        return walk_sequence
+
+    # --------------------------------------------------------
+    # Walk-in
+    # --------------------------------------------------------
+    walk_in_count = max(
+        4,
+        int(total_frames * walk_in_fraction),
+    )
+
+    walk_in_frames = []
+
+    # Start from a background-only plate.
+    x1, y1, x2, y2 = animal_bbox
+
+    animal_mask = animal_rgba[:, :, 3]
+
+    background = original.copy()
+
+    # Remove the original animal from the plate.
+    # Dilate slightly to remove stray outline pixels.
+    full_mask = np.zeros(
+        original.shape[:2],
+        dtype=np.uint8,
+    )
+
+    full_mask[y1:y2, x1:x2] = animal_mask
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (7, 7),
+    )
+    full_mask = cv2.dilate(full_mask, kernel)
+
+    try:
+        background = cv2.inpaint(
+            background,
+            full_mask,
+            7,
+            cv2.INPAINT_TELEA,
+        )
+    except Exception:
+        pass
+
+    for i in range(walk_in_count):
+        p = i / max(1, walk_in_count - 1)
+
+        walk_in_frames.append(
+            create_animal_walk_in_frame(
+                background,
+                animal_rgba,
+                animal_bbox,
+                p,
+            )
+        )
+
+    # --------------------------------------------------------
+    # Put the walk cycle at the original location.
+    # --------------------------------------------------------
+    remaining = max(
+        1,
+        total_frames - walk_in_count,
+    )
+
+    if mode == "Walk in → walk in place":
+        merge_count = 0
+    else:
+        merge_count = max(
+            4,
+            int(total_frames * merge_fraction),
+        )
+
+    cycle_count = max(
+        1,
+        remaining - merge_count,
+    )
+
+    cycle_frames = [
+        walk_sequence[i % len(walk_sequence)].copy()
+        for i in range(cycle_count)
+    ]
+
+    result = walk_in_frames + cycle_frames
+
+    # --------------------------------------------------------
+    # Final merge back into ORIGINAL image.
+    # --------------------------------------------------------
+    if merge_count > 0:
+        animated_last = (
+            result[-1]
+            if result
+            else original.copy()
+        )
+
+        for i in range(merge_count):
+            p = i / max(1, merge_count - 1)
+
+            result.append(
+                create_merge_frame(
+                    animated_last,
+                    original,
+                    p,
+                )
+            )
+
+    # Exactly requested frame count where possible.
+    if len(result) > total_frames:
+        result = result[:total_frames]
+
+    while len(result) < total_frames:
+        result.append(
+            result[-1].copy()
+            if result
+            else original.copy()
+        )
+
+    return result
+
+
+# ============================================================
+# EXPORT
+# ============================================================
+
+def create_gif(
+    frames: List[np.ndarray],
+    fps: int,
+) -> bytes:
+
+    if not frames:
+        return b""
+
+    pil_frames = [
+        Image.fromarray(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        )
+        for frame in frames
+    ]
+
+    buffer = io.BytesIO()
+
+    duration = max(
+        20,
+        int(1000 / max(1, fps)),
+    )
+
+    pil_frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration,
+        loop=0,
+        optimize=False,
+    )
+
+    return buffer.getvalue()
+
+
+def create_mp4(
+    frames: List[np.ndarray],
+    fps: int,
+) -> Optional[bytes]:
+
+    if not frames:
+        return None
+
+    h, w = frames[0].shape[:2]
+
+    # MP4 codecs on Streamlit Cloud can vary, so try mp4v first.
+    buffer = io.BytesIO()
+
+    temp_path = "/tmp/animal_walk.mp4"
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    writer = cv2.VideoWriter(
+        temp_path,
+        fourcc,
+        float(fps),
+        (w, h),
+    )
+
+    if not writer.isOpened():
+        return None
+
+    for frame in frames:
+        writer.write(frame)
+
+    writer.release()
+
+    try:
+        with open(temp_path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def create_frame_zip(
+    frames: List[np.ndarray],
+) -> bytes:
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(
+        buffer,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as zf:
+
+        for i, frame in enumerate(frames, 1):
+            ok, encoded = cv2.imencode(
+                ".png",
+                frame,
+            )
+
+            if ok:
+                zf.writestr(
+                    f"frame_{i:03d}.png",
+                    encoded.tobytes(),
+                )
+
+    return buffer.getvalue()
+
+
+def create_keyframe_zip(
+    keyframes: List[np.ndarray],
+) -> bytes:
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(
+        buffer,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as zf:
+
+        for i, frame in enumerate(keyframes, 1):
+            ok, encoded = cv2.imencode(
+                ".png",
+                frame,
+            )
+
+            if ok:
+                zf.writestr(
+                    f"walk_keyframe_{i}.png",
+                    encoded.tobytes(),
+                )
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# VISUALIZE GEMINI DETECTION
+# ============================================================
+
+def draw_detection_overlay(
+    image_bgr: np.ndarray,
+    scene_data: Dict[str, Any],
+) -> np.ndarray:
+
+    output = image_bgr.copy()
+    h, w = output.shape[:2]
+
+    # Animal polygon.
+    animal_polygon = scene_data.get("animal_polygon") or []
+
+    pts = normalized_polygon_to_px(
+        animal_polygon,
+        w,
+        h,
+    )
+
+    if len(pts) >= 3:
+        cv2.polylines(
+            output,
+            [pts],
+            True,
+            (0, 180, 0),
+            max(2, min(h, w) // 300),
+        )
+
+    # Parts.
+    for part in scene_data.get("parts", []):
+        if not isinstance(part, dict):
+            continue
+
+        polygon = part.get("polygon") or []
+
+        p = normalized_polygon_to_px(
+            polygon,
+            w,
+            h,
+        )
+
+        if len(p) >= 3:
+            cv2.polylines(
+                output,
+                [p],
+                True,
+                (255, 120, 0),
+                max(1, min(h, w) // 500),
+            )
+
+        joints = part.get("joints") or {}
+
+        for joint_name, joint in joints.items():
+            if isinstance(joint, (list, tuple)) and len(joint) >= 2:
+                x, y = normalized_point_to_px(
+                    joint,
+                    w,
+                    h,
+                )
+
+                cv2.circle(
+                    output,
+                    (x, y),
+                    max(3, min(h, w) // 120),
+                    (0, 0, 255),
+                    -1,
+                )
+
+                cv2.putText(
+                    output,
+                    str(joint_name),
+                    (x + 5, y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.35, min(h, w) / 2500),
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+    return output
+
+
+# ============================================================
+# UI
+# ============================================================
+
+uploaded_file = st.file_uploader(
+    "Upload your hand-drawn scene",
+    type=["png", "jpg", "jpeg"],
+)
+
+if not uploaded_file:
+    st.info(
+        "Upload the drawing containing the animal and background. "
+        "Then Gemini will identify the animal and its joints."
+    )
+    st.stop()
+
+file_bytes = uploaded_file.getvalue()
+
+# Normalize every uploaded JPG/JPEG/PNG to PNG bytes before sending it to
+# Gemini. This prevents a MIME-type mismatch when a JPG is uploaded.
+try:
+    uploaded_pil = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    png_buffer = io.BytesIO()
+    uploaded_pil.save(png_buffer, format="PNG")
+    gemini_image_bytes = png_buffer.getvalue()
+except Exception as exc:
+    st.error(f"Could not prepare the uploaded image for Gemini: {exc}")
+    st.stop()
+
+image_np = cv2.imdecode(
+    np.frombuffer(file_bytes, np.uint8),
+    cv2.IMREAD_COLOR,
+)
+
+if image_np is None:
+    st.error("Could not read the uploaded image.")
+    st.stop()
+
+st.subheader("Original drawing")
+
+c1, c2 = st.columns(2)
+
+with c1:
+    st.image(
+        cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB),
+        caption="Original",
+        use_container_width=True,
+    )
+
+with c2:
+    st.markdown(
+        """
+### Workflow
+
+**1. Gemini detects the animal**
+
+↓  
+
+**2. Gemini maps its anatomy and joints**
+
+↓  
+
+**3. Python extracts the ORIGINAL animal parts**
+
+↓  
+
+**4. Python creates 4 walking poses**
+
+↓  
+
+**5. The 4 poses are interpolated**
+
+↓  
+
+**6. GIF / MP4 / individual frames are produced**
+"""
+    )
+
+
+# ============================================================
+# STEP 1
+# ============================================================
+
+st.markdown("---")
+st.header("🔍 Step 1 — Detect animal and anatomy")
+
+if st.button(
+    "Analyze drawing with Gemini",
+    type="primary",
+    use_container_width=True,
+):
+
+    with st.spinner(
+        "Gemini is locating the animal, legs and joints..."
+    ):
+
+        scene_data = analyze_and_segment_scene(
+            gemini_image_bytes,
+            GEMINI_API_KEY,
+            None,
+        )
+
+    if scene_data:
+
+        st.session_state["scene_data"] = scene_data
+
+        # Clear old render after a new analysis.
+        st.session_state.pop("animation_frames", None)
+        st.session_state.pop("keyframes", None)
+
+
+# ============================================================
+# SHOW ANALYSIS
+# ============================================================
+
+if "scene_data" not in st.session_state:
+    st.stop()
+
+scene_data = st.session_state["scene_data"]
+
+animal_name = scene_data.get(
+    "identified_character",
+    "character",
+)
+
+st.success(
+    f"Detected character: **{animal_name}**"
+)
+
+parts = scene_data.get("parts", [])
+leg_parts = get_leg_parts(scene_data)
+
+st.write(
+    f"Gemini detected **{len(parts)} anatomical parts**, "
+    f"including **{len(leg_parts)} leg(s)**."
+)
+
+with st.expander("View Gemini analysis JSON"):
+    st.json(scene_data)
+
+overlay = draw_detection_overlay(
+    image_np,
+    scene_data,
+)
+
+st.image(
+    cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
+    caption="Gemini detection — green = animal, orange = parts, red = joints",
+    use_container_width=True,
+)
+
+
+# ============================================================
+# STEP 2 — PREPARE LEGS
+# ============================================================
+
+st.markdown("---")
+st.header("🦵 Step 2 — Prepare walking anatomy")
+
+prepared_legs = []
+
+for leg in leg_parts:
+    prepared = prepare_leg_sprite(
+        image_np,
+        leg,
+    )
+
+    if prepared is not None:
+        prepared_legs.append(prepared)
+
+if not prepared_legs:
+    st.warning(
+        "Gemini did not return usable leg polygons and joints. "
+        "Try analyzing again with a clearer image."
+    )
+
+    st.stop()
+
+st.success(
+    f"Prepared {len(prepared_legs)} movable leg(s) from the original drawing."
+)
+
+for leg in prepared_legs:
+    with st.expander(
+        f"🦵 {leg['name']}"
+    ):
+        st.write("Side:", leg["side"])
+        st.write("Global joints:", leg["global_joints"])
+
+
+# ============================================================
+# STEP 3 — GENERATE 4 KEYFRAMES
+# ============================================================
+
+st.markdown("---")
+st.header("🎬 Step 3 — Generate the 4 walking drawings")
+
+st.write(
+    "These are not AI redrawings. Each pose is constructed from the "
+    "original hand-drawn leg pixels and rotated around the detected joints."
+)
+
+if st.button(
+    "🦒 Generate 4 Walking Poses",
+    type="primary",
+    use_container_width=True,
+):
+
+    with st.spinner(
+        "Building four hand-drawn walking poses..."
+    ):
+
+        keyframes = make_four_keyframes(
+            image_np,
+            prepared_legs,
+            scene_data,
+            STRIDE,
+            BOB_AMOUNT,
+        )
+
+        st.session_state["keyframes"] = keyframes
+
+        # Clear old full animation.
+        st.session_state.pop("animation_frames", None)
+
+
+if "keyframes" in st.session_state:
+
+    keyframes = st.session_state["keyframes"]
+
+    cols = st.columns(4)
+
+    for i, frame in enumerate(keyframes):
+
+        with cols[i]:
+
+            st.image(
+                cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB,
+                ),
+                caption=f"Walking pose {i + 1}",
+                use_container_width=True,
+            )
+
+    keyframe_zip = create_keyframe_zip(
+        keyframes
+    )
+
+    st.download_button(
+        "⬇️ Download the 4 separate walking drawings",
+        data=keyframe_zip,
+        file_name="giraffe_or_animal_walk_keyframes.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# STEP 4 — FULL ANIMATION
+# ============================================================
+
+if "keyframes" not in st.session_state:
+    st.stop()
+
+st.markdown("---")
+st.header("🎞️ Step 4 — Render full animation")
+
+st.write(
+    f"Mode: **{ANIMATION_MODE}**  |  "
+    f"{TOTAL_FRAMES} frames  |  "
+    f"{FPS} FPS  |  "
+    f"{WALK_CYCLES} walking cycle(s)"
+)
+
+if st.button(
+    "🚀 Render Animation",
+    type="primary",
+    use_container_width=True,
+):
+
+    with st.spinner(
+        "Rendering the walking animation..."
+    ):
+
+        animal_rgba, animal_bbox, _ = extract_animal(
+            image_np,
+            scene_data,
+        )
+
+        frames = build_animation(
+            image_np,
+            animal_rgba,
+            animal_bbox,
+            st.session_state["keyframes"],
+            TOTAL_FRAMES,
+            WALK_CYCLES,
+            FPS,
+            ANIMATION_MODE,
+            WALK_IN_FRACTION,
+            MERGE_FRACTION,
+        )
+
+        st.session_state["animation_frames"] = frames
+
+    st.success(
+        f"Finished rendering {len(frames)} frames."
+    )
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+if "animation_frames" in st.session_state:
+
+    frames = st.session_state["animation_frames"]
+
+    st.markdown("---")
+    st.header("🎉 Result")
+
+    gif_bytes = create_gif(
+        frames,
+        FPS,
+    )
+
+    st.image(
+        gif_bytes,
+        caption="Generated hand-drawn walking animation",
+        use_container_width=True,
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.download_button(
+            "⬇️ Download GIF",
+            data=gif_bytes,
+            file_name="hand_drawn_animal_walk.gif",
+            mime="image/gif",
+            use_container_width=True,
+        )
+
+    with col2:
+        mp4_bytes = create_mp4(
+            frames,
+            FPS,
+        )
+
+        if mp4_bytes:
+            st.download_button(
+                "⬇️ Download MP4",
+                data=mp4_bytes,
+                file_name="hand_drawn_animal_walk.mp4",
+                mime="video/mp4",
+                use_container_width=True,
+            )
+        else:
+            st.info(
+                "MP4 encoding is unavailable in this environment."
+            )
+
+    with col3:
+        frame_zip = create_frame_zip(
+            frames,
+        )
+
+        st.download_button(
+            "⬇️ Download all PNG frames",
+            data=frame_zip,
+            file_name="hand_drawn_animal_animation_frames.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    st.markdown("### Individual animation frames")
+
+    preview_count = min(
+        12,
+        len(frames),
+    )
+
+    preview_indices = np.linspace(
+        0,
+        len(frames) - 1,
+        preview_count,
+        dtype=int,
+    )
+
+    preview_cols = st.columns(4)
+
+    for n, idx in enumerate(preview_indices):
+
+        with preview_cols[n % 4]:
+
+            st.image(
+                cv2.cvtColor(
+                    frames[idx],
+                    cv2.COLOR_BGR2RGB,
+                ),
+                caption=f"Frame {idx + 1}",
+                use_container_width=True,
+            )
+
+st.markdown("---")
+st.caption(
+    "The animation is generated algorithmically from the uploaded "
+    "drawing. Gemini is used for visual understanding/geometry, not "
+    "for generating replacement artwork."
+)
+
