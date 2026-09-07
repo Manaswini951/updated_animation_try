@@ -25,7 +25,7 @@ st.set_page_config(
 st.title("🦒 Hand-Drawn Animal Walk Animator")
 st.caption(
     "Gemini identifies the animal and its anatomy. Python creates a "
-    "4-pose walking cycle from the ORIGINAL drawing."
+    "4-pose walking cycle from the ORIGINAL drawing with precision annotations."
 )
 
 # ============================================================
@@ -127,7 +127,7 @@ st.sidebar.info(
 
 
 # ============================================================
-# GEMINI ANALYSIS
+# GEMINI ANALYSIS & DISCOVERY
 # ============================================================
 
 def clean_json_text(text: str) -> str:
@@ -165,13 +165,7 @@ def _model_actions(model_obj: Any) -> List[str]:
 
 
 def discover_available_models(client: genai.Client) -> List[str]:
-    """
-    Ask the Gemini API which models are actually available for this API key.
-
-    Google documents models.list() + supported_actions as the way to find
-    models that support generateContent. We intentionally do not rely on a
-    hard-coded list of old model names.
-    """
+    """Ask the Gemini API which models are actually available for this API key."""
     discovered: List[str] = []
     try:
         for model_obj in client.models.list():
@@ -183,15 +177,10 @@ def discover_available_models(client: genai.Client) -> List[str]:
             if actions and "generateContent" not in actions:
                 continue
 
-            # The API normally returns names like "models/gemini-...".
-            # generate_content accepts the model name with or without the
-            # "models/" prefix depending on SDK/API handling, but keeping the
-            # returned name is safest.
             discovered.append(name)
     except Exception:
         return []
 
-    # Remove duplicates while preserving order.
     unique = []
     seen = set()
     for name in discovered:
@@ -203,15 +192,9 @@ def discover_available_models(client: genai.Client) -> List[str]:
 
 
 def model_priority_score(name: str) -> Tuple[int, str]:
-    """
-    Rank currently available models for image understanding.
-
-    This is only a preference order. Availability is determined dynamically
-    from the user's API key, and every candidate is actually tested.
-    """
+    """Rank currently available models for image understanding."""
     n = name.lower().replace("models/", "")
 
-    # Prefer current fast multimodal Gemini models.
     if "gemini-3.7-flash" in n:
         return (0, n)
     if "gemini-3.6-flash" in n:
@@ -245,7 +228,6 @@ def ordered_model_candidates(client: genai.Client) -> List[str]:
     """Return dynamically available generateContent models in best-first order."""
     available = discover_available_models(client)
 
-    # Prefer Gemini models for this particular image-analysis task.
     gemini_models = [m for m in available if "gemini" in m.lower()]
     other_models = [m for m in available if "gemini" not in m.lower()]
 
@@ -261,7 +243,6 @@ def _safe_response_text(response: Any) -> str:
     if text:
         return str(text)
 
-    # Defensive fallback if .text is unavailable.
     try:
         pieces = []
         for candidate in getattr(response, "candidates", []) or []:
@@ -280,14 +261,7 @@ def analyze_and_segment_scene(
     api_key: str,
     model_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Analyze the drawing using a model that is actually available to the key.
-
-    IMPORTANT: no obsolete hard-coded fallback model list is used here.
-    The app first calls models.list(), filters for generateContent support,
-    ranks candidates, and then tries them one by one. If a model returns a
-    404/403/unsupported-method error, the next available model is tried.
-    """
+    """Analyze the drawing using the updated precision anatomy prompt."""
     if not api_key:
         st.error("Please enter a Gemini API key.")
         return None
@@ -299,85 +273,237 @@ def analyze_and_segment_scene(
         return None
 
     prompt = r"""
-You are analyzing a SINGLE hand-drawn animal scene.
+You are a precision visual-anatomy annotator for a hand-drawn 2D animation
+system.
 
-The goal is NOT to redraw the animal.
-The goal is to give a Python animation program accurate geometry so it
-can cut pieces from the ORIGINAL drawing and move them.
-
-Identify the main animal/character and separate it from the background.
+You are analyzing ONE hand-drawn animal image.
 
 IMPORTANT:
-- Preserve the artist's original drawing.
-- Do NOT invent missing anatomy.
-- Do NOT create new artwork.
-- Estimate geometry from visible pixels.
-- The animal can be a giraffe, horse, cow, dog, cat, rabbit, elephant,
-  dinosaur, person, bird, etc.
-- If the animal has four legs, identify all four separately.
-- For each leg, provide 3 joints along the visible leg:
-  proximal_joint, middle_joint, distal_joint.
-  For a quadruped these correspond approximately to hip/shoulder,
-  knee/elbow, and ankle/wrist/hoof, depending on the leg.
-- Coordinates are normalized 0..100 as [y, x].
-- Polygons should tightly follow the visible part.
-- The animal polygon should tightly surround the WHOLE animal.
-- Include enough margin around every polygon to avoid cutting off
-  hand-drawn strokes.
-- If a tail/head/neck is clearly visible, identify it too.
-- Do not make the animal bbox equal to the whole image unless the
-  animal really occupies the whole image.
+This image will NOT be redrawn by AI.
 
-The four walking poses will be created by Python using these joints.
+Python will physically cut pixels from the ORIGINAL IMAGE and move them.
+Therefore your coordinates must describe the actual visible pixels as
+accurately as possible.
+
+============================================================
+PRIMARY TASK
+============================================================
+
+Identify the animal and identify EVERY VISIBLE LEG.
+
+For every visible leg:
+
+1. Trace ONLY that leg.
+2. Do NOT include background.
+3. Do NOT include the body.
+4. Do NOT include another leg.
+5. Do NOT include shadows on the floor.
+6. Do NOT include large empty regions surrounding the leg.
+7. Follow the visible outer boundary of the drawn leg.
+8. Include the black outline belonging to the leg.
+9. Include the colored interior belonging to the leg.
+10. Include the hoof/foot.
+11. The polygon must begin at the actual attachment point to the body.
+12. Do not cut through the leg unnecessarily.
+
+============================================================
+VERY IMPORTANT: LEG ANATOMY
+============================================================
+
+For each visible leg identify:
+
+root
+upper_leg
+middle_joint
+lower_leg
+hoof
+
+For a quadruped, estimate:
+
+proximal joint = shoulder/hip region
+middle joint = knee/elbow region
+distal joint = ankle/wrist/hoof region
+
+Do NOT place the middle joint in the middle of the bounding box simply
+because it is convenient.
+
+Place it where the drawn leg actually changes direction.
+
+============================================================
+OVERLAPPING LEGS
+============================================================
+
+If one leg overlaps another:
+
+- identify the visible leg separately
+- do NOT merge the two legs into one polygon
+- do NOT invent the hidden portion
+- use only pixels that are actually visible
+
+If the boundary between two legs is uncertain, prefer a smaller polygon
+rather than accidentally including pixels from the other leg.
+
+============================================================
+BODY CONNECTION
+============================================================
+
+The top/root of the leg is extremely important.
+
+The polygon should touch the body exactly where the leg emerges.
+
+Do NOT include a large piece of the abdomen/body.
+
+Do NOT make the leg polygon rectangular.
+
+Do NOT make a large triangular polygon around the leg.
+
+============================================================
+JOINT COORDINATES
+============================================================
+
+Coordinates use normalized [y,x] format from 0 to 100.
+
+Provide:
+
+root
+proximal
+middle
+distal
+hoof
+
+The middle joint must be positioned on the visible centerline of the
+drawn leg.
+
+============================================================
+LEG CENTERLINE
+============================================================
+
+Also provide a centerline containing 5-9 points following the actual
+center of the visible leg.
+
+The centerline must begin at the body attachment and end at the hoof.
+
+============================================================
+LEG WIDTH
+============================================================
+
+Estimate the visible width of the leg at several points.
+
+Return:
+
+width_profile:
+[
+    {"at":0.0,"width":...},
+    {"at":0.25,"width":...},
+    {"at":0.50,"width":...},
+    {"at":0.75,"width":...},
+    {"at":1.0,"width":...}
+]
+
+These widths are normalized relative to image width.
+
+============================================================
+BODY
+============================================================
+
+Identify the body separately.
+
+The body polygon should exclude the legs as much as reasonably possible.
+
+============================================================
+OUTPUT
+============================================================
+
 Return ONLY valid JSON.
 
-Required structure:
+Use this exact structure:
 
 {
   "identified_character": "giraffe",
-  "animal_bbox": [ymin, xmin, ymax, xmax],
-  "animal_polygon": [[y,x], [y,x], ...],
+
+  "animal_bbox": [ymin,xmin,ymax,xmax],
+
+  "animal_polygon": [
+    [y,x],
+    ...
+  ],
+
   "parts": [
+
     {
       "name": "body",
       "type": "body",
-      "polygon": [[y,x], ...]
+      "polygon": [
+        [y,x],
+        ...
+      ]
     },
+
     {
       "name": "front_left_leg",
       "type": "leg",
       "side": "front_left",
-      "polygon": [[y,x], ...],
+
+      "polygon": [
+        [y,x],
+        ...
+      ],
+
       "joints": {
+        "root": [y,x],
         "proximal": [y,x],
         "middle": [y,x],
-        "distal": [y,x]
-      }
+        "distal": [y,x],
+        "hoof": [y,x]
+      },
+
+      "centerline": [
+        [y,x],
+        [y,x],
+        [y,x],
+        [y,x],
+        [y,x]
+      ],
+
+      "width_profile": [
+        {"at":0.0,"width":0.0},
+        {"at":0.25,"width":0.0},
+        {"at":0.50,"width":0.0},
+        {"at":0.75,"width":0.0},
+        {"at":1.0,"width":0.0}
+      ]
     }
   ],
-  "notes": "short description"
+
+  "notes": ""
 }
 
-For a four-legged animal, use these exact leg names when possible:
-front_left_leg
-front_right_leg
-back_left_leg
-back_right_leg
+============================================================
+QUALITY CONTROL BEFORE RETURNING JSON
+============================================================
 
-If only two legs are visible, return the visible legs and do not invent
-the hidden ones.
+Before returning the answer, mentally inspect every leg.
 
-If there is no animal, return:
-{
-  "identified_character": "none",
-  "animal_bbox": null,
-  "animal_polygon": [],
-  "parts": [],
-  "notes": "No clear animal detected"
-}
+For EACH leg ask:
+
+A. Does the polygon contain only the leg?
+B. Does it include the complete visible hoof?
+C. Does it accidentally contain background?
+D. Does it accidentally contain body pixels?
+E. Does it accidentally contain another leg?
+F. Is the root located at the real body attachment?
+G. Is the middle joint located at the actual bend?
+H. Does the centerline follow the actual drawn leg?
+
+If any answer is wrong, correct the coordinates before returning JSON.
+
+Do NOT simplify the leg into a rectangle.
+
+Do NOT approximate the leg using a generic animal model.
+
+Use the actual pixels visible in THIS image.
 """
 
-    # Dynamically discover the models available to THIS API key.
     discovered = ordered_model_candidates(client)
 
     if not discovered:
@@ -387,8 +513,6 @@ If there is no animal, return:
         )
         return None
 
-    # If the UI ever supplies a model name, try it first only if it was
-    # actually discovered. Otherwise AUTO mode ignores it and uses discovery.
     candidates: List[str] = []
     if model_name:
         requested = model_name.strip()
@@ -421,9 +545,6 @@ If there is no animal, return:
                 prompt,
             ]
 
-            # First try JSON mode. If this particular available model does
-            # not support response_mime_type, retry the SAME model once with
-            # a plain text response before abandoning that model.
             try:
                 response = client.models.generate_content(
                     model=current_model,
@@ -433,7 +554,7 @@ If there is no animal, return:
                         temperature=0.1,
                     ),
                 )
-            except Exception as json_mode_error:
+            except Exception:
                 response = client.models.generate_content(
                     model=current_model,
                     contents=contents,
@@ -456,9 +577,6 @@ If there is no animal, return:
         except Exception as exc:
             error_text = str(exc).replace("\n", " ")
             errors.append(f"{current_model}: {error_text}")
-            # Continue automatically. This is intentional: a listed model
-            # can still fail because of quota, regional availability,
-            # transient backend errors, unsupported multimodal input, etc.
             continue
 
     st.error("Gemini analysis failed after trying every available model.")
@@ -574,15 +692,6 @@ def bbox_from_normalized(
     return x1, y1, x2, y2
 
 
-def point_inside_or_near(
-    point: Tuple[int, int],
-    bbox: Tuple[int, int, int, int],
-) -> bool:
-    x, y = point
-    x1, y1, x2, y2 = bbox
-    return x1 <= x <= x2 and y1 <= y <= y2
-
-
 # ============================================================
 # IMAGE / ALPHA HELPERS
 # ============================================================
@@ -601,7 +710,6 @@ def rgba_from_masked_crop(
     if crop.size == 0:
         return np.zeros((1, 1, 4), dtype=np.uint8)
 
-    # Slight feathering keeps hand-drawn strokes from getting harsh edges.
     alpha = cv2.GaussianBlur(crop_mask, (3, 3), 0)
 
     rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
@@ -633,7 +741,6 @@ def extract_animal(
         x1, y1, x2, y2 = bbox
         mask[y1:y2, x1:x2] = 255
 
-    # Clean small holes while preserving hand-drawn contours.
     kernel_size = max(3, int(min(h, w) / 250) * 2 + 1)
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -754,8 +861,12 @@ def prepare_leg_sprite(
     if len(polygon) < 3:
         return None
 
-    if not all(k in joints for k in ("proximal", "middle", "distal")):
+    # Support both new precision keys ('proximal' or fallback check)
+    if not isinstance(joints, dict) or not any(k in joints for k in ("proximal", "root")):
         return None
+
+    # Normalize joints lookup
+    joint_target = joints.get("proximal") or joints.get("root")
 
     h, w = image_bgr.shape[:2]
 
@@ -780,20 +891,28 @@ def prepare_leg_sprite(
 
     points_px = {
         name: normalized_point_to_px(
-            joints[name],
+            coords,
             w,
             h,
         )
-        for name in ("proximal", "middle", "distal")
+        for name, coords in joints.items()
+        if isinstance(coords, (list, tuple)) and len(coords) >= 2
     }
 
     local_joints = {
         name: (
-            points_px[name][0] - x1,
-            points_px[name][1] - y1,
+            coords[0] - x1,
+            coords[1] - y1,
         )
-        for name in points_px
+        for name, coords in points_px.items()
     }
+
+    # Determine rotation center fallback
+    pivot = local_joints.get("proximal") or local_joints.get("root")
+    if not pivot and local_joints:
+        pivot = list(local_joints.values())[0]
+    elif not pivot:
+        pivot = (sprite.shape[1] // 2, 0)
 
     return {
         "name": leg.get("name", "leg"),
@@ -801,6 +920,7 @@ def prepare_leg_sprite(
         "sprite": sprite,
         "bbox": (x1, y1, x2, y2),
         "joints": local_joints,
+        "pivot": pivot,
         "global_joints": points_px,
     }
 
@@ -825,18 +945,6 @@ def get_leg_parts(scene_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 # WALK CYCLE
 # ============================================================
 
-# Angles are intentionally gentle.
-# Each leg gets a different phase so the animal does not look like
-# four legs moving simultaneously.
-
-WALK_ANGLES = {
-    "front_left":  +1.0,
-    "front_right": -1.0,
-    "back_left":   -0.9,
-    "back_right":  +0.9,
-}
-
-
 def leg_phase_for_side(side: str) -> float:
     side = side.lower()
 
@@ -850,13 +958,7 @@ def leg_phase_for_side(side: str) -> float:
     if "back_left" in side:
         return math.pi
 
-    # For generic legs, alternate using a deterministic mapping.
     return 0.0
-
-
-def normalized_cycle(t: float) -> float:
-    """Smooth periodic cycle from 0..1."""
-    return t % 1.0
 
 
 def leg_swing(
@@ -866,16 +968,10 @@ def leg_swing(
 ) -> float:
 
     phase = leg_phase_for_side(side)
-
-    # sin gives forward/back movement.
     s = math.sin(
         2.0 * math.pi * cycle_t + phase
     )
-
-    # Cubic-ish smoothing reduces mechanical motion.
     smooth = s * (0.75 + 0.25 * abs(s))
-
-    # Convert normalized stride to degrees.
     return smooth * stride * 100.0
 
 
@@ -885,32 +981,20 @@ def transform_leg_from_joint(
 ) -> Tuple[np.ndarray, int, int]:
 
     sprite = leg["sprite"]
-
-    # Rotate the complete extracted leg around its proximal joint.
-    # This preserves the actual original line drawing.
-    proximal = leg["joints"]["proximal"]
+    pivot = leg["pivot"]
 
     rotated, M = rotate_rgba(
         sprite,
         angle,
-        center=proximal,
+        center=pivot,
     )
 
-    # Transform the original proximal point so we can place the sprite
-    # at exactly the same anatomical location.
-    px, py = proximal
-
+    px, py = pivot
     new_px = M[0, 0] * px + M[0, 1] * py + M[0, 2]
     new_py = M[1, 0] * px + M[1, 1] * py + M[1, 2]
 
     global_x, global_y = leg["bbox"][0], leg["bbox"][1]
 
-    target_x = int(global_x + px - (new_px - (new_px - px)))
-    target_y = int(global_y + py - (new_py - (new_py - py)))
-
-    # Simpler and more stable placement:
-    # find where the transformed proximal point sits in rotated image,
-    # then place that point at the original global proximal position.
     tx = int(round(global_x + px - new_px))
     ty = int(round(global_y + py - new_py))
 
@@ -931,8 +1015,6 @@ def erase_original_leg_from_background(
     if cv2.countNonZero(mask) == 0:
         return base_bgr
 
-    # Inpainting keeps the background rather than painting a white box.
-    # For simple paper backgrounds this is usually very clean.
     try:
         return cv2.inpaint(
             base_bgr,
@@ -955,7 +1037,6 @@ def make_four_keyframes(
     if not prepared_legs:
         return [image_bgr.copy() for _ in range(4)]
 
-    # Remove all animated legs from the original plate first.
     clean_plate = image_bgr.copy()
 
     for leg in scene_data.get("parts", []):
@@ -970,15 +1051,11 @@ def make_four_keyframes(
             )
 
     frames = []
-
-    # Four deliberately different key poses.
     cycle_positions = [0.00, 0.25, 0.50, 0.75]
 
     for key_index, cycle_t in enumerate(cycle_positions):
         frame = clean_plate.copy()
 
-        # Very small body bob. This affects the whole assembled animal,
-        # but we keep it subtle because the original drawing is preserved.
         body_y_shift = int(
             math.sin(2.0 * math.pi * cycle_t) *
             image_bgr.shape[0] *
@@ -987,14 +1064,12 @@ def make_four_keyframes(
 
         for leg in prepared_legs:
             side = leg["side"]
-
             angle = leg_swing(
                 side,
                 cycle_t,
                 stride,
             )
 
-            # Different front/back weighting makes the cycle less robotic.
             if "back" in side.lower():
                 angle *= 0.85
 
@@ -1060,26 +1135,6 @@ def interpolate_keyframe_images(
 # WALK-IN / MERGE
 # ============================================================
 
-def resize_rgba(
-    sprite: np.ndarray,
-    scale: float,
-) -> np.ndarray:
-
-    if scale <= 0:
-        return np.zeros((1, 1, 4), dtype=np.uint8)
-
-    h, w = sprite.shape[:2]
-
-    nw = max(1, int(w * scale))
-    nh = max(1, int(h * scale))
-
-    return cv2.resize(
-        sprite,
-        (nw, nh),
-        interpolation=cv2.INTER_LINEAR,
-    )
-
-
 def create_animal_walk_in_frame(
     background: np.ndarray,
     animal_rgba: np.ndarray,
@@ -1094,8 +1149,6 @@ def create_animal_walk_in_frame(
     target_y = y1
 
     ah, aw = animal_rgba.shape[:2]
-
-    # Start just outside the left side.
     start_x = -aw - 20
 
     current_x = int(
@@ -1104,7 +1157,6 @@ def create_animal_walk_in_frame(
         ease_in_out(progress)
     )
 
-    # Small vertical bounce.
     bob = int(
         math.sin(progress * math.pi * 6.0) *
         background.shape[0] *
@@ -1157,7 +1209,6 @@ def build_animation(
 
     original = image_bgr.copy()
 
-    # Use keyframes repeatedly for the in-place walking section.
     walk_frames = max(
         8,
         int(total_frames * 0.60),
@@ -1174,7 +1225,6 @@ def build_animation(
         frames_per_segment=max(2, walk_frames // 4),
     )
 
-    # Repeat/truncate according to requested cycles.
     desired_walk_count = max(
         8,
         walk_cycles * 16,
@@ -1187,36 +1237,23 @@ def build_animation(
             smooth_cycle[i % len(smooth_cycle)].copy()
         )
 
-    # --------------------------------------------------------
-    # Mode: walk in place only
-    # --------------------------------------------------------
     if mode == "Walk in place only":
         return walk_sequence
 
-    # --------------------------------------------------------
-    # Walk-in
-    # --------------------------------------------------------
     walk_in_count = max(
         4,
         int(total_frames * walk_in_fraction),
     )
 
     walk_in_frames = []
-
-    # Start from a background-only plate.
     x1, y1, x2, y2 = animal_bbox
-
     animal_mask = animal_rgba[:, :, 3]
-
     background = original.copy()
 
-    # Remove the original animal from the plate.
-    # Dilate slightly to remove stray outline pixels.
     full_mask = np.zeros(
         original.shape[:2],
         dtype=np.uint8,
     )
-
     full_mask[y1:y2, x1:x2] = animal_mask
 
     kernel = cv2.getStructuringElement(
@@ -1237,7 +1274,6 @@ def build_animation(
 
     for i in range(walk_in_count):
         p = i / max(1, walk_in_count - 1)
-
         walk_in_frames.append(
             create_animal_walk_in_frame(
                 background,
@@ -1247,9 +1283,6 @@ def build_animation(
             )
         )
 
-    # --------------------------------------------------------
-    # Put the walk cycle at the original location.
-    # --------------------------------------------------------
     remaining = max(
         1,
         total_frames - walk_in_count,
@@ -1275,9 +1308,6 @@ def build_animation(
 
     result = walk_in_frames + cycle_frames
 
-    # --------------------------------------------------------
-    # Final merge back into ORIGINAL image.
-    # --------------------------------------------------------
     if merge_count > 0:
         animated_last = (
             result[-1]
@@ -1287,7 +1317,6 @@ def build_animation(
 
         for i in range(merge_count):
             p = i / max(1, merge_count - 1)
-
             result.append(
                 create_merge_frame(
                     animated_last,
@@ -1296,7 +1325,6 @@ def build_animation(
                 )
             )
 
-    # Exactly requested frame count where possible.
     if len(result) > total_frames:
         result = result[:total_frames]
 
@@ -1330,7 +1358,6 @@ def create_gif(
     ]
 
     buffer = io.BytesIO()
-
     duration = max(
         20,
         int(1000 / max(1, fps)),
@@ -1358,12 +1385,8 @@ def create_mp4(
         return None
 
     h, w = frames[0].shape[:2]
-
-    # MP4 codecs on Streamlit Cloud can vary, so try mp4v first.
     buffer = io.BytesIO()
-
     temp_path = "/tmp/animal_walk.mp4"
-
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
     writer = cv2.VideoWriter(
@@ -1393,25 +1416,21 @@ def create_frame_zip(
 ) -> bytes:
 
     buffer = io.BytesIO()
-
     with zipfile.ZipFile(
         buffer,
         "w",
         compression=zipfile.ZIP_DEFLATED,
     ) as zf:
-
         for i, frame in enumerate(frames, 1):
             ok, encoded = cv2.imencode(
                 ".png",
                 frame,
             )
-
             if ok:
                 zf.writestr(
                     f"frame_{i:03d}.png",
                     encoded.tobytes(),
                 )
-
     return buffer.getvalue()
 
 
@@ -1420,25 +1439,21 @@ def create_keyframe_zip(
 ) -> bytes:
 
     buffer = io.BytesIO()
-
     with zipfile.ZipFile(
         buffer,
         "w",
         compression=zipfile.ZIP_DEFLATED,
     ) as zf:
-
         for i, frame in enumerate(keyframes, 1):
             ok, encoded = cv2.imencode(
                 ".png",
                 frame,
             )
-
             if ok:
                 zf.writestr(
                     f"walk_keyframe_{i}.png",
                     encoded.tobytes(),
                 )
-
     return buffer.getvalue()
 
 
@@ -1454,9 +1469,7 @@ def draw_detection_overlay(
     output = image_bgr.copy()
     h, w = output.shape[:2]
 
-    # Animal polygon.
     animal_polygon = scene_data.get("animal_polygon") or []
-
     pts = normalized_polygon_to_px(
         animal_polygon,
         w,
@@ -1472,13 +1485,11 @@ def draw_detection_overlay(
             max(2, min(h, w) // 300),
         )
 
-    # Parts.
     for part in scene_data.get("parts", []):
         if not isinstance(part, dict):
             continue
 
         polygon = part.get("polygon") or []
-
         p = normalized_polygon_to_px(
             polygon,
             w,
@@ -1494,8 +1505,13 @@ def draw_detection_overlay(
                 max(1, min(h, w) // 500),
             )
 
-        joints = part.get("joints") or {}
+        # Draw centerline if available
+        centerline = part.get("centerline") or []
+        cl_pts = normalized_polygon_to_px(centerline, w, h)
+        if len(cl_pts) >= 2:
+            cv2.polylines(output, [cl_pts], False, (0, 255, 255), 2)
 
+        joints = part.get("joints") or {}
         for joint_name, joint in joints.items():
             if isinstance(joint, (list, tuple)) and len(joint) >= 2:
                 x, y = normalized_point_to_px(
@@ -1503,7 +1519,6 @@ def draw_detection_overlay(
                     w,
                     h,
                 )
-
                 cv2.circle(
                     output,
                     (x, y),
@@ -1511,7 +1526,6 @@ def draw_detection_overlay(
                     (0, 0, 255),
                     -1,
                 )
-
                 cv2.putText(
                     output,
                     str(joint_name),
@@ -1544,8 +1558,6 @@ if not uploaded_file:
 
 file_bytes = uploaded_file.getvalue()
 
-# Normalize every uploaded JPG/JPEG/PNG to PNG bytes before sending it to
-# Gemini. This prevents a MIME-type mismatch when a JPG is uploaded.
 try:
     uploaded_pil = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     png_buffer = io.BytesIO()
@@ -1629,10 +1641,7 @@ if st.button(
         )
 
     if scene_data:
-
         st.session_state["scene_data"] = scene_data
-
-        # Clear old render after a new analysis.
         st.session_state.pop("animation_frames", None)
         st.session_state.pop("keyframes", None)
 
@@ -1673,7 +1682,7 @@ overlay = draw_detection_overlay(
 
 st.image(
     cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
-    caption="Gemini detection — green = animal, orange = parts, red = joints",
+    caption="Gemini detection — green = animal, orange = parts, red = joints, yellow = centerline",
     use_container_width=True,
 )
 
@@ -1701,7 +1710,6 @@ if not prepared_legs:
         "Gemini did not return usable leg polygons and joints. "
         "Try analyzing again with a clearer image."
     )
-
     st.stop()
 
 st.success(
@@ -1747,21 +1755,16 @@ if st.button(
         )
 
         st.session_state["keyframes"] = keyframes
-
-        # Clear old full animation.
         st.session_state.pop("animation_frames", None)
 
 
 if "keyframes" in st.session_state:
 
     keyframes = st.session_state["keyframes"]
-
     cols = st.columns(4)
 
     for i, frame in enumerate(keyframes):
-
         with cols[i]:
-
             st.image(
                 cv2.cvtColor(
                     frame,
@@ -1778,7 +1781,7 @@ if "keyframes" in st.session_state:
     st.download_button(
         "⬇️ Download the 4 separate walking drawings",
         data=keyframe_zip,
-        file_name="giraffe_or_animal_walk_keyframes.zip",
+        file_name="animal_walk_keyframes.zip",
         mime="application/zip",
         use_container_width=True,
     )
@@ -1795,7 +1798,7 @@ st.markdown("---")
 st.header("🎞️ Step 4 — Render full animation")
 
 st.write(
-    f"Mode: **{ANIMATION_MODE}**  |  "
+    f"Mode: **{ANIMATION_MODE}** |  "
     f"{TOTAL_FRAMES} frames  |  "
     f"{FPS} FPS  |  "
     f"{WALK_CYCLES} walking cycle(s)"
@@ -1918,9 +1921,7 @@ if "animation_frames" in st.session_state:
     preview_cols = st.columns(4)
 
     for n, idx in enumerate(preview_indices):
-
         with preview_cols[n % 4]:
-
             st.image(
                 cv2.cvtColor(
                     frames[idx],
@@ -1936,4 +1937,3 @@ st.caption(
     "drawing. Gemini is used for visual understanding/geometry, not "
     "for generating replacement artwork."
 )
-
