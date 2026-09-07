@@ -40,7 +40,6 @@ GEMINI_API_KEY = st.sidebar.text_input(
     help="Your Google Gemini API key.",
 )
 
-# Initial default options; can be dynamically updated if client connects successfully
 MODEL = st.sidebar.selectbox(
     "Gemini model preference",
     [
@@ -150,14 +149,12 @@ def get_available_models(client: genai.Client) -> List[str]:
     supported_models = []
     try:
         for m in client.models.list():
-            # Check if model supports content generation and is active
             model_name = m.name.replace("models/", "")
             if "flash" in model_name or "pro" in model_name:
                 supported_models.append(model_name)
     except Exception:
         pass
     
-    # Fallback default prioritized list if API listing fails or returns empty
     defaults = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-pro"]
     for d in defaults:
         if d not in supported_models:
@@ -182,7 +179,6 @@ def analyze_and_segment_scene(
         st.error(f"Failed to initialize Gemini client: {e}")
         return None
 
-    # Automatically assemble a robust cascade of models to try
     discovered_models = get_available_models(client)
     
     models_to_try = [preferred_model]
@@ -538,4 +534,177 @@ def rotate_rgba(
 
     M = cv2.getRotationMatrix2D(
         center,
-        angle
+        angle,
+        1.0,
+    )
+
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+
+    M[0, 2] += new_w / 2 - center[0]
+    M[1, 2] += new_h / 2 - center[1]
+
+    rotated = cv2.warpAffine(
+        sprite,
+        M,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+    return rotated, M
+
+
+# ============================================================
+# LEG PREPARATION
+# ============================================================
+
+def prepare_leg_sprite(
+    image_bgr: np.ndarray,
+    leg: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+
+    polygon = leg.get("polygon") or []
+    joints = leg.get("joints") or {}
+
+    if len(polygon) < 3:
+        return None
+
+    if not all(k in joints for k in ("proximal", "middle", "distal")):
+        return None
+
+    h, w = image_bgr.shape[:2]
+
+    mask = polygon_mask(
+        (h, w),
+        polygon,
+        dilation=max(2, min(h, w) // 250),
+    )
+
+    x1, y1, x2, y2 = bbox_from_polygon(
+        polygon,
+        w,
+        h,
+        margin=max(12, min(h, w) // 100),
+    )
+
+    sprite = rgba_from_masked_crop(
+        image_bgr,
+        mask,
+        (x1, y1, x2, y2),
+    )
+
+    points_px = {
+        name: normalized_point_to_px(
+            joints[name],
+            w,
+            h,
+        )
+        for name in ("proximal", "middle", "distal")
+    }
+
+    local_joints = {
+        name: (
+            points_px[name][0] - x1,
+            points_px[name][1] - y1,
+        )
+        for name in points_px
+    }
+
+    return {
+        "name": leg.get("name", "leg"),
+        "side": leg.get("side", leg.get("name", "leg")),
+        "sprite": sprite,
+        "bbox": (x1, y1, x2, y2),
+        "joints": local_joints,
+        "global_joints": points_px,
+    }
+
+
+def get_leg_parts(scene_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    result = []
+
+    for part in scene_data.get("parts", []):
+        if not isinstance(part, dict):
+            continue
+
+        part_type = str(part.get("type", "")).lower()
+        name = str(part.get("name", "")).lower()
+
+        if part_type == "leg" or "leg" in name:
+            result.append(part)
+
+    return result
+
+
+# ============================================================
+# WALK CYCLE
+# ============================================================
+
+def leg_phase_for_side(side: str) -> float:
+    side = side.lower()
+
+    if "front_left" in side:
+        return 0.0
+    if "back_right" in side:
+        return 0.0
+
+    if "front_right" in side:
+        return math.pi
+    if "back_left" in side:
+        return math.pi
+
+    return 0.0
+
+
+def leg_swing(
+    side: str,
+    cycle_t: float,
+    stride: float,
+) -> float:
+
+    phase = leg_phase_for_side(side)
+    s = math.sin(
+        2.0 * math.pi * cycle_t + phase
+    )
+    smooth = s * (0.75 + 0.25 * abs(s))
+    return smooth * stride * 100.0
+
+
+def transform_leg_from_joint(
+    leg: Dict[str, Any],
+    angle: float,
+) -> Tuple[np.ndarray, int, int]:
+
+    sprite = leg["sprite"]
+    proximal = leg["joints"]["proximal"]
+
+    rotated, M = rotate_rgba(
+        sprite,
+        angle,
+        center=proximal,
+    )
+
+    px, py = proximal
+    new_px = M[0, 0] * px + M[0, 1] * py + M[0, 2]
+    new_py = M[1, 0] * px + M[1, 1] * py + M[1, 2]
+
+    global_x, global_y = leg["bbox"][0], leg["bbox"][1]
+
+    tx = int(round(global_x + px - new_px))
+    ty = int(round(global_y + py - new_py))
+
+    return rotated, tx, ty
+
+
+def erase_original_leg_from_background(
+    base_bgr: np.ndarray,
+    leg: Dict[str, Any],
+) -> np.ndarray:
+
+    mask = polygon_mask(
+        base_bgr.shape[:2],
