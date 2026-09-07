@@ -9,18 +9,18 @@ from google import genai
 from google.genai import types
 
 st.set_page_config(
-    page_title="AI Scene Growth & Character Animator",
+    page_title="AI Scene Growth & Fine-Grained Character Animator",
     page_icon="🎬",
     layout="wide",
 )
 
-st.title("🌱 AI-Powered Scene Growth & Character Animator")
+st.title("🌱 AI-Powered Fine-Grained Scene & Character Animator")
 st.markdown(
     """
 **Pipeline Workflow:**
-1. **AI Segmentation:** Gemini identifies individual drawing components (grass, trees, bunny).
-2. **Plate Preserved:** Keeps your original colored background plate intact without blanking it out.
-3. **Sequential Growth & Walk-In:** Scenery elements grow upward into place, and the character walks in.
+1. **Fine-Grained AI Segmentation:** Gemini detects individual scene objects as well as fine character parts (head, ears, arms, legs).
+2. **Plate Preserved:** Keeps your original colored background plate intact.
+3. **Sequential Assembly:** Scenery grows upward, followed by the character parts assembling and walking into place.
 """
 )
 
@@ -34,11 +34,21 @@ def analyze_and_segment_scene(image_bytes, api_key):
     client = genai.Client(api_key=api_key)
     
     prompt = """
-    Analyze this hand-drawn scene. Identify distinct visual elements like background bushes, 
-    grass tufts, trees, and the main character bunny.
-    Return a JSON object detailing each object, its type ('background_element' or 'character'), 
-    its appearance growth order (1 for background scenery/grass, 2 for foreground details, 3 for main character), 
-    and its bounding box coordinates normalized from 0 to 100 [ymin, xmin, ymax, xmax].
+    Analyze this hand-drawn scene in detail. You must break it down into individual fine-grained layers and character parts.
+    Identify:
+    1. Background elements (grass tufts, trees, bushes) with growth_order 1 or 2.
+    2. The character's individual body parts separately: 
+       - "bunny_head"
+       - "bunny_ears"
+       - "bunny_body"
+       - "bunny_left_arm"
+       - "bunny_right_arm"
+       - "bunny_left_leg"
+       - "bunny_right_leg"
+    
+    For each item, specify its type ('background_element' or 'character_part'), 
+    its animation/growth order (backgrounds grow first, character parts assemble last at order 3), 
+    and its precise bounding box coordinates normalized from 0 to 100 [ymin, xmin, ymax, xmax].
     
     Return ONLY valid JSON in this exact format:
     {
@@ -50,8 +60,14 @@ def analyze_and_segment_scene(image_bytes, api_key):
           "box_2d": [ymin, xmin, ymax, xmax]
         },
         {
-          "name": "main_bunny",
-          "type": "character",
+          "name": "bunny_head",
+          "type": "character_part",
+          "growth_order": 3,
+          "box_2d": [ymin, xmin, ymax, xmax]
+        },
+        {
+          "name": "bunny_left_leg",
+          "type": "character_part",
           "growth_order": 3,
           "box_2d": [ymin, xmin, ymax, xmax]
         }
@@ -101,11 +117,8 @@ def extract_element_crop(image_np, box):
 
 def render_growth_frame(base_plate, sprites_data, global_progress):
     h, w = base_plate.shape[:2]
-    
-    # 1. Start with a pristine copy of the original full drawing plate
     frame = cv2.cvtColor(base_plate, cv2.COLOR_BGR2BGRA)
     
-    # Sort elements by growth sequence order
     sorted_sprites = sorted(sprites_data, key=lambda x: x['growth_order'])
 
     for item in sorted_sprites:
@@ -119,19 +132,14 @@ def render_growth_frame(base_plate, sprites_data, global_progress):
             continue
 
         sh, sw = sprite.shape[:2]
-
-        # Before an element's growth window begins, temporarily clear its region from the base plate 
-        # so it can "grow" into position.
         element_progress = (global_progress - start_trigger) / max(1e-6, (end_trigger - start_trigger))
         element_progress = float(np.clip(element_progress, 0.0, 1.0))
 
         if global_progress < start_trigger:
-            # Mask out this region initially (make it blank white/background)
             frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
             continue
 
         if item['type'] == 'background_element':
-            # Scale up growth effect from the base position upward
             current_scale = element_progress
             if current_scale <= 0:
                 frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
@@ -141,25 +149,22 @@ def render_growth_frame(base_plate, sprites_data, global_progress):
             new_h = max(2, int(sh * current_scale))
             
             resized = cv2.resize(sprite, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            
-            # Clear target region first
             frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
             
             anchor_x = orig_pos[0]
             anchor_y = orig_pos[1] + sh - new_h  
-            
             frame = paste_rgba(frame, resized, anchor_x, anchor_y)
 
-        elif item['type'] == 'character':
+        elif item['type'] == 'character_part':
             walk_progress = element_progress
-            start_x = -sw
+            start_x = -sw - 50
             target_x = orig_pos[0]
             current_x = int(start_x + (target_x - start_x) * walk_progress)
             
-            bob = int(math.sin(walk_progress * math.pi * 8) * 4) if walk_progress < 1.0 else 0
+            # Slight floating/bobbing effect for individual character pieces as they walk in
+            bob = int(math.sin(walk_progress * math.pi * 8) * 3) if walk_progress < 1.0 else 0
             current_y = orig_pos[1] + bob
             
-            # Clear character start path area if walking in
             if walk_progress < 1.0:
                 frame[orig_pos[1]:orig_pos[1]+sh, orig_pos[0]:orig_pos[0]+sw] = [255, 255, 255, 255]
                 
@@ -206,13 +211,13 @@ if uploaded_file and GEMINI_API_KEY:
     
     st.image(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB), caption="Original Uploaded Scene", width=500)
 
-    if st.button("🔍 Step 1: Detect Scene Layers with Gemini", type="primary"):
-        with st.spinner("Analyzing artwork structure..."):
+    if st.button("🔍 Step 1: Detect Fine-Grained Layers with Gemini", type="primary"):
+        with st.spinner("Analyzing scene components and limbs..."):
             scene_data = analyze_and_segment_scene(file_bytes, GEMINI_API_KEY)
             
         if scene_data and "scene_elements" in scene_data:
             st.session_state["scene_elements"] = scene_data["scene_elements"]
-            st.success(f"Successfully mapped {len(scene_data['scene_elements'])} visual layers!")
+            st.success(f"Successfully mapped {len(scene_data['scene_elements'])} fine elements (limbs, head, background)!")
             st.json(scene_data)
 
     if "scene_elements" in st.session_state:
@@ -221,7 +226,7 @@ if uploaded_file and GEMINI_API_KEY:
         total_frames = st.slider("Animation Frame Count", 15, 60, 30)
         fps = st.slider("Frames Per Second (FPS)", 6, 24, 12)
 
-        if st.button("🚀 Render Growth & Walk-In GIF"):
+        if st.button("🚀 Render Growth & Limb Assembly GIF"):
             with st.spinner("Generating animation sequence..."):
                 processed_sprites = []
                 for element in st.session_state["scene_elements"]:
@@ -248,11 +253,11 @@ if uploaded_file and GEMINI_API_KEY:
                 gif_bytes = create_gif(frames, fps=fps)
 
                 st.markdown("### 🎉 Result")
-                st.image(gif_bytes, caption="Animation Preview", width=500)
+                st.image(gif_bytes, caption="Fine-Grained Animation Preview", width=500)
                 
                 st.download_button(
                     label="⬇️ Download Animation GIF",
                     data=gif_bytes,
-                    file_name="scene_growth_animation.gif",
-                    mime="image/gif"
+                    file_name="fine_grained_animation.gif",
+                    mime="application/gif"
                 )
