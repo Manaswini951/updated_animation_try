@@ -1048,15 +1048,9 @@ def swing_leg(
     leg,
     swing_angle,
 ):
-    """
-    Treats each leg as a single solid cut-out piece rotating smoothly 
-    around its shoulder/hip (proximal) joint pivot. 
-    This 100% guarantees the leg never tears, splits, or separates into pieces.
-    """
     sprite = leg["sprite"]
     joints = leg["joints"]
 
-    # Pivot around shoulder/hip (proximal) joint
     if "proximal" in joints:
         pivot = (float(joints["proximal"][0]), float(joints["proximal"][1]))
     else:
@@ -1215,7 +1209,7 @@ def remove_animal_from_background(
 
 
 # ============================================================
-# BODY-ONLY SPRITE (WITH LEGS RENDERED UNDERNEATH)
+# BODY-ONLY SPRITE
 # ============================================================
 
 def make_body_sprite(
@@ -1223,10 +1217,6 @@ def make_body_sprite(
     animal_bbox,
     prepared_legs,
 ):
-    """
-    Leaves the body completely intact. The leg roots are tucked safely 
-    underneath the body torso so they never pull away or detach.
-    """
     return animal.copy()
 
 
@@ -1303,8 +1293,6 @@ def create_walking_pose(
 
     bx, by, _, _ = body_bbox
 
-    # 1. Render legs FIRST so their upper attachment points are 
-    # hidden securely underneath the body sprite.
     for index, leg in enumerate(
         prepared_legs
     ):
@@ -1346,7 +1334,6 @@ def create_walking_pose(
             ly + bob,
         )
 
-    # 2. Render body ON TOP of the legs to hide any root seams.
     frame = alpha_over(
         frame,
         body_sprite,
@@ -2286,4 +2273,145 @@ if st.button(
     use_container_width=True,
 ):
     with st.spinner(
-        "
+        "Rendering complete animation..."
+    ):
+        locomotion_profile = scene.get("locomotion_profile", {})
+
+        frames = build_animation(
+            image=image,
+            animal=animal,
+            animal_bbox=animal_bbox,
+            body_sprite=body_sprite,
+            prepared_legs=prepared_legs,
+            total_frames=TOTAL_FRAMES,
+            walk_cycles=WALK_CYCLES,
+            mode=ANIMATION_MODE,
+            walk_in_fraction=WALK_IN_FRACTION,
+            stand_fraction=STAND_FRACTION,
+            merge_fraction=MERGE_FRACTION,
+            locomotion_profile=locomotion_profile,
+        )
+
+        st.session_state[
+            "frames"
+        ] = frames
+
+    st.success(
+        f"Rendered {len(frames)} frames at {FPS} FPS."
+    )
+
+
+# ============================================================
+# RESULT
+# ============================================================
+
+if "frames" in st.session_state:
+    frames = st.session_state[
+        "frames"
+    ]
+
+    gif = gif_bytes(
+        frames,
+        FPS,
+    )
+
+    st.markdown("---")
+
+    st.header(
+        "🎉 Final Animation"
+    )
+
+    st.image(
+        gif,
+        caption=(
+            "White canvas → walking animal → "
+            "fully connected limbs → scenery merge"
+        ),
+        use_container_width=True,
+    )
+
+    a, b, c = st.columns(3)
+
+    with a:
+        st.download_button(
+            "⬇️ Download GIF",
+            gif,
+            "connected_animal_walk.gif",
+            "image/gif",
+            use_container_width=True,
+        )
+
+    with b:
+        mp4 = mp4_bytes(
+            frames,
+            FPS,
+        )
+
+        if mp4:
+            st.download_button(
+                "⬇️ Download MP4",
+                mp4,
+                "connected_animal_walk.mp4",
+                "video/mp4",
+                use_container_width=True,
+            )
+
+        else:
+            st.info(
+                "MP4 unavailable in this environment."
+            )
+
+    with c:
+        st.download_button(
+            "⬇️ Download PNG frames",
+            zip_frames(
+                frames,
+                "animal_walk_frame",
+            ),
+            "connected_animal_walk_frames.zip",
+            "application/zip",
+            use_container_width=True,
+        )
+
+    st.markdown(
+        "### 🖼️ Animation frame preview"
+    )
+
+    indices = np.linspace(
+        0,
+        len(frames) - 1,
+        min(
+            16,
+            len(frames),
+        ),
+        dtype=int,
+    )
+
+    cols = st.columns(4)
+
+    for n, index in enumerate(
+        indices
+    ):
+        with cols[
+            n % 4
+        ]:
+            st.image(
+                cv2.cvtColor(
+                    frames[index],
+                    cv2.COLOR_BGR2RGB,
+                ),
+                caption=f"Frame {index + 1}",
+                use_container_width=True,
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "v6 — Solid connected animation. Gemini provides dynamic anatomy & joints. "
+    "Python performs pendulum limb rotation with zero separation."
+)
