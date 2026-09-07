@@ -514,25 +514,25 @@ st.write("Unlike the old version, the whole leg is no longer rotated as one rigi
 if st.button("🦒 Generate 4 improved walking poses",type="primary",use_container_width=True):
     with st.spinner("Building articulated poses..."):
         keys=keyframes(image,prepared,scene)
-        st.session_state.keys=keys; st.session_state.pop("frames",None)
+        st.session_state["walk_keyframes"] = keys; st.session_state.pop("frames",None)
 
-if "keys" in st.session_state:
+if "walk_keyframes" in st.session_state:
     cols=st.columns(4)
-    for i,f in enumerate(st.session_state.keys):
+    for i,f in enumerate(st.session_state["walk_keyframes"]):
         with cols[i]:st.image(cv2.cvtColor(f,cv2.COLOR_BGR2RGB),caption=f"Pose {i+1}",use_container_width=True)
-    st.download_button("⬇️ Download 4 key poses",zip_frames(st.session_state.keys,"walk_pose"),"animal_walk_keyposes.zip","application/zip",use_container_width=True)
+    st.download_button("⬇️ Download 4 key poses",zip_frames(st.session_state["walk_keyframes"],"walk_pose"),"animal_walk_keyposes.zip","application/zip",use_container_width=True)
 
 st.markdown("---")
 st.header("🎞️ Step 3 — Render animation")
 if st.button("🚀 Render animation",type="primary",use_container_width=True):
     with st.spinner("Rendering..."):
         animal,bbox,_=extract_animal(image,scene)
-        frames=build_animation(image,animal,bbox,st.session_state.keys,TOTAL_FRAMES,WALK_CYCLES,ANIMATION_MODE,WALK_IN_FRACTION,MERGE_FRACTION)
-        st.session_state.frames=frames
+        frames=build_animation(image,animal,bbox,st.session_state["walk_keyframes"],TOTAL_FRAMES,WALK_CYCLES,ANIMATION_MODE,WALK_IN_FRACTION,MERGE_FRACTION)
+        st.session_state["frames"] = frames
     st.success(f"Rendered {len(frames)} frames at {FPS} FPS.")
 
 if "frames" in st.session_state:
-    frames=st.session_state.frames; gb=gif_bytes(frames,FPS)
+    frames=st.session_state["frames"]; gb=gif_bytes(frames,FPS)
     st.markdown("### 🎉 Result")
     st.image(gb,caption="Articulated hand-drawn walking animation",use_container_width=True)
     a,b,c=st.columns(3)
