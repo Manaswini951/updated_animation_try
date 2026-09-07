@@ -41,15 +41,15 @@ def detect_character_skeleton(image_bytes, api_key):
       "joints": {
          "head": [x, y],
          "neck": [x, y],
-         "left_knee": [x, y],
-         ...
+         "left_knee": [x, y]
       }
     }
     """
 
     try:
+        # Updated model identifier to gemini-3.6-flash
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                 prompt
