@@ -1,5 +1,6 @@
-streamlit>=1.41.0
-opencv-python-headless>=4.8.0
-numpy>=1.24.0
-Pillow>=10.0.0
-pyarrow<25.0.0
+google-genai
+streamlit
+opencv-python-headless
+numpy
+pillow
+scikit-image
