@@ -1,4 +1,3 @@
-
 import io
 import json
 import math
@@ -20,16 +19,16 @@ from google.genai import types
 # ============================================================
 
 st.set_page_config(
-    page_title="Hand-Drawn Giraffe Walk Animator",
+    page_title="Hand-Drawn Animal Walk Animator",
     page_icon="🦒",
     layout="wide",
 )
 
-st.title("🦒 Hand-Drawn Giraffe Walk Animator — Articulated v3")
+st.title("🦒 Hand-Drawn Animal Walk Animator — Connected Walk v4")
 
 st.caption(
-    "White-canvas entrance → slow articulated walk → exact target position → "
-    "smooth merge into the original drawing."
+    "Gemini analyzes anatomy only. Python moves the ORIGINAL drawing pixels. "
+    "No AI redraw is used."
 )
 
 
@@ -47,65 +46,65 @@ GEMINI_API_KEY = st.sidebar.text_input(
 ANIMATION_MODE = st.sidebar.selectbox(
     "Animation mode",
     [
-        "White canvas → walk in → merge to original",
-        "White canvas → walk in only",
+        "White canvas → walk in → stand → merge",
+        "White canvas → walk in → stand",
         "Walk in place only",
     ],
 )
 
 TOTAL_FRAMES = st.sidebar.slider(
-    "Total animation frames",
-    32,
+    "Total frames",
+    30,
     160,
     80,
-    4,
+    2,
 )
 
 FPS = st.sidebar.slider(
     "FPS",
     4,
     20,
-    6,
+    7,
 )
 
 WALK_CYCLES = st.sidebar.slider(
-    "Walking cycles before target",
-    1,
-    6,
+    "Walking cycles after entering",
+    0,
+    5,
     2,
 )
 
-st.sidebar.markdown("### 🦵 Giraffe Motion")
+st.sidebar.markdown("### 🦵 Giraffe movement")
 
 STEP_ANGLE = st.sidebar.slider(
     "Leg swing",
-    3.0,
-    25.0,
-    11.0,
+    2.0,
+    18.0,
+    8.0,
     0.5,
 )
 
 KNEE_BEND = st.sidebar.slider(
     "Knee bend",
     0.0,
-    25.0,
-    8.0,
+    16.0,
+    5.0,
     0.5,
 )
 
 FOOT_LIFT = st.sidebar.slider(
     "Foot lift",
     0.0,
-    0.12,
-    0.035,
+    0.08,
+    0.025,
     0.005,
 )
 
 BODY_BOB = st.sidebar.slider(
     "Body bob",
     0.0,
-    0.04,
-    0.006,
+    0.025,
+    0.004,
     0.001,
 )
 
@@ -117,38 +116,38 @@ GROUND_LOCK = st.sidebar.slider(
     0.05,
 )
 
-st.sidebar.markdown("### 🚶 Walk Timing")
+st.sidebar.markdown("### 🎬 Timing")
 
 WALK_IN_FRACTION = st.sidebar.slider(
     "Walk-in portion",
-    0.15,
-    0.65,
-    0.38,
+    0.10,
+    0.50,
+    0.25,
     0.02,
 )
 
 STAND_FRACTION = st.sidebar.slider(
-    "Standing / settling portion",
-    0.03,
-    0.20,
-    0.08,
-    0.01,
+    "Standing / walking-in-place portion",
+    0.10,
+    0.60,
+    0.45,
+    0.02,
 )
 
 MERGE_FRACTION = st.sidebar.slider(
-    "Final merge portion",
+    "Final scenery merge",
     0.05,
-    0.30,
+    0.35,
     0.18,
     0.02,
 )
 
-st.sidebar.markdown("### 🧹 Character Extraction")
+st.sidebar.markdown("### 🧹 Drawing extraction")
 
 INK_DILATION = st.sidebar.slider(
     "Ink capture",
     1,
-    8,
+    7,
     3,
     1,
 )
@@ -158,25 +157,25 @@ SHADOW_SUPPRESSION = st.sidebar.checkbox(
     True,
 )
 
+st.sidebar.markdown("### 🚶 Entry")
+
+ENTRY_SIDE = st.sidebar.selectbox(
+    "Animal enters from",
+    ["Left", "Right"],
+)
+
+ENTRY_EXTRA_DISTANCE = st.sidebar.slider(
+    "Entry distance",
+    0.0,
+    0.30,
+    0.08,
+    0.01,
+)
+
 
 # ============================================================
-# BASIC HELPERS
+# GEMINI
 # ============================================================
-
-def ease(t: float) -> float:
-    t = float(np.clip(t, 0.0, 1.0))
-    return t * t * (3.0 - 2.0 * t)
-
-
-def ease_in_out(t: float) -> float:
-    t = float(np.clip(t, 0.0, 1.0))
-    return 3 * t * t - 2 * t * t * t
-
-
-def smootherstep(t: float) -> float:
-    t = float(np.clip(t, 0.0, 1.0))
-    return t * t * t * (t * (t * 6 - 15) + 10)
-
 
 def clean_json_text(text: str) -> str:
     text = (text or "").strip()
@@ -195,10 +194,6 @@ def clean_json_text(text: str) -> str:
     return text
 
 
-# ============================================================
-# GEMINI MODEL DISCOVERY
-# ============================================================
-
 def model_name(obj: Any) -> str:
     return str(
         getattr(obj, "name", "") or ""
@@ -206,25 +201,13 @@ def model_name(obj: Any) -> str:
 
 
 def model_actions(obj: Any) -> List[str]:
+    actions = getattr(obj, "supported_actions", None)
 
-    a = getattr(
-        obj,
-        "supported_actions",
-        None,
-    )
-
-    if a is None:
-        a = getattr(
-            obj,
-            "supportedActions",
-            None,
-        )
+    if actions is None:
+        actions = getattr(obj, "supportedActions", None)
 
     try:
-        return [
-            str(x)
-            for x in (a or [])
-        ]
+        return [str(x) for x in (actions or [])]
     except Exception:
         return []
 
@@ -234,14 +217,14 @@ def discover_models(client: genai.Client) -> List[str]:
     models = []
 
     try:
-        for m in client.models.list():
+        for model in client.models.list():
 
-            name = model_name(m)
+            name = model_name(model)
 
             if not name:
                 continue
 
-            actions = model_actions(m)
+            actions = model_actions(model)
 
             if actions:
                 if not any(
@@ -255,8 +238,8 @@ def discover_models(client: genai.Client) -> List[str]:
     except Exception:
         return []
 
-    unique = []
     seen = set()
+    result = []
 
     for name in models:
 
@@ -264,20 +247,16 @@ def discover_models(client: genai.Client) -> List[str]:
 
         if key not in seen:
             seen.add(key)
-            unique.append(name)
+            result.append(name)
 
-    return unique
+    return result
 
 
 def model_score(name: str) -> Tuple[int, str]:
 
-    x = name.lower().replace(
-        "models/",
-        "",
-    )
+    x = name.lower().replace("models/", "")
 
-    # Prefer current Flash models if available.
-    preferred = [
+    patterns = [
         ("gemini-3.7-flash", 0),
         ("gemini-3.6-flash", 1),
         ("gemini-3.5-flash", 2),
@@ -291,7 +270,7 @@ def model_score(name: str) -> Tuple[int, str]:
         ("gemini", 20),
     ]
 
-    for pattern, score in preferred:
+    for pattern, score in patterns:
 
         if pattern in x:
             return score, x
@@ -299,13 +278,9 @@ def model_score(name: str) -> Tuple[int, str]:
     return 100, x
 
 
-def safe_text(resp: Any) -> str:
+def safe_text(response: Any) -> str:
 
-    text = getattr(
-        resp,
-        "text",
-        None,
-    )
+    text = getattr(response, "text", None)
 
     if text:
         return str(text)
@@ -314,14 +289,11 @@ def safe_text(resp: Any) -> str:
 
     try:
 
-        for candidate in (
-            getattr(
-                resp,
-                "candidates",
-                [],
-            )
-            or []
-        ):
+        for candidate in getattr(
+            response,
+            "candidates",
+            [],
+        ) or []:
 
             content = getattr(
                 candidate,
@@ -329,19 +301,20 @@ def safe_text(resp: Any) -> str:
                 None,
             )
 
-            for part in (
-                getattr(
-                    content,
-                    "parts",
-                    [],
-                )
-                or []
-            ):
+            for part in getattr(
+                content,
+                "parts",
+                [],
+            ) or []:
 
-                if getattr(part, "text", None):
-                    parts.append(
-                        str(part.text)
-                    )
+                value = getattr(
+                    part,
+                    "text",
+                    None,
+                )
+
+                if value:
+                    parts.append(str(value))
 
     except Exception:
         pass
@@ -349,19 +322,17 @@ def safe_text(resp: Any) -> str:
     return "\n".join(parts).strip()
 
 
-# ============================================================
-# GEMINI ANATOMY ANALYSIS
-# ============================================================
-
 def analyze_scene(
     image_bytes: bytes,
     api_key: str,
 ) -> Optional[Dict[str, Any]]:
 
     if not api_key:
+
         st.error(
             "Please enter your Gemini API key."
         )
+
         return None
 
     try:
@@ -370,11 +341,12 @@ def analyze_scene(
             api_key=api_key
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         st.error(
-            f"Could not initialize Gemini: {e}"
+            f"Could not initialize Gemini: {exc}"
         )
+
         return None
 
     models = discover_models(client)
@@ -394,95 +366,109 @@ def analyze_scene(
         return None
 
     prompt = r"""
-Analyze this SINGLE hand-drawn animal scene for a 2D cut-out
-animation system.
+Analyze this SINGLE hand-drawn animal scene for a
+2D cut-out animation system.
+
+DO NOT redraw the animal.
+
+Return geometry only.
+
+Coordinates must be normalized 0..100
+and represented as [y,x].
+
+The Python program will move ORIGINAL pixels.
 
 IMPORTANT:
-The Python program will NOT redraw the animal.
 
-The Python program will move ORIGINAL pixels from the uploaded image.
+1. Identify ONLY the main visible animal.
 
-Return ONLY geometry.
+2. The animal polygon must surround the visible
+   animal but exclude background and floor shadows.
 
-Coordinates must be normalized from 0..100 and written as [y,x].
+3. Identify EVERY clearly visible leg.
 
-The most important task is identifying the animal and its legs.
+4. Do NOT invent hidden legs.
 
-CRITICAL REQUIREMENTS:
+5. Each leg must have a tight polygon around
+   the actual visible leg.
 
-1. Identify only the visible animal.
-2. Ignore:
-   - floor
-   - table
-   - cast shadow
-   - glare
-   - background
-   - scenery
-3. animal_polygon must tightly surround the visible animal.
-4. For every clearly visible leg:
-   - give a polygon tightly surrounding that leg
-   - do not include floor shadow
-   - do not invent hidden legs
-5. Every leg must contain:
+6. Do NOT include floor shadows.
+
+7. Each leg must contain:
+
    proximal
    middle
    distal
-6. proximal:
-   exact visible attachment point to body.
-7. middle:
-   actual visible knee/elbow area.
-   Do not simply place it halfway.
-8. distal:
-   visible ankle/wrist/hoof connection.
-   Do not include cast shadow.
-9. Give side when possible:
-   front_left
-   front_right
-   back_left
-   back_right
-10. Give body polygon when clearly visible.
-11. Give head, neck and tail polygons if clearly visible.
-12. The animal_bbox must tightly contain the animal.
-13. Estimate visible artwork only.
-14. Do not imagine anatomy that cannot be seen.
 
-The output must be valid JSON only.
+8. PROXIMAL:
+   exact point where the visible leg attaches
+   to the body.
 
-Use this exact structure:
+9. MIDDLE:
+   actual knee/elbow/bend location.
+
+10. DISTAL:
+    ankle/wrist/hoof area before any shadow.
+
+11. For a giraffe, preserve the very long
+    characteristic leg geometry.
+
+12. Give a side whenever possible:
+
+    front_left
+    front_right
+    back_left
+    back_right
+
+13. Also identify body/head/neck/tail when visible.
+
+14. Be conservative.
+    Follow the actual ink.
+
+Return ONLY valid JSON.
+
+Schema:
 
 {
   "identified_character":"giraffe",
   "animal_bbox":[ymin,xmin,ymax,xmax],
   "animal_polygon":[[y,x],...],
+
   "parts":[
+
     {
       "name":"body",
       "type":"body",
       "polygon":[[y,x],...]
     },
+
     {
       "name":"front_left_leg",
       "type":"leg",
       "side":"front_left",
+
       "polygon":[[y,x],...],
+
       "joints":{
         "proximal":[y,x],
         "middle":[y,x],
         "distal":[y,x]
       }
     }
+
   ],
+
   "notes":"..."
 }
 
 If no animal is visible:
 
 {
-  "identified_character":"none",
-  "animal_bbox":[0,0,0,0],
-  "animal_polygon":[],
-  "parts":[],
-  "notes":"No visible animal"
+ "identified_character":"none",
+ "animal_bbox":[],
+ "animal_polygon":[],
+ "parts":[],
+ "notes":"..."
 }
 """
 
@@ -502,23 +488,27 @@ If no animal is visible:
 
             try:
 
-                response = client.models.generate_content(
-                    model=current_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.05,
-                    ),
+                response = (
+                    client.models.generate_content(
+                        model=current_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.05,
+                        ),
+                    )
                 )
 
             except Exception:
 
-                response = client.models.generate_content(
-                    model=current_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        temperature=0.05,
-                    ),
+                response = (
+                    client.models.generate_content(
+                        model=current_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            temperature=0.05,
+                        ),
+                    )
                 )
 
             text = safe_text(response)
@@ -533,16 +523,16 @@ If no animal is visible:
                 )
 
             st.success(
-                f"✅ Anatomy analysis completed with `{current_model}`"
+                f"✅ Anatomy analyzed with `{current_model}`"
             )
 
             return data
 
-        except Exception as e:
+        except Exception as exc:
 
             errors.append(
                 f"{current_model}: "
-                f"{str(e).replace(chr(10), ' ')}"
+                f"{str(exc).replace(chr(10), ' ')}"
             )
 
     st.error(
@@ -564,60 +554,54 @@ If no animal is visible:
 
 def pt_px(
     p,
-    w,
-    h,
+    width,
+    height,
 ):
     y = float(
-        np.clip(
-            p[0],
-            0,
-            100,
-        )
+        np.clip(p[0], 0, 100)
     )
 
     x = float(
-        np.clip(
-            p[1],
-            0,
-            100,
-        )
+        np.clip(p[1], 0, 100)
     )
 
     return np.array(
         [
-            x * w / 100.0,
-            y * h / 100.0,
+            x * width / 100.0,
+            y * height / 100.0,
         ],
         dtype=np.float32,
     )
 
 
 def poly_px(
-    poly,
-    w,
-    h,
+    polygon,
+    width,
+    height,
 ):
 
-    if not isinstance(poly, list):
+    if not isinstance(
+        polygon,
+        list,
+    ):
         return np.empty(
             (0, 2),
-            np.int32,
+            dtype=np.int32,
         )
 
     points = []
 
-    for p in poly:
+    for p in polygon:
 
         if (
             isinstance(p, (list, tuple))
             and len(p) >= 2
         ):
-
             points.append(
                 pt_px(
                     p,
-                    w,
-                    h,
+                    width,
+                    height,
                 )
             )
 
@@ -625,32 +609,32 @@ def poly_px(
 
         return np.empty(
             (0, 2),
-            np.int32,
+            dtype=np.int32,
         )
 
     return np.asarray(
         points,
-        np.int32,
+        dtype=np.int32,
     )
 
 
 def poly_mask(
     shape,
-    poly,
-    dil=0,
+    polygon,
+    dilation=0,
 ):
 
-    h, w = shape[:2]
+    height, width = shape[:2]
 
     mask = np.zeros(
-        (h, w),
-        np.uint8,
+        (height, width),
+        dtype=np.uint8,
     )
 
     points = poly_px(
-        poly,
-        w,
-        h,
+        polygon,
+        width,
+        height,
     )
 
     if len(points) >= 3:
@@ -661,13 +645,13 @@ def poly_mask(
             255,
         )
 
-    if dil > 0:
+    if dilation > 0:
 
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (
-                2 * dil + 1,
-                2 * dil + 1,
+                2 * dilation + 1,
+                2 * dilation + 1,
             ),
         )
 
@@ -680,86 +664,113 @@ def poly_mask(
 
 
 def bbox_poly(
-    poly,
-    w,
-    h,
+    polygon,
+    width,
+    height,
     margin=10,
 ):
 
-    p = poly_px(
-        poly,
-        w,
-        h,
+    points = poly_px(
+        polygon,
+        width,
+        height,
     )
 
-    if len(p) < 3:
-        return 0, 0, w, h
+    if len(points) < 3:
 
-    x, y, bw, bh = cv2.boundingRect(p)
+        return (
+            0,
+            0,
+            width,
+            height,
+        )
+
+    x, y, bw, bh = cv2.boundingRect(
+        points
+    )
 
     return (
         max(0, x - margin),
         max(0, y - margin),
-        min(w, x + bw + margin),
-        min(h, y + bh + margin),
+        min(width, x + bw + margin),
+        min(height, y + bh + margin),
     )
 
 
 def bbox_norm(
-    bb,
-    w,
-    h,
+    bbox,
+    width,
+    height,
     margin=10,
 ):
 
     if (
-        not isinstance(bb, list)
-        or len(bb) != 4
+        not isinstance(bbox, list)
+        or len(bbox) != 4
     ):
-
-        return 0, 0, w, h
+        return (
+            0,
+            0,
+            width,
+            height,
+        )
 
     ymin, xmin, ymax, xmax = [
         float(v)
-        for v in bb
+        for v in bbox
     ]
 
     x1 = int(
-        xmin * w / 100
+        xmin * width / 100
     )
 
     y1 = int(
-        ymin * h / 100
+        ymin * height / 100
     )
 
     x2 = int(
-        xmax * w / 100
+        xmax * width / 100
     )
 
     y2 = int(
-        ymax * h / 100
+        ymax * height / 100
     )
 
     return (
         max(0, x1 - margin),
         max(0, y1 - margin),
-        min(w, x2 + margin),
-        min(h, y2 + margin),
+        min(width, x2 + margin),
+        min(height, y2 + margin),
+    )
+
+
+def rotation_matrix(
+    angle,
+    center,
+):
+
+    return cv2.getRotationMatrix2D(
+        (
+            float(center[0]),
+            float(center[1]),
+        ),
+        float(angle),
+        1.0,
     )
 
 
 def rotate_point(
     point,
     center,
-    angle_deg,
+    angle,
 ):
 
-    angle = math.radians(
-        angle_deg
+    angle_rad = math.radians(
+        float(angle)
     )
 
-    c = math.cos(angle)
-    s = math.sin(angle)
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
 
     q = (
         np.asarray(
@@ -769,27 +780,15 @@ def rotate_point(
         - center
     )
 
-    return center + np.array(
-        [
-            c * q[0] - s * q[1],
-            s * q[0] + c * q[1],
-        ],
-        dtype=np.float32,
-    )
-
-
-def rotation_matrix(
-    angle_deg,
-    center,
-):
-
-    return cv2.getRotationMatrix2D(
-        (
-            float(center[0]),
-            float(center[1]),
-        ),
-        angle_deg,
-        1.0,
+    return (
+        center
+        + np.array(
+            [
+                c * q[0] - s * q[1],
+                s * q[0] + c * q[1],
+            ],
+            dtype=np.float32,
+        )
     )
 
 
@@ -811,19 +810,14 @@ def ink_mask(
 
     H, S, V = cv2.split(hsv)
 
-    # Strong colored pixels.
     colored = (
-        S > 38
-    ).astype(
-        np.uint8
-    ) * 255
+        S > 35
+    ).astype(np.uint8) * 255
 
     strong_color = (
         (S > 55)
         & (V > 45)
-    ).astype(
-        np.uint8
-    ) * 255
+    ).astype(np.uint8) * 255
 
     support_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -838,246 +832,259 @@ def ink_mask(
         support_kernel,
     )
 
-    # Dark ink.
     dark = (
         V < 145
-    ).astype(
-        np.uint8
-    ) * 255
+    ).astype(np.uint8) * 255
+
+    dark_attached = cv2.bitwise_and(
+        dark,
+        color_support,
+    )
 
     if shadow_suppress:
-
-        # Black/brown outline is retained when it
-        # is spatially close to actual colored artwork.
-        dark_attached = cv2.bitwise_and(
-            dark,
-            color_support,
-        )
-
-        fg = cv2.bitwise_or(
+        foreground = cv2.bitwise_or(
             colored,
             dark_attached,
         )
-
     else:
-
-        fg = cv2.bitwise_or(
+        foreground = cv2.bitwise_or(
             colored,
             dark,
         )
 
-    fg = cv2.bitwise_and(
-        fg,
+    foreground = cv2.bitwise_and(
+        foreground,
         region_mask,
     )
 
-    # Close tiny holes.
     close_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (3, 3),
     )
 
-    fg = cv2.morphologyEx(
-        fg,
+    foreground = cv2.morphologyEx(
+        foreground,
         cv2.MORPH_CLOSE,
         close_kernel,
         iterations=1,
     )
 
-    # Slight dilation to preserve hand-drawn edges.
     if dilation > 0:
 
-        dil_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (
-                2 * dilation + 1,
-                2 * dilation + 1,
+        foreground = cv2.dilate(
+            foreground,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (
+                    2 * dilation + 1,
+                    2 * dilation + 1,
+                ),
             ),
         )
 
-        fg = cv2.dilate(
-            fg,
-            dil_kernel,
+    return foreground
+
+
+# ============================================================
+# SAFE ALPHA COMPOSITING
+# ============================================================
+
+def alpha_over(
+    destination,
+    source,
+    x,
+    y,
+):
+    """
+    VERY defensive alpha compositor.
+
+    Fixes the previous broadcasting error by ensuring:
+      - source is BGRA
+      - alpha is H x W x 1
+      - destination is BGR
+      - clipping is done before multiplication
+    """
+
+    if source is None:
+        return destination
+
+    if source.size == 0:
+        return destination
+
+    destination = np.asarray(
+        destination,
+        dtype=np.uint8,
+    )
+
+    source = np.asarray(
+        source,
+        dtype=np.uint8,
+    )
+
+    if source.ndim != 3:
+        return destination
+
+    if source.shape[2] == 3:
+
+        alpha_channel = np.full(
+            source.shape[:2],
+            255,
+            dtype=np.uint8,
         )
 
-    return fg
+        source = np.dstack(
+            [
+                source,
+                alpha_channel,
+            ]
+        )
 
+    if source.shape[2] < 4:
+        return destination
 
-def rgba_from_crop(
-    image_bgr,
-    mask,
-    bbox,
-):
+    H, W = destination.shape[:2]
 
-    x1, y1, x2, y2 = bbox
+    sh, sw = source.shape[:2]
 
-    crop = image_bgr[
-        y1:y2,
-        x1:x2,
-    ].copy()
+    x = int(x)
+    y = int(y)
 
-    crop_mask = mask[
-        y1:y2,
-        x1:x2,
+    x1 = max(0, x)
+    y1 = max(0, y)
+
+    x2 = min(W, x + sw)
+    y2 = min(H, y + sh)
+
+    if x1 >= x2 or y1 >= y2:
+        return destination
+
+    sx1 = x1 - x
+    sy1 = y1 - y
+
+    sx2 = sx1 + (x2 - x1)
+    sy2 = sy1 + (y2 - y1)
+
+    src = source[
+        sy1:sy2,
+        sx1:sx2,
     ]
 
-    if crop.size == 0:
-
-        return np.zeros(
-            (1, 1, 4),
-            np.uint8,
-        )
-
-    rgba = cv2.cvtColor(
-        crop,
-        cv2.COLOR_BGR2BGRA,
+    src_rgb = src[:, :, :3].astype(
+        np.float32
     )
 
-    rgba[:, :, 3] = cv2.GaussianBlur(
-        crop_mask,
-        (3, 3),
+    alpha = src[:, :, 3].astype(
+        np.float32
+    ) / 255.0
+
+    if alpha.ndim == 2:
+        alpha = alpha[:, :, None]
+
+    dst = destination[
+        y1:y2,
+        x1:x2,
+    ].astype(np.float32)
+
+    if dst.ndim == 2:
+
+        dst = cv2.cvtColor(
+            dst.astype(np.uint8),
+            cv2.COLOR_GRAY2BGR,
+        ).astype(np.float32)
+
+    if dst.shape[2] != 3:
+        dst = dst[:, :, :3]
+
+    result = (
+        src_rgb * alpha
+        + dst * (1.0 - alpha)
+    )
+
+    destination[
+        y1:y2,
+        x1:x2,
+    ] = np.clip(
+        result,
         0,
-    )
+        255,
+    ).astype(np.uint8)
 
-    return rgba
+    return destination
 
 
 # ============================================================
-# LEG EXTRACTION
+# RGBA TRANSFORM HELPERS
 # ============================================================
 
-def prepare_leg(
-    image_bgr,
-    part,
+def warp_rgba(
+    sprite,
+    alpha_mask,
+    matrix,
 ):
 
-    polygon = part.get(
-        "polygon"
-    ) or []
+    h, w = sprite.shape[:2]
 
-    joints = part.get(
-        "joints"
-    ) or {}
-
-    required = (
-        "proximal",
-        "middle",
-        "distal",
+    transformed = cv2.warpAffine(
+        sprite,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
     )
 
-    if (
-        len(polygon) < 3
-        or not all(
-            key in joints
-            for key in required
-        )
-    ):
-
-        return None
-
-    h, w = image_bgr.shape[:2]
-
-    region = poly_mask(
-        (h, w),
-        polygon,
-        dil=max(
-            1,
-            INK_DILATION,
-        ),
+    transformed_alpha = cv2.warpAffine(
+        alpha_mask,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
     )
 
-    mask = ink_mask(
-        image_bgr,
-        region,
-        SHADOW_SUPPRESSION,
-        INK_DILATION,
-    )
+    transformed[:, :, 3] = transformed_alpha
 
-    margin = max(
-        25,
-        min(h, w) // 45,
-    )
+    return transformed
 
-    bbox = bbox_poly(
-        polygon,
-        w,
-        h,
-        margin=margin,
-    )
 
-    x1, y1, x2, y2 = bbox
+def translate_rgba(
+    sprite,
+    dx,
+    dy,
+):
 
-    sprite = cv2.cvtColor(
-        image_bgr[
-            y1:y2,
-            x1:x2
+    h, w = sprite.shape[:2]
+
+    matrix = np.array(
+        [
+            [1, 0, float(dx)],
+            [0, 1, float(dy)],
         ],
-        cv2.COLOR_BGR2BGRA,
+        dtype=np.float32,
     )
 
-    sprite_alpha = mask[
-        y1:y2,
-        x1:x2
-    ]
-
-    sprite[:, :, 3] = cv2.GaussianBlur(
-        sprite_alpha,
-        (3, 3),
-        0,
+    return cv2.warpAffine(
+        sprite,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
     )
 
-    global_joints = {
-        key: pt_px(
-            joints[key],
-            w,
-            h,
-        )
-        for key in required
-    }
 
-    local_joints = {
-        key:
-            global_joints[key]
-            - np.array(
-                [
-                    x1,
-                    y1,
-                ],
-                np.float32,
-            )
-        for key in required
-    }
-
-    return {
-        "name": part.get(
-            "name",
-            "leg",
-        ),
-        "side": part.get(
-            "side",
-            part.get(
-                "name",
-                "leg",
-            ),
-        ),
-        "sprite": sprite,
-        "bbox": bbox,
-        "joints": local_joints,
-        "global": global_joints,
-    }
-
+# ============================================================
+# LEG DETECTION / PREPARATION
+# ============================================================
 
 def leg_parts(scene):
 
     result = []
 
-    for part in (
-        scene.get(
-            "parts",
-            []
-        )
-        or []
-    ):
+    for part in scene.get(
+        "parts",
+        [],
+    ) or []:
 
         if not isinstance(
             part,
@@ -1103,145 +1110,191 @@ def leg_parts(scene):
             part_type == "leg"
             or "leg" in name
         ):
-
             result.append(part)
 
     return result
 
 
-# ============================================================
-# AFFINE SPRITE UTILITIES
-# ============================================================
-
-def warp_rgba(
-    sprite,
-    alpha,
-    matrix,
+def prepare_leg(
+    image_bgr,
+    part,
 ):
 
-    h, w = sprite.shape[:2]
+    polygon = part.get(
+        "polygon"
+    ) or []
 
-    warped = cv2.warpAffine(
-        sprite,
-        matrix,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(
-            0,
-            0,
-            0,
-            0,
+    joints = part.get(
+        "joints"
+    ) or {}
+
+    if (
+        len(polygon) < 3
+        or not all(
+            key in joints
+            for key in (
+                "proximal",
+                "middle",
+                "distal",
+            )
+        )
+    ):
+        return None
+
+    h, w = image_bgr.shape[:2]
+
+    region = poly_mask(
+        (h, w),
+        polygon,
+        dilation=max(
+            2,
+            INK_DILATION,
         ),
     )
 
-    warped_alpha = cv2.warpAffine(
-        alpha,
-        matrix,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+    mask = ink_mask(
+        image_bgr,
+        region,
+        SHADOW_SUPPRESSION,
+        INK_DILATION,
     )
 
-    warped[:, :, 3] = warped_alpha
-
-    return warped
-
-
-def alpha_over(
-    dst,
-    src,
-    x,
-    y,
-):
-
-    if src is None or src.size == 0:
-        return dst
-
-    sh, sw = src.shape[:2]
-
-    H, W = dst.shape[:2]
-
-    x1 = max(
-        0,
-        int(x),
+    # Bigger margin is important because
+    # the leg will rotate.
+    margin = max(
+        30,
+        min(h, w) // 45,
     )
 
-    y1 = max(
-        0,
-        int(y),
+    bbox = bbox_poly(
+        polygon,
+        w,
+        h,
+        margin=margin,
     )
 
-    x2 = min(
-        W,
-        int(x + sw),
+    x1, y1, x2, y2 = bbox
+
+    sprite = cv2.cvtColor(
+        image_bgr[
+            y1:y2,
+            x1:x2
+        ],
+        cv2.COLOR_BGR2BGRA,
     )
 
-    y2 = min(
-        H,
-        int(y + sh),
-    )
-
-    if x1 >= x2 or y1 >= y2:
-        return dst
-
-    sx1 = x1 - int(x)
-    sy1 = y1 - int(y)
-
-    sx2 = sx1 + (x2 - x1)
-    sy2 = sy1 + (y2 - y1)
-
-    source = src[
-        sy1:sy2,
-        sx1:sx2
-    ].astype(
-        np.float32
-    )
-
-    alpha = (
-        source[:, :, 3:4]
-        / 255.0
-    )
-
-    target = dst[
+    local_mask = mask[
         y1:y2,
         x1:x2
-    ].astype(
-        np.float32
+    ].copy()
+
+    # Slightly strengthen thin hand-drawn lines.
+    local_mask = cv2.dilate(
+        local_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3),
+        ),
     )
 
-    result = (
-        source[:, :, :3] * alpha
-        + target * (1.0 - alpha)
-    )
-
-    dst[
-        y1:y2,
-        x1:x2
-    ] = np.clip(
-        result,
+    sprite[:, :, 3] = cv2.GaussianBlur(
+        local_mask,
+        (3, 3),
         0,
-        255,
-    ).astype(
-        np.uint8
     )
 
-    return dst
+    global_joints = {
+        key: pt_px(
+            joints[key],
+            w,
+            h,
+        )
+        for key in (
+            "proximal",
+            "middle",
+            "distal",
+        )
+    }
+
+    local_joints = {
+        key: global_joints[key]
+        - np.array(
+            [x1, y1],
+            dtype=np.float32,
+        )
+        for key in global_joints
+    }
+
+    return {
+        "name": part.get(
+            "name",
+            "leg",
+        ),
+        "side": part.get(
+            "side",
+            part.get(
+                "name",
+                "leg",
+            ),
+        ),
+        "sprite": sprite,
+        "bbox": bbox,
+        "joints": local_joints,
+        "global": global_joints,
+        "mask": local_mask,
+    }
 
 
 # ============================================================
-# ARTICULATED LEG
+# CONNECTED ARTICULATED LEG
 # ============================================================
+
+def leg_root_radius(leg):
+
+    P = leg["joints"]["proximal"]
+    M = leg["joints"]["middle"]
+
+    length = float(
+        np.linalg.norm(M - P)
+    )
+
+    return max(
+        5,
+        min(
+            24,
+            int(length * 0.18),
+        ),
+    )
+
 
 def articulated_leg(
     leg,
     swing,
-    knee_bend,
+    knee,
     foot_lift,
-    ground_lock,
-    canvas_h,
 ):
+
+    """
+    IMPORTANT DIFFERENCE FROM OLD VERSION:
+
+    The leg is NOT split at a hard boundary.
+
+    Instead:
+
+        BODY
+          │
+       ROOT/COLLAR
+          │
+      ========   <- overlap
+          │
+        KNEE
+       /    \
+      /      \
+     LOWER LEG
+
+    The proximal root remains attached to the body.
+    Upper and lower sections overlap at the knee.
+    """
 
     sprite = leg["sprite"]
 
@@ -1252,122 +1305,165 @@ def articulated_leg(
     D = leg["joints"]["distal"]
 
     # --------------------------------------------------------
-    # Distance from proximal to distal.
-    # Used to split upper and lower segments.
+    # Segment directions
     # --------------------------------------------------------
 
-    total_vec = D - P
+    upper_vector = M - P
+    lower_vector = D - M
 
-    total_len = max(
+    upper_length = max(
         1.0,
         float(
             np.linalg.norm(
-                total_vec
+                upper_vector
             )
         ),
     )
 
-    unit = (
-        total_vec
-        / total_len
+    lower_length = max(
+        1.0,
+        float(
+            np.linalg.norm(
+                lower_vector
+            )
+        ),
     )
 
-    projection = np.dot(
-        M - P,
-        unit,
+    upper_unit = (
+        upper_vector
+        / upper_length
     )
 
-    middle_ratio = float(
-        np.clip(
-            projection / total_len,
-            0.20,
-            0.80,
-        )
+    lower_unit = (
+        lower_vector
+        / lower_length
+    )
+
+    root_radius = leg_root_radius(
+        leg
+    )
+
+    knee_overlap = max(
+        5,
+        min(
+            18,
+            int(
+                min(
+                    upper_length,
+                    lower_length,
+                )
+                * 0.15
+            ),
+        ),
     )
 
     # --------------------------------------------------------
-    # Pixel coordinate grid.
+    # Pixel coordinate grid
     # --------------------------------------------------------
 
     yy, xx = np.mgrid[
         0:h,
-        0:w
-    ].astype(
+        0:w,
+    ].astype(np.float32)
+
+    q = np.stack(
+        [xx, yy],
+        axis=-1,
+    )
+
+    alpha = sprite[
+        :,
+        :,
+        3
+    ]
+
+    # --------------------------------------------------------
+    # Projection along upper leg
+    # --------------------------------------------------------
+
+    upper_projection = np.sum(
+        (q - P) * upper_unit,
+        axis=-1,
+    )
+
+    # --------------------------------------------------------
+    # Projection along lower leg
+    # --------------------------------------------------------
+
+    lower_projection = np.sum(
+        (q - M) * lower_unit,
+        axis=-1,
+    )
+
+    base_alpha = alpha.astype(
         np.float32
     )
 
-    points = np.stack(
-        [
-            xx,
-            yy,
-        ],
-        axis=-1,
-    )
+    # --------------------------------------------------------
+    # Upper segment
+    #
+    # Start BEFORE root radius so that it
+    # overlaps the body collar.
+    # --------------------------------------------------------
 
-    q = points - P
-
-    distance_along = np.sum(
-        q * unit,
-        axis=-1,
-    )
-
-    middle_distance = (
-        total_len
-        * middle_ratio
-    )
-
-    # Soft transition around knee.
-    transition = max(
-        5.0,
-        total_len * 0.08,
-    )
-
-    upper_weight = 1.0 - np.clip(
+    upper_region = (
+        (upper_projection >= root_radius * 0.35)
+        &
         (
-            distance_along
-            - middle_distance
+            upper_projection
+            <= upper_length
+            + knee_overlap
         )
-        / transition,
-        0.0,
-        1.0,
     )
 
-    lower_weight = 1.0 - upper_weight
+    upper_mask = np.where(
+        upper_region,
+        base_alpha,
+        0,
+    ).astype(np.uint8)
 
-    base_alpha = (
-        sprite[:, :, 3]
-        .astype(np.float32)
-        / 255.0
+    # --------------------------------------------------------
+    # Lower segment
+    #
+    # Starts BEFORE knee so upper/lower
+    # physically overlap.
+    # --------------------------------------------------------
+
+    lower_region = (
+        (lower_projection >= -knee_overlap)
+        &
+        (
+            lower_projection
+            <= lower_length
+            + knee_overlap
+        )
     )
 
-    upper_alpha = np.clip(
-        base_alpha
-        * upper_weight,
-        0.0,
-        1.0,
-    ) * 255
+    lower_mask = np.where(
+        lower_region,
+        base_alpha,
+        0,
+    ).astype(np.uint8)
 
-    lower_alpha = np.clip(
-        base_alpha
-        * lower_weight,
-        0.0,
-        1.0,
-    ) * 255
-
-    upper_alpha = (
-        upper_alpha
-        .astype(np.uint8)
+    # Extra overlap.
+    upper_mask = cv2.dilate(
+        upper_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3),
+        ),
     )
 
-    lower_alpha = (
-        lower_alpha
-        .astype(np.uint8)
+    lower_mask = cv2.dilate(
+        lower_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3),
+        ),
     )
 
     # --------------------------------------------------------
     # UPPER LEG
-    #
-    # Rotates around proximal attachment.
     # --------------------------------------------------------
 
     upper_matrix = rotation_matrix(
@@ -1377,121 +1473,88 @@ def articulated_leg(
 
     upper = warp_rgba(
         sprite,
-        upper_alpha,
+        upper_mask,
         upper_matrix,
     )
 
-    # Where the knee has moved.
-    moved_knee = rotate_point(
+    # Exact moved knee.
+    M1 = rotate_point(
         M,
         P,
         swing,
     )
 
     # --------------------------------------------------------
-    # LOWER LEG
+    # FOOT LIFT
     #
-    # Its original orientation receives:
+    # Do NOT translate the lower leg vertically.
     #
-    # body swing
-    # +
-    # knee articulation
+    # Translation was one of the reasons the
+    # old version broke the knee connection.
     #
-    # This creates a real bend.
+    # Instead add a small rotation around
+    # the knee.
     # --------------------------------------------------------
 
-    lower_absolute_angle = (
+    lift_pixels = (
+        float(foot_lift)
+        * h
+    )
+
+    lift_angle = 0.0
+
+    if lift_pixels > 0:
+
+        lift_angle = math.degrees(
+            math.atan2(
+                lift_pixels * 0.30,
+                max(
+                    lower_length,
+                    1.0,
+                ),
+            )
+        )
+
+        lift_angle = min(
+            lift_angle,
+            7.0,
+        )
+
+        # Normal walking leg:
+        # foot is below knee -> rotate clockwise
+        # to raise it slightly.
+        if D[1] >= M[1]:
+            lift_angle = -lift_angle
+
+    # Lower leg absolute orientation.
+    lower_angle = (
         swing
-        + knee_bend
+        + knee
+        + lift_angle
     )
 
-    lower_matrix = rotation_matrix(
-        lower_absolute_angle,
-        M,
-    )
-
-    lower = warp_rgba(
+    # Rotate around ORIGINAL knee.
+    lower_rotated = warp_rgba(
         sprite,
-        lower_alpha,
-        lower_matrix,
-    )
-
-    # The rotation around original M keeps M fixed.
-    # Now move the entire lower segment so its knee
-    # coincides with the newly moved knee.
-    shift = (
-        moved_knee
-        - M
-    )
-
-    translation = np.array(
-        [
-            [1, 0, shift[0]],
-            [0, 1, shift[1]],
-        ],
-        dtype=np.float32,
-    )
-
-    lower = cv2.warpAffine(
-        lower,
-        translation,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(
-            0,
-            0,
-            0,
-            0,
+        lower_mask,
+        rotation_matrix(
+            lower_angle,
+            M,
         ),
     )
 
-    # --------------------------------------------------------
-    # FOOT LIFT
-    #
-    # Image y decreases upward.
-    # Ground lock prevents excessive floating.
-    # --------------------------------------------------------
-
-    effective_lift = (
-        foot_lift
-        * (1.0 - 0.70 * ground_lock)
+    # Move ORIGINAL knee to MOVED knee.
+    lower = translate_rgba(
+        lower_rotated,
+        M1[0] - M[0],
+        M1[1] - M[1],
     )
-
-    lift_pixels = (
-        effective_lift
-        * canvas_h
-    )
-
-    if lift_pixels > 0.01:
-
-        lift_matrix = np.array(
-            [
-                [1, 0, 0],
-                [0, 1, -lift_pixels],
-            ],
-            dtype=np.float32,
-        )
-
-        lower = cv2.warpAffine(
-            lower,
-            lift_matrix,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(
-                0,
-                0,
-                0,
-                0,
-            ),
-        )
 
     return upper, lower
 
 
 # ============================================================
-# CLEAN ORIGINAL CHARACTER
+# ANIMAL EXTRACTION
 # ============================================================
 
 def extract_animal(
@@ -1501,12 +1564,9 @@ def extract_animal(
 
     h, w = image.shape[:2]
 
-    polygon = (
-        scene.get(
-            "animal_polygon"
-        )
-        or []
-    )
+    polygon = scene.get(
+        "animal_polygon"
+    ) or []
 
     if len(polygon) >= 3:
 
@@ -1515,15 +1575,15 @@ def extract_animal(
             w,
             h,
             margin=max(
-                10,
-                min(h, w) // 150,
+                15,
+                min(h, w) // 100,
             ),
         )
 
         region = poly_mask(
             (h, w),
             polygon,
-            dil=INK_DILATION,
+            dilation=INK_DILATION,
         )
 
     else:
@@ -1535,14 +1595,14 @@ def extract_animal(
             w,
             h,
             margin=max(
-                10,
-                min(h, w) // 150,
+                15,
+                min(h, w) // 100,
             ),
         )
 
         region = np.zeros(
             (h, w),
-            np.uint8,
+            dtype=np.uint8,
         )
 
         x1, y1, x2, y2 = bbox
@@ -1561,40 +1621,51 @@ def extract_animal(
 
     x1, y1, x2, y2 = bbox
 
-    rgba = cv2.cvtColor(
-        image[
-            y1:y2,
-            x1:x2
-        ],
-        cv2.COLOR_BGR2BGRA,
-    )
-
-    rgba[:, :, 3] = mask[
+    crop = image[
         y1:y2,
         x1:x2
     ]
 
-    return rgba, bbox, mask
+    rgba = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2BGRA,
+    )
+
+    rgba[:, :, 3] = cv2.GaussianBlur(
+        mask[
+            y1:y2,
+            x1:x2
+        ],
+        (3, 3),
+        0,
+    )
+
+    return (
+        rgba,
+        bbox,
+        mask,
+    )
 
 
 # ============================================================
-# REMOVE CHARACTER FROM ORIGINAL
+# REMOVE ANIMAL FROM ORIGINAL BACKGROUND
 # ============================================================
 
-def remove_animal_from_original(
+def remove_animal_from_background(
     image,
     animal,
     bbox,
 ):
 
-    result = image.copy()
+    background = image.copy()
 
     x1, y1, x2, y2 = bbox
 
-    mask = np.zeros(
-        image.shape[:2],
-        np.uint8,
-    )
+    if (
+        x2 <= x1
+        or y2 <= y1
+    ):
+        return background
 
     alpha = animal[
         :,
@@ -1602,26 +1673,18 @@ def remove_animal_from_original(
         3
     ]
 
-    hh = min(
-        alpha.shape[0],
-        y2 - y1,
+    full_mask = np.zeros(
+        image.shape[:2],
+        dtype=np.uint8,
     )
 
-    ww = min(
-        alpha.shape[1],
-        x2 - x1,
-    )
+    full_mask[
+        y1:y2,
+        x1:x2
+    ] = alpha
 
-    mask[
-        y1:y1 + hh,
-        x1:x1 + ww
-    ] = alpha[
-        :hh,
-        :ww
-    ]
-
-    mask = cv2.dilate(
-        mask,
+    full_mask = cv2.dilate(
+        full_mask,
         cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (9, 9),
@@ -1630,118 +1693,154 @@ def remove_animal_from_original(
 
     try:
 
-        result = cv2.inpaint(
-            result,
-            mask,
-            8,
+        return cv2.inpaint(
+            background,
+            full_mask,
+            7,
             cv2.INPAINT_TELEA,
         )
 
     except Exception:
-        pass
 
-    return result
+        return background
 
 
 # ============================================================
-# ANIMAL PLATE
+# BODY-ONLY SPRITE
 # ============================================================
 
-def clean_animation_plate(
-    image,
-    scene,
+def make_body_sprite(
+    animal,
+    animal_bbox,
+    prepared_legs,
 ):
 
-    plate = image.copy()
+    body = animal.copy()
 
-    for part in (
-        scene.get(
-            "parts",
-            []
+    ax1, ay1, ax2, ay2 = animal_bbox
+
+    body_h, body_w = body.shape[:2]
+
+    for leg in prepared_legs:
+
+        lx1, ly1, lx2, ly2 = leg[
+            "bbox"
+        ]
+
+        local_x1 = lx1 - ax1
+        local_y1 = ly1 - ay1
+        local_x2 = lx2 - ax1
+        local_y2 = ly2 - ay1
+
+        # Clip.
+        bx1 = max(
+            0,
+            local_x1,
         )
-        or []
-    ):
 
-        if not isinstance(
-            part,
-            dict,
+        by1 = max(
+            0,
+            local_y1,
+        )
+
+        bx2 = min(
+            body_w,
+            local_x2,
+        )
+
+        by2 = min(
+            body_h,
+            local_y2,
+        )
+
+        if (
+            bx1 >= bx2
+            or by1 >= by2
         ):
             continue
 
-        is_leg = (
-            str(
-                part.get(
-                    "type",
-                    "",
-                )
-            ).lower()
-            == "leg"
-            or
-            "leg" in str(
-                part.get(
-                    "name",
-                    "",
-                )
-            ).lower()
+        sx1 = bx1 - local_x1
+        sy1 = by1 - local_y1
+
+        sx2 = sx1 + (
+            bx2 - bx1
         )
 
-        if not is_leg:
-            continue
+        sy2 = sy1 + (
+            by2 - by1
+        )
 
-        polygon = (
-            part.get(
-                "polygon"
+        leg_mask = leg[
+            "mask"
+        ][
+            sy1:sy2,
+            sx1:sx2
+        ].copy()
+
+        # ----------------------------------------------------
+        # CRITICAL:
+        # Keep a collar of ORIGINAL pixels around
+        # the proximal attachment point.
+        # ----------------------------------------------------
+
+        P = leg[
+            "joints"
+        ]["proximal"]
+
+        root_radius = leg_root_radius(
+            leg
+        )
+
+        px = int(
+            P[0] - (
+                lx1 - ax1
             )
-            or []
         )
 
-        if len(polygon) < 3:
-            continue
-
-        region = poly_mask(
-            plate.shape,
-            polygon,
-            dil=max(
-                3,
-                INK_DILATION + 2,
-            ),
-        )
-
-        mask = ink_mask(
-            plate,
-            region,
-            SHADOW_SUPPRESSION,
-            INK_DILATION + 1,
-        )
-
-        mask = cv2.dilate(
-            mask,
-            cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (9, 9),
-            ),
-        )
-
-        try:
-
-            plate = cv2.inpaint(
-                plate,
-                mask,
-                6,
-                cv2.INPAINT_TELEA,
+        py = int(
+            P[1] - (
+                ly1 - ay1
             )
+        )
 
-        except Exception:
-            pass
+        px -= sx1
+        py -= sy1
 
-    return plate
+        cv2.circle(
+            leg_mask,
+            (
+                px,
+                py,
+            ),
+            root_radius,
+            0,
+            -1,
+        )
+
+        body_alpha = body[
+            by1:by2,
+            bx1:bx2,
+            3
+        ]
+
+        body_alpha[
+            leg_mask > 0
+        ] = 0
+
+        body[
+            by1:by2,
+            bx1:bx2,
+            3
+        ] = body_alpha
+
+    return body
 
 
 # ============================================================
-# GAIT PHASE
+# WALKING PHASE
 # ============================================================
 
-def leg_phase(
+def phase_for(
     side,
     index,
 ):
@@ -1749,14 +1848,6 @@ def leg_phase(
     s = str(
         side
     ).lower()
-
-    # Natural diagonal gait.
-    #
-    # Front-left + back-right
-    # move together.
-    #
-    # Front-right + back-left
-    # move together.
 
     if "front_left" in s:
         return 0.0
@@ -1777,39 +1868,85 @@ def leg_phase(
     )
 
 
+def smooth_gait(value):
+
+    # Smooth sinusoidal movement.
+    return (
+        value
+        * (
+            0.72
+            + 0.28
+            * abs(value)
+        )
+    )
+
+
 # ============================================================
-# SINGLE WALKING POSE
+# WALKING POSE
 # ============================================================
 
-def render_walk_pose(
-    plate,
+def create_walking_pose(
+    background,
+    body_sprite,
+    body_bbox,
     prepared_legs,
-    phase,
-    body_offset_y=0,
+    t,
 ):
 
-    frame = plate.copy()
+    frame = background.copy()
 
-    h, w = plate.shape[:2]
+    h, w = background.shape[:2]
+
+    # --------------------------------------------------------
+    # Gentle whole-body bob.
+    #
+    # IMPORTANT:
+    # Body and ALL legs receive exactly the same bob.
+    # This prevents the old "leg detached from body" problem.
+    # --------------------------------------------------------
+
+    bob = int(
+        math.sin(
+            2.0
+            * math.pi
+            * t
+        )
+        * h
+        * BODY_BOB
+    )
+
+    bx, by, _, _ = body_bbox
+
+    # Body moves together with legs.
+    frame = alpha_over(
+        frame,
+        body_sprite,
+        bx,
+        by + bob,
+    )
+
+    # --------------------------------------------------------
+    # Legs
+    # --------------------------------------------------------
 
     for index, leg in enumerate(
         prepared_legs
     ):
 
-        phase_offset = leg_phase(
+        phase = phase_for(
             leg["side"],
             index,
         )
 
-        s = math.sin(
-            phase
-            + phase_offset
+        raw = math.sin(
+            2.0
+            * math.pi
+            * t
+            + phase
         )
 
-        # Slightly softer than a perfect sine.
-        gait = (
-            0.72 * s
-            + 0.28 * s * abs(s)
+        gait = smooth_gait(
+            raw
         )
 
         side = str(
@@ -1822,27 +1959,25 @@ def render_walk_pose(
         )
 
         if "back" in side:
-            swing *= 0.92
+            swing *= 0.90
 
-        # Lift happens primarily during forward swing.
-        forward = max(
+        # Feet lift only during positive phase.
+        lift = max(
             0.0,
             gait,
+        ) * FOOT_LIFT
+
+        lift *= (
+            1.0
+            - 0.65
+            * GROUND_LOCK
         )
 
-        lift = (
-            forward
-            * FOOT_LIFT
-        )
+        # Knee bends only during swing.
+        if raw > 0:
 
-        # Knee flexion.
-        #
-        # When the leg moves forward,
-        # bend the knee slightly.
-        if gait > 0:
-
-            knee = -(
-                KNEE_BEND
+            knee = (
+                -KNEE_BEND
                 * gait
             )
 
@@ -1859,202 +1994,156 @@ def render_walk_pose(
             swing,
             knee,
             lift,
-            GROUND_LOCK,
-            h,
         )
 
-        bx, by, _, _ = leg["bbox"]
+        lx, ly, _, _ = leg[
+            "bbox"
+        ]
 
-        draw_y = (
-            by
-            + int(body_offset_y)
+        # SAME bob as body.
+        ly += bob
+
+        # Upper first.
+        frame = alpha_over(
+            frame,
+            upper,
+            lx,
+            ly,
         )
+
+        # Lower second.
+        # Overlap makes the knee visually connected.
+        frame = alpha_over(
+            frame,
+            lower,
+            lx,
+            ly,
+        )
+
+    return frame
+
+
+# ============================================================
+# STANDING POSE
+# ============================================================
+
+def create_standing_pose(
+    background,
+    body_sprite,
+    body_bbox,
+    prepared_legs,
+):
+
+    frame = background.copy()
+
+    bx, by, _, _ = body_bbox
+
+    frame = alpha_over(
+        frame,
+        body_sprite,
+        bx,
+        by,
+    )
+
+    for leg in prepared_legs:
+
+        upper, lower = articulated_leg(
+            leg,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+        lx, ly, _, _ = leg[
+            "bbox"
+        ]
 
         frame = alpha_over(
             frame,
             upper,
-            bx,
-            draw_y,
+            lx,
+            ly,
         )
 
         frame = alpha_over(
             frame,
             lower,
-            bx,
-            draw_y,
+            lx,
+            ly,
         )
 
     return frame
 
 
 # ============================================================
-# WALKING KEYFRAMES
+# WALK-IN
 # ============================================================
 
-def create_walk_keyframes(
-    image,
-    prepared_legs,
-    scene,
-):
+def ease_in_out(t):
 
-    plate = clean_animation_plate(
-        image,
-        scene,
-    )
-
-    # 8 poses instead of 4.
-    #
-    # This is important for a more natural
-    # giraffe gait.
-
-    phases = np.linspace(
-        0,
-        2 * math.pi,
-        9,
-        endpoint=False,
-    )
-
-    frames = []
-
-    for phase in phases:
-
-        bob = (
-            math.sin(
-                phase * 2
-            )
-            * image.shape[0]
-            * BODY_BOB
+    t = float(
+        np.clip(
+            t,
+            0.0,
+            1.0,
         )
+    )
 
-        frame = render_walk_pose(
-            plate,
-            prepared_legs,
-            phase,
-            bob,
+    return (
+        t
+        * t
+        * (
+            3.0
+            - 2.0
+            * t
         )
-
-        frames.append(frame)
-
-    return frames
-
-
-# ============================================================
-# STANDING FRAME
-# ============================================================
-
-def create_standing_frame(
-    image,
-    prepared_legs,
-    scene,
-):
-
-    plate = clean_animation_plate(
-        image,
-        scene,
-    )
-
-    # Legs nearly neutral.
-    frame = render_walk_pose(
-        plate,
-        prepared_legs,
-        0.0,
-        0,
-    )
-
-    return frame
-
-
-# ============================================================
-# WHITE CANVAS
-# ============================================================
-
-def white_canvas(
-    image,
-):
-
-    h, w = image.shape[:2]
-
-    return np.full(
-        (h, w, 3),
-        255,
-        dtype=np.uint8,
     )
 
 
-# ============================================================
-# PLACE ANIMAL
-# ============================================================
-
-def place_animal_at_target(
-    canvas,
+def create_walk_in_frame(
+    white_canvas,
     animal,
-    bbox,
-    progress,
-    from_left=True,
+    target_bbox,
+    p,
 ):
 
-    x1, y1, x2, y2 = bbox
+    H, W = white_canvas.shape[:2]
 
-    ah, aw = animal.shape[:2]
+    target_x1, target_y1, target_x2, target_y2 = (
+        target_bbox
+    )
 
-    # Exact target location.
-    target_x = x1
-    target_y = y1
+    animal_h, animal_w = (
+        animal.shape[:2]
+    )
 
-    # Start completely outside left edge.
-    start_x = -aw - 40
+    p = ease_in_out(
+        p
+    )
 
-    if from_left:
+    target_x = target_x1
 
-        p = smootherstep(
-            progress
-        )
+    target_y = target_y1
 
-        current_x = int(
-            start_x
-            + (
-                target_x
-                - start_x
-            )
-            * p
+    # Extra distance outside canvas.
+    extra = int(
+        W
+        * ENTRY_EXTRA_DISTANCE
+    )
+
+    if ENTRY_SIDE == "Left":
+
+        start_x = (
+            -animal_w
+            - extra
         )
 
     else:
 
-        current_x = target_x
-
-    current_y = target_y
-
-    return alpha_over(
-        canvas,
-        animal,
-        current_x,
-        current_y,
-    )
-
-
-# ============================================================
-# MOVE WALKING ANIMAL
-# ============================================================
-
-def create_walk_in_frame(
-    white,
-    walking_pose,
-    animal_bbox,
-    animal_position_progress,
-):
-
-    x1, y1, x2, y2 = animal_bbox
-
-    ph, pw = walking_pose.shape[:2]
-
-    start_x = -pw - 50
-
-    target_x = x1
-
-    p = smootherstep(
-        animal_position_progress
-    )
+        start_x = (
+            W
+            + extra
+        )
 
     x = int(
         start_x
@@ -2065,56 +2154,45 @@ def create_walk_in_frame(
         * p
     )
 
-    # Very small vertical body movement.
-    #
-    # Avoid excessive bouncing because a giraffe
-    # has a relatively stable torso while walking.
-    y = y1
+    # Very subtle walking bob while entering.
+    y = int(
+        target_y
+        + math.sin(
+            p
+            * math.pi
+            * 2.0
+        )
+        * H
+        * 0.004
+    )
+
+    frame = white_canvas.copy()
 
     return alpha_over(
-        white.copy(),
-        walking_pose,
+        frame,
+        animal,
         x,
         y,
     )
 
 
 # ============================================================
-# EXACT TARGET POSITION
-# ============================================================
-
-def create_target_frame(
-    white,
-    walking_pose,
-    bbox,
-):
-
-    x1, y1, _, _ = bbox
-
-    return alpha_over(
-        white.copy(),
-        walking_pose,
-        x1,
-        y1,
-    )
-
-
-# ============================================================
-# SMOOTH MERGE
+# FINAL MERGE
 # ============================================================
 
 def smooth_merge(
-    character_frame,
+    animated_frame,
     original,
     p,
 ):
 
-    p = smootherstep(
+    p = ease_in_out(
         p
     )
 
+    # Slightly smoother than direct linear dissolve.
     return cv2.addWeighted(
-        character_frame,
+        animated_frame,
         1.0 - p,
         original,
         p,
@@ -2123,352 +2201,193 @@ def smooth_merge(
 
 
 # ============================================================
-# BUILD COMPLETE ANIMATION
+# COMPLETE ANIMATION
 # ============================================================
 
 def build_animation(
     image,
     animal,
-    bbox,
-    walk_keys,
+    animal_bbox,
+    body_sprite,
+    prepared_legs,
     total_frames,
-    cycles,
+    walk_cycles,
     mode,
-    walk_fraction,
+    walk_in_fraction,
     stand_fraction,
     merge_fraction,
 ):
 
-    original = image.copy()
-
-    white = white_canvas(
-        image
-    )
-
-    if not walk_keys:
-        return [
-            original.copy()
-            for _ in range(total_frames)
-        ]
+    H, W = image.shape[:2]
 
     # --------------------------------------------------------
-    # FRAME ALLOCATION
+    # PURE WHITE INITIAL CANVAS
+    # --------------------------------------------------------
+
+    white = np.full(
+        (H, W, 3),
+        255,
+        dtype=np.uint8,
+    )
+
+    # --------------------------------------------------------
+    # Background used after animal is removed.
+    #
+    # It is NOT shown during the walk-in.
+    # --------------------------------------------------------
+
+    clean_background = (
+        remove_animal_from_background(
+            image,
+            animal,
+            animal_bbox,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Determine frame counts.
     # --------------------------------------------------------
 
     if mode == "Walk in place only":
 
-        walk_in_n = 0
-        stand_n = 0
+        walk_n = 0
         merge_n = 0
+
+        stand_n = total_frames
 
     else:
 
-        walk_in_n = max(
+        walk_n = max(
             8,
             int(
                 total_frames
-                * walk_fraction
+                * walk_in_fraction
             ),
         )
 
-        stand_n = max(
-            3,
-            int(
-                total_frames
-                * stand_fraction
-            ),
-        )
-
-        if mode == "White canvas → walk in only":
+        if mode == "White canvas → walk in → stand":
 
             merge_n = 0
 
         else:
 
             merge_n = max(
-                4,
+                5,
                 int(
                     total_frames
                     * merge_fraction
                 ),
             )
 
-    remaining = (
-        total_frames
-        - walk_in_n
-        - stand_n
-        - merge_n
-    )
-
-    if remaining < 1:
-
-        remaining = 1
-
-    # --------------------------------------------------------
-    # WALK CYCLE FRAMES
-    # --------------------------------------------------------
-
-    cycle_count = max(
-        1,
-        int(cycles),
-    )
-
-    # Use all 8 keyframes.
-    cycle_length = len(
-        walk_keys
-    )
-
-    walking_frames = []
-
-    for i in range(
-        max(
-            remaining,
-            cycle_count * cycle_length,
-        )
-    ):
-
-        idx = (
-            i
-            % cycle_length
+        stand_n = max(
+            8,
+            total_frames
+            - walk_n
+            - merge_n,
         )
 
-        next_idx = (
-            idx + 1
-        ) % cycle_length
+    frames = []
 
-        # Smooth interpolation between
-        # actual articulated drawings.
-        local_t = (
-            i
-            % cycle_length
-        ) / float(
-            cycle_length
-        )
+    # ========================================================
+    # PHASE 1
+    # PURE WHITE + ANIMAL ENTERS
+    # ========================================================
 
-        # Slight ease.
-        blend = smootherstep(
-            local_t
-        )
-
-        frame = cv2.addWeighted(
-            walk_keys[idx],
-            1.0 - blend,
-            walk_keys[next_idx],
-            blend,
-            0,
-        )
-
-        walking_frames.append(
-            frame
-        )
-
-    seq = []
-
-    # --------------------------------------------------------
-    # PHASE 1:
-    # PURE WHITE CANVAS
-    # GIRAFFE WALKS IN FROM LEFT
-    # --------------------------------------------------------
-
-    if walk_in_n > 0:
+    if walk_n > 0:
 
         for i in range(
-            walk_in_n
+            walk_n
         ):
 
-            if walk_in_n == 1:
+            if walk_n == 1:
                 p = 1.0
             else:
-                p = (
-                    i
-                    / float(
-                        walk_in_n - 1
-                    )
+                p = i / (
+                    walk_n - 1
                 )
-
-            # Make the gait slightly slower.
-            cycle_progress = (
-                p
-                * max(
-                    1.0,
-                    cycle_count
-                )
-            )
-
-            phase_index = (
-                cycle_progress
-                * cycle_length
-            )
-
-            idx = int(
-                phase_index
-            ) % cycle_length
-
-            next_idx = (
-                idx + 1
-            ) % cycle_length
-
-            blend = smootherstep(
-                phase_index
-                - int(
-                    phase_index
-                )
-            )
-
-            pose = cv2.addWeighted(
-                walk_keys[idx],
-                1.0 - blend,
-                walk_keys[next_idx],
-                blend,
-                0,
-            )
 
             frame = create_walk_in_frame(
                 white,
-                pose,
-                bbox,
+                animal,
+                animal_bbox,
                 p,
             )
 
-            seq.append(
+            frames.append(
                 frame
             )
 
-    # --------------------------------------------------------
-    # PHASE 2:
-    # GIRAFFE REACHES EXACT LOCATION
-    # --------------------------------------------------------
+    # ========================================================
+    # PHASE 2
+    # ANIMAL IS NOW AT EXACT ORIGINAL POSITION
+    #
+    # It walks gently in place.
+    # ========================================================
 
     if stand_n > 0:
 
-        last_pose = walk_keys[
-            0
-        ]
+        if walk_cycles <= 0:
 
-        # Use several almost-still frames.
-        # This gives the feeling of arriving
-        # and settling its weight.
-        for i in range(
-            stand_n
-        ):
+            for _ in range(
+                stand_n
+            ):
 
-            if stand_n == 1:
-                p = 1.0
-            else:
-                p = (
+                frame = create_standing_pose(
+                    clean_background,
+                    body_sprite,
+                    animal_bbox,
+                    prepared_legs,
+                )
+
+                frames.append(
+                    frame
+                )
+
+        else:
+
+            for i in range(
+                stand_n
+            ):
+
+                # Number of complete cycles.
+                t = (
                     i
-                    / float(
-                        stand_n - 1
+                    / max(
+                        1,
+                        stand_n,
                     )
+                    * walk_cycles
                 )
 
-            # Tiny residual body movement.
-            settling = (
-                math.sin(
-                    p * math.pi
-                )
-                * image.shape[0]
-                * BODY_BOB
-                * 0.35
-            )
-
-            target = create_target_frame(
-                white,
-                last_pose,
-                bbox,
-            )
-
-            if abs(
-                settling
-            ) > 0.01:
-
-                # Apply tiny vertical movement
-                # only to character.
-                x1, y1, x2, y2 = bbox
-
-                shifted = np.full_like(
-                    target,
-                    255,
+                frame = create_walking_pose(
+                    clean_background,
+                    body_sprite,
+                    animal_bbox,
+                    prepared_legs,
+                    t,
                 )
 
-                shifted = alpha_over(
-                    shifted,
-                    last_pose,
-                    x1,
-                    y1 + int(settling),
+                frames.append(
+                    frame
                 )
 
-                target = shifted
-
-            seq.append(
-                target
-            )
-
-    # --------------------------------------------------------
-    # PHASE 3:
-    # OPTIONAL WALK-IN-PLACE
-    # --------------------------------------------------------
-
-    remaining_walk = max(
-        0,
-        remaining,
-    )
-
-    for i in range(
-        remaining_walk
-    ):
-
-        idx = (
-            i
-            % len(
-                walking_frames
-            )
-        )
-
-        frame = walking_frames[
-            idx
-        ].copy()
-
-        # Walking frames are on the original
-        # coordinate system, so the giraffe is
-        # already exactly at its target.
-        seq.append(
-            frame
-        )
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # If the requested animation is meant to
-    # finish with the original image, reserve
-    # the final merge frames.
-    #
-    # We rebuild the sequence so merge always
-    # occurs at the very end.
-    # --------------------------------------------------------
+    # ========================================================
+    # PHASE 3
+    # SETTLE INTO EXACT ORIGINAL POSE
+    # ========================================================
 
     if merge_n > 0:
 
-        # Make sure we have a target-position
-        # character frame.
-        target_pose = walk_keys[
-            0
-        ]
+        if frames:
 
-        character_target = create_target_frame(
-            white,
-            target_pose,
-            bbox,
-        )
+            last_frame = frames[-1]
 
-        # Replace any accidental excess frames.
-        if len(seq) > total_frames - merge_n:
+        else:
 
-            seq = seq[
-                :total_frames - merge_n
-            ]
+            last_frame = white.copy()
 
-        # Add merge.
+        # First few merge frames remain animated,
+        # then dissolve into the original scenery.
         for i in range(
             merge_n
         ):
@@ -2476,208 +2395,54 @@ def build_animation(
             if merge_n == 1:
                 p = 1.0
             else:
-                p = (
-                    i
-                    / float(
-                        merge_n - 1
-                    )
+                p = i / (
+                    merge_n - 1
                 )
 
-            merged = smooth_merge(
-                character_target,
-                original,
+            frame = smooth_merge(
+                last_frame,
+                image,
                 p,
             )
 
-            seq.append(
-                merged
+            frames.append(
+                frame
             )
 
     # --------------------------------------------------------
-    # WALK-IN-PLACE ONLY
+    # Exact frame count.
     # --------------------------------------------------------
 
-    if mode == "Walk in place only":
+    if len(frames) > total_frames:
 
-        seq = []
-
-        for i in range(
-            total_frames
-        ):
-
-            idx = (
-                i
-                % len(
-                    walking_frames
-                )
-            )
-
-            seq.append(
-                walking_frames[idx].copy()
-            )
-
-    # --------------------------------------------------------
-    # FINAL LENGTH
-    # --------------------------------------------------------
-
-    if len(seq) > total_frames:
-
-        seq = seq[
+        frames = frames[
             :total_frames
         ]
 
-    while len(seq) < total_frames:
+    while len(frames) < total_frames:
 
-        if mode == "White canvas → walk in → merge":
-
-            seq.append(
-                original.copy()
-            )
-
-        else:
-
-            seq.append(
-                seq[-1].copy()
-                if seq
+        frames.append(
+            image.copy()
+            if merge_n > 0
+            else (
+                frames[-1].copy()
+                if frames
                 else white.copy()
             )
-
-    # Guarantee final original frame
-    # when merge mode is active.
-    if mode == "White canvas → walk in → merge":
-
-        seq[-1] = original.copy()
-
-    return seq
-
-
-# ============================================================
-# DETECTION VISUALIZATION
-# ============================================================
-
-def detection_overlay(
-    image,
-    scene,
-):
-
-    output = image.copy()
-
-    h, w = output.shape[:2]
-
-    animal_polygon = poly_px(
-        scene.get(
-            "animal_polygon"
-        )
-        or [],
-        w,
-        h,
-    )
-
-    if len(
-        animal_polygon
-    ) >= 3:
-
-        cv2.polylines(
-            output,
-            [
-                animal_polygon
-            ],
-            True,
-            (0, 180, 0),
-            max(
-                2,
-                min(h, w) // 300,
-            ),
         )
 
-    for part in (
-        scene.get(
-            "parts",
-            []
-        )
-        or []
+    # Guarantee final frame = ORIGINAL.
+    if (
+        mode
+        == "White canvas → walk in → stand → merge"
     ):
+        frames[-1] = image.copy()
 
-        if not isinstance(
-            part,
-            dict,
-        ):
-            continue
-
-        polygon = poly_px(
-            part.get(
-                "polygon"
-            )
-            or [],
-            w,
-            h,
-        )
-
-        if len(
-            polygon
-        ) >= 3:
-
-            cv2.polylines(
-                output,
-                [
-                    polygon
-                ],
-                True,
-                (255, 120, 0),
-                max(
-                    1,
-                    min(h, w) // 450,
-                ),
-            )
-
-        joints = part.get(
-            "joints",
-            {}
-        ) or {}
-
-        for name, joint in joints.items():
-
-            if (
-                isinstance(
-                    joint,
-                    (list, tuple)
-                )
-                and len(joint) >= 2
-            ):
-
-                x, y = (
-                    pt_px(
-                        joint,
-                        w,
-                        h,
-                    )
-                    .astype(int)
-                )
-
-                cv2.circle(
-                    output,
-                    (x, y),
-                    6,
-                    (0, 0, 255),
-                    -1,
-                )
-
-                cv2.putText(
-                    output,
-                    str(name),
-                    (x + 7, y - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 0, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-    return output
+    return frames
 
 
 # ============================================================
-# EXPORTS
+# EXPORT
 # ============================================================
 
 def gif_bytes(
@@ -2688,15 +2453,34 @@ def gif_bytes(
     if not frames:
         return b""
 
-    images = [
-        Image.fromarray(
-            cv2.cvtColor(
+    images = []
+
+    for frame in frames:
+
+        frame = np.asarray(
+            frame,
+            dtype=np.uint8,
+        )
+
+        if frame.ndim == 2:
+
+            frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_GRAY2RGB,
+            )
+
+        else:
+
+            frame = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB,
             )
+
+        images.append(
+            Image.fromarray(
+                frame
+            )
         )
-        for frame in frames
-    ]
 
     buffer = io.BytesIO()
 
@@ -2747,13 +2531,16 @@ def mp4_bytes(
 
         try:
             os.remove(path)
-        except OSError:
+        except Exception:
             pass
 
         return None
 
     for frame in frames:
-        writer.write(frame)
+
+        writer.write(
+            frame
+        )
 
     writer.release()
 
@@ -2762,15 +2549,15 @@ def mp4_bytes(
         with open(
             path,
             "rb",
-        ) as file:
+        ) as f:
 
-            return file.read()
+            return f.read()
 
     finally:
 
         try:
             os.remove(path)
-        except OSError:
+        except Exception:
             pass
 
 
@@ -2808,11 +2595,125 @@ def zip_frames(
 
 
 # ============================================================
-# USER INTERFACE
+# DETECTION VISUALIZATION
+# ============================================================
+
+def detection_overlay(
+    image,
+    scene,
+):
+
+    output = image.copy()
+
+    h, w = output.shape[:2]
+
+    animal_polygon = poly_px(
+        scene.get(
+            "animal_polygon"
+        ) or [],
+        w,
+        h,
+    )
+
+    if len(animal_polygon) >= 3:
+
+        cv2.polylines(
+            output,
+            [animal_polygon],
+            True,
+            (0, 180, 0),
+            max(
+                2,
+                min(h, w) // 300,
+            ),
+        )
+
+    for part in scene.get(
+        "parts",
+        [],
+    ) or []:
+
+        if not isinstance(
+            part,
+            dict,
+        ):
+            continue
+
+        polygon = poly_px(
+            part.get(
+                "polygon"
+            ) or [],
+            w,
+            h,
+        )
+
+        if len(polygon) >= 3:
+
+            cv2.polylines(
+                output,
+                [polygon],
+                True,
+                (255, 120, 0),
+                max(
+                    1,
+                    min(h, w) // 450,
+                ),
+            )
+
+        joints = part.get(
+            "joints"
+        ) or {}
+
+        for name, joint in joints.items():
+
+            if (
+                isinstance(
+                    joint,
+                    (list, tuple),
+                )
+                and len(joint) >= 2
+            ):
+
+                x, y = (
+                    pt_px(
+                        joint,
+                        w,
+                        h,
+                    )
+                    .astype(int)
+                )
+
+                cv2.circle(
+                    output,
+                    (x, y),
+                    6,
+                    (0, 0, 255),
+                    -1,
+                )
+
+                cv2.putText(
+                    output,
+                    str(name),
+                    (
+                        x + 6,
+                        y - 6,
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+    return output
+
+
+# ============================================================
+# UI
 # ============================================================
 
 uploaded = st.file_uploader(
-    "Upload your hand-drawn giraffe scene",
+    "Upload your hand-drawn animal scene",
     type=[
         "png",
         "jpg",
@@ -2820,12 +2721,11 @@ uploaded = st.file_uploader(
     ],
 )
 
-
 if not uploaded:
 
     st.info(
-        "Upload the original drawing containing the giraffe "
-        "and its background."
+        "Upload the drawing containing the giraffe/animal "
+        "and its original background."
     )
 
     st.stop()
@@ -2835,18 +2735,18 @@ raw = uploaded.getvalue()
 
 
 # ============================================================
-# LOAD IMAGE
+# READ IMAGE
 # ============================================================
 
 try:
 
-    pil = Image.open(
+    pil_image = Image.open(
         io.BytesIO(raw)
     ).convert("RGB")
 
     png_buffer = io.BytesIO()
 
-    pil.save(
+    pil_image.save(
         png_buffer,
         format="PNG",
     )
@@ -2855,10 +2755,10 @@ try:
         png_buffer.getvalue()
     )
 
-except Exception as e:
+except Exception as exc:
 
     st.error(
-        f"Could not prepare image: {e}"
+        f"Could not prepare image: {exc}"
     )
 
     st.stop()
@@ -2867,11 +2767,10 @@ except Exception as e:
 image = cv2.imdecode(
     np.frombuffer(
         raw,
-        np.uint8,
+        dtype=np.uint8,
     ),
     cv2.IMREAD_COLOR,
 )
-
 
 if image is None:
 
@@ -2883,7 +2782,7 @@ if image is None:
 
 
 # ============================================================
-# ORIGINAL PREVIEW
+# ORIGINAL IMAGE
 # ============================================================
 
 c1, c2 = st.columns(2)
@@ -2899,52 +2798,46 @@ with c1:
         use_container_width=True,
     )
 
-
 with c2:
 
     st.markdown(
         """
-### 🦒 New animation sequence
+### 🎬 New animation sequence
 
-**1. White canvas**
+**1. Completely white canvas**
 
-The animation begins with a completely white canvas.
+⬇️
 
-**2. Giraffe enters**
+**2. Animal enters from the side**
 
-Only the giraffe is visible.
-The background does not move.
+⬇️
 
-**3. Slow articulated walk**
+**3. Animal reaches the exact position where it originally stood**
 
-The legs use:
+⬇️
 
-- hip/shoulder joint
-- knee joint
-- ankle/hoof joint
+**4. Animal walks gently in place**
 
-**4. Exact target position**
+⬇️
 
-The giraffe moves until its bounding box reaches the
-same position as the giraffe in the original drawing.
+**5. Legs remain connected to the body**
 
-**5. Settling**
+⬇️
 
-The giraffe briefly stands at that exact position.
+**6. Animal settles**
 
-**6. Smooth reconstruction**
+⬇️
 
-The original drawing gradually appears.
+**7. Original scenery smoothly appears**
 
-**7. Final frame**
-
-The result becomes exactly the uploaded original image.
+The background is intentionally **not shown during the
+walk-in**.
 """
     )
 
 
 # ============================================================
-# ANALYZE
+# ANALYSIS
 # ============================================================
 
 if st.button(
@@ -2954,19 +2847,19 @@ if st.button(
 ):
 
     with st.spinner(
-        "Analyzing giraffe anatomy..."
+        "Gemini is analyzing the animal anatomy..."
     ):
 
-        scene_result = analyze_scene(
+        scene = analyze_scene(
             gemini_bytes,
             GEMINI_API_KEY,
         )
 
-    if scene_result:
+    if scene:
 
-        st.session_state.scene = (
-            scene_result
-        )
+        st.session_state[
+            "scene"
+        ] = scene
 
         st.session_state.pop(
             "walk_keyframes",
@@ -2984,11 +2877,12 @@ if "scene" not in st.session_state:
     st.stop()
 
 
-scene = st.session_state.scene
-
+scene = st.session_state[
+    "scene"
+]
 
 st.success(
-    f"Detected: **{scene.get('identified_character', 'character')}**"
+    f"Detected: **{scene.get('identified_character', 'animal')}**"
 )
 
 
@@ -2996,12 +2890,10 @@ with st.expander(
     "Gemini anatomy JSON"
 ):
 
-    st.json(scene)
+    st.json(
+        scene
+    )
 
-
-# ============================================================
-# DETECTION PREVIEW
-# ============================================================
 
 st.image(
     cv2.cvtColor(
@@ -3012,7 +2904,8 @@ st.image(
         cv2.COLOR_BGR2RGB,
     ),
     caption=(
-        "Green = animal | Orange = legs | "
+        "Green = animal | "
+        "Orange = legs | "
         "Red = joints"
     ),
     use_container_width=True,
@@ -3027,35 +2920,93 @@ parts = leg_parts(
     scene
 )
 
-prepared = []
+prepared_legs = []
 
 for part in parts:
 
-    prepared_leg = prepare_leg(
+    prepared = prepare_leg(
         image,
         part,
     )
 
-    if prepared_leg is not None:
+    if prepared is not None:
 
-        prepared.append(
-            prepared_leg
+        prepared_legs.append(
+            prepared
         )
 
 
-if not prepared:
+if not prepared_legs:
 
     st.error(
-        "No usable leg polygons/joints were returned. "
-        "Try a clearer image or analyze again."
+        "Gemini did not return usable leg "
+        "polygons and joints."
     )
 
     st.stop()
 
 
 st.success(
-    f"Prepared {len(prepared)} original leg cut-outs."
+    f"Prepared {len(prepared_legs)} connected "
+    f"original-pixel leg cut-outs."
 )
+
+
+# ============================================================
+# EXTRACT ANIMAL
+# ============================================================
+
+animal, animal_bbox, animal_mask = (
+    extract_animal(
+        image,
+        scene,
+    )
+)
+
+
+# ============================================================
+# BODY SPRITE
+# ============================================================
+
+body_sprite = make_body_sprite(
+    animal,
+    animal_bbox,
+    prepared_legs,
+)
+
+
+# ============================================================
+# DEBUG / EXTRACTION PREVIEW
+# ============================================================
+
+with st.expander(
+    "🔬 Extraction preview"
+):
+
+    preview_white = np.full(
+        image.shape,
+        255,
+        dtype=np.uint8,
+    )
+
+    preview_white = alpha_over(
+        preview_white,
+        animal,
+        animal_bbox[0],
+        animal_bbox[1],
+    )
+
+    st.image(
+        cv2.cvtColor(
+            preview_white,
+            cv2.COLOR_BGR2RGB,
+        ),
+        caption=(
+            "Extracted original animal "
+            "on white"
+        ),
+        use_container_width=True,
+    )
 
 
 # ============================================================
@@ -3065,35 +3016,63 @@ st.success(
 st.markdown("---")
 
 st.header(
-    "🦵 Step 2 — Generate slow articulated walking poses"
+    "🦵 Step 2 — Connected walking poses"
 )
 
 st.write(
-    "The giraffe is no longer treated as a rigid object. "
-    "Each visible leg bends around its detected knee while "
-    "the upper section follows the body attachment."
+    "The proximal part of every leg is deliberately "
+    "kept attached to the body. The knee has an overlap "
+    "between the upper and lower pieces, and body/legs "
+    "receive the same bob movement."
 )
 
 
 if st.button(
-    "🦒 Generate 8 improved walking poses",
+    "🦒 Generate 4 walking poses",
     type="primary",
     use_container_width=True,
 ):
 
     with st.spinner(
-        "Building articulated giraffe gait..."
+        "Building connected giraffe walking poses..."
     ):
 
-        keyframes = create_walk_keyframes(
-            image,
-            prepared,
-            scene,
+        # White is NOT used here because these are
+        # diagnostic walking poses.
+        #
+        # Use the cleaned original background.
+        clean_background = (
+            remove_animal_from_background(
+                image,
+                animal,
+                animal_bbox,
+            )
         )
+
+        poses = []
+
+        for t in (
+            0.00,
+            0.25,
+            0.50,
+            0.75,
+        ):
+
+            pose = create_walking_pose(
+                clean_background,
+                body_sprite,
+                animal_bbox,
+                prepared_legs,
+                t,
+            )
+
+            poses.append(
+                pose
+            )
 
         st.session_state[
             "walk_keyframes"
-        ] = keyframes
+        ] = poses
 
         st.session_state.pop(
             "frames",
@@ -3103,19 +3082,15 @@ if st.button(
 
 if "walk_keyframes" in st.session_state:
 
-    keyframes = st.session_state[
-        "walk_keyframes"
-    ]
-
     cols = st.columns(4)
 
     for i, frame in enumerate(
-        keyframes
+        st.session_state[
+            "walk_keyframes"
+        ]
     ):
 
-        with cols[
-            i % 4
-        ]:
+        with cols[i]:
 
             st.image(
                 cv2.cvtColor(
@@ -3127,12 +3102,14 @@ if "walk_keyframes" in st.session_state:
             )
 
     st.download_button(
-        "⬇️ Download 8 key poses",
+        "⬇️ Download 4 walking poses",
         zip_frames(
-            keyframes,
-            "giraffe_walk_pose",
+            st.session_state[
+                "walk_keyframes"
+            ],
+            "connected_walk_pose",
         ),
-        "giraffe_walk_keyposes.zip",
+        "connected_giraffe_walk_poses.zip",
         "application/zip",
         use_container_width=True,
     )
@@ -3145,55 +3122,50 @@ if "walk_keyframes" in st.session_state:
 st.markdown("---")
 
 st.header(
-    "🎞️ Step 3 — Build white-canvas entrance animation"
+    "🎞️ Step 3 — Full animation"
+)
+
+st.write(
+    """
+The final animation is designed to behave like this:
+
+**White → giraffe walks in → reaches exact original location
+→ walks/stands → settles → original image appears.**
+"""
 )
 
 
-if "walk_keyframes" not in st.session_state:
+if st.button(
+    "🚀 Render full animation",
+    type="primary",
+    use_container_width=True,
+):
 
-    st.info(
-        "First generate the walking poses above."
-    )
-
-else:
-
-    if st.button(
-        "🚀 Render complete animation",
-        type="primary",
-        use_container_width=True,
+    with st.spinner(
+        "Rendering complete animation..."
     ):
 
-        with st.spinner(
-            "Rendering slow giraffe entrance and merge..."
-        ):
-
-            animal, bbox, animal_mask = extract_animal(
-                image,
-                scene,
-            )
-
-            frames = build_animation(
-                image=image,
-                animal=animal,
-                bbox=bbox,
-                walk_keys=st.session_state[
-                    "walk_keyframes"
-                ],
-                total_frames=TOTAL_FRAMES,
-                cycles=WALK_CYCLES,
-                mode=ANIMATION_MODE,
-                walk_fraction=WALK_IN_FRACTION,
-                stand_fraction=STAND_FRACTION,
-                merge_fraction=MERGE_FRACTION,
-            )
-
-            st.session_state[
-                "frames"
-            ] = frames
-
-        st.success(
-            f"Rendered {len(frames)} frames at {FPS} FPS."
+        frames = build_animation(
+            image=image,
+            animal=animal,
+            animal_bbox=animal_bbox,
+            body_sprite=body_sprite,
+            prepared_legs=prepared_legs,
+            total_frames=TOTAL_FRAMES,
+            walk_cycles=WALK_CYCLES,
+            mode=ANIMATION_MODE,
+            walk_in_fraction=WALK_IN_FRACTION,
+            stand_fraction=STAND_FRACTION,
+            merge_fraction=MERGE_FRACTION,
         )
+
+        st.session_state[
+            "frames"
+        ] = frames
+
+    st.success(
+        f"Rendered {len(frames)} frames at {FPS} FPS."
+    )
 
 
 # ============================================================
@@ -3211,32 +3183,34 @@ if "frames" in st.session_state:
         FPS,
     )
 
-    st.markdown(
-        "### 🎉 Final animation"
+    st.markdown("---")
+
+    st.header(
+        "🎉 Final Animation"
     )
 
     st.image(
         gif,
         caption=(
-            "White canvas → slow giraffe entrance → "
-            "exact target position → original scene"
+            "White canvas → walking animal → "
+            "exact original position → scenery merge"
         ),
         use_container_width=True,
     )
 
-    col1, col2, col3 = st.columns(3)
+    a, b, c = st.columns(3)
 
-    with col1:
+    with a:
 
         st.download_button(
             "⬇️ Download GIF",
             gif,
-            "giraffe_white_canvas_walk.gif",
+            "hand_drawn_giraffe_walk_v4.gif",
             "image/gif",
             use_container_width=True,
         )
 
-    with col2:
+    with b:
 
         mp4 = mp4_bytes(
             frames,
@@ -3248,7 +3222,7 @@ if "frames" in st.session_state:
             st.download_button(
                 "⬇️ Download MP4",
                 mp4,
-                "giraffe_white_canvas_walk.mp4",
+                "hand_drawn_giraffe_walk_v4.mp4",
                 "video/mp4",
                 use_container_width=True,
             )
@@ -3259,53 +3233,41 @@ if "frames" in st.session_state:
                 "MP4 unavailable in this environment."
             )
 
-    with col3:
+    with c:
 
         st.download_button(
             "⬇️ Download PNG frames",
             zip_frames(
                 frames,
-                "giraffe_frame",
+                "giraffe_walk_frame",
             ),
-            "giraffe_animation_frames.zip",
+            "hand_drawn_giraffe_walk_v4_frames.zip",
             "application/zip",
             use_container_width=True,
         )
-
 
     # ========================================================
     # FRAME PREVIEW
     # ========================================================
 
     st.markdown(
-        "### 🖼️ Animation stages"
+        "### 🖼️ Animation frame preview"
     )
 
-    preview_indices = [
+    indices = np.linspace(
         0,
-        int(len(frames) * 0.10),
-        int(len(frames) * 0.25),
-        int(len(frames) * 0.40),
-        int(len(frames) * 0.55),
-        int(len(frames) * 0.70),
-        int(len(frames) * 0.85),
         len(frames) - 1,
-    ]
-
-    preview_indices = sorted(
-        set(
-            np.clip(
-                preview_indices,
-                0,
-                len(frames) - 1,
-            ).astype(int)
-        )
+        min(
+            16,
+            len(frames),
+        ),
+        dtype=int,
     )
 
     cols = st.columns(4)
 
-    for n, idx in enumerate(
-        preview_indices
+    for n, index in enumerate(
+        indices
     ):
 
         with cols[
@@ -3314,10 +3276,10 @@ if "frames" in st.session_state:
 
             st.image(
                 cv2.cvtColor(
-                    frames[idx],
+                    frames[index],
                     cv2.COLOR_BGR2RGB,
                 ),
-                caption=f"Frame {idx + 1}",
+                caption=f"Frame {index + 1}",
                 use_container_width=True,
             )
 
@@ -3329,7 +3291,7 @@ if "frames" in st.session_state:
 st.markdown("---")
 
 st.caption(
-    "v3 — Original-pixel articulated animation. "
-    "Gemini supplies anatomy geometry only. "
-    "No AI redraw is used for the animation artwork."
+    "v4 — Connected original-pixel animal animation. "
+    "Gemini provides anatomy/geometry only. "
+    "Python performs all movement and compositing."
 )
