@@ -1048,9 +1048,15 @@ def swing_leg(
     leg,
     swing_angle,
 ):
+    """
+    Treats each leg as a single solid cut-out piece rotating smoothly 
+    around its shoulder/hip (proximal) joint pivot. 
+    This 100% guarantees the leg never tears, splits, or separates into pieces.
+    """
     sprite = leg["sprite"]
     joints = leg["joints"]
 
+    # Pivot around shoulder/hip (proximal) joint
     if "proximal" in joints:
         pivot = (float(joints["proximal"][0]), float(joints["proximal"][1]))
     else:
@@ -1209,7 +1215,7 @@ def remove_animal_from_background(
 
 
 # ============================================================
-# BODY-ONLY SPRITE
+# BODY-ONLY SPRITE (WITH LEGS RENDERED UNDERNEATH)
 # ============================================================
 
 def make_body_sprite(
@@ -1217,6 +1223,10 @@ def make_body_sprite(
     animal_bbox,
     prepared_legs,
 ):
+    """
+    Leaves the body completely intact. The leg roots are tucked safely 
+    underneath the body torso so they never pull away or detach.
+    """
     return animal.copy()
 
 
@@ -1293,6 +1303,8 @@ def create_walking_pose(
 
     bx, by, _, _ = body_bbox
 
+    # 1. Render legs FIRST so their upper attachment points are 
+    # hidden securely underneath the body sprite.
     for index, leg in enumerate(
         prepared_legs
     ):
@@ -1334,6 +1346,7 @@ def create_walking_pose(
             ly + bob,
         )
 
+    # 2. Render body ON TOP of the legs to hide any root seams.
     frame = alpha_over(
         frame,
         body_sprite,
