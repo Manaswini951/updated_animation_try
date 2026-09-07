@@ -7,18 +7,34 @@ import streamlit as st
 from PIL import Image
 from google import genai
 from google.genai import types
-from skimage.transform import PiecewiseAffineTransform, warp
 
-# Initialize Gemini API
+# Initialize Streamlit Page Config
+st.set_page_config(
+    page_title="AI Scene Growth & Character Animator",
+    page_icon="🎬",
+    layout="wide",
+)
+
+st.title("🌱 AI-Powered Scene Growth & Character Animator")
+st.markdown(
+    """
+**Pipeline Workflow:**
+1. **AI Segmentation:** Gemini analyzes your drawing, isolates elements (grass, trees, leaves, bunny), and removes backgrounds.
+2. **Sequential Scene Growth:** Animate background elements (grass and trees growing upward/scaling in).
+3. **Character Walk-In:** The main character walks onto the finished scene.
+"""
+)
+
 GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", type="password")
 
 # ============================================================
-# PHASE 1: AI JOINT DETECTION (GEMINI VISION)
+# STAGE 1: AI OBJECT & LAYER EXTRACTION (GEMINI VISION)
 # ============================================================
 
-def detect_character_skeleton(image_bytes, api_key):
+def analyze_and_segment_scene(image_bytes, api_key):
     """
-    Sends drawing to Gemini to identify key joints for limb bending.
+    Sends the drawing to Gemini to detect individual components 
+    and provide layering/positioning metadata.
     """
     if not api_key:
         st.error("Please enter a valid Gemini API Key.")
@@ -27,22 +43,28 @@ def detect_character_skeleton(image_bytes, api_key):
     client = genai.Client(api_key=api_key)
     
     prompt = """
-    Analyze this drawing. Identify the character and return a JSON object with 2D keypoint coordinates normalized from 0 to 100 for:
-    - head
-    - neck
-    - left_shoulder, left_elbow, left_wrist
-    - right_shoulder, right_elbow, right_wrist
-    - left_hip, left_knee, left_ankle
-    - right_hip, right_knee, right_ankle
+    Analyze this hand-drawn scene. Identify all individual background and foreground elements 
+    (e.g., grass tufts, trees, bushes, and the main character object).
+    Return a JSON object detailing each object, its type ('background_element' or 'character'), 
+    its suggested appearance order (1 for background grass/trees, 2 for leaves, 3 for main character), 
+    and its bounding box coordinates normalized from 0 to 100 [ymin, xmin, ymax, xmax].
     
-    Return ONLY valid JSON in this structure:
+    Return ONLY valid JSON in this exact format:
     {
-      "character_detected": true,
-      "joints": {
-         "head": [x, y],
-         "neck": [x, y],
-         "left_knee": [x, y]
-      }
+      "scene_elements": [
+        {
+          "name": "background_tree",
+          "type": "background_element",
+          "growth_order": 1,
+          "box_2d": [ymin, xmin, ymax, xmax]
+        },
+        {
+          "name": "main_bunny",
+          "type": "character",
+          "growth_order": 3,
+          "box_2d": [ymin, xmin, ymax, xmax]
+        }
+      ]
     }
     """
 
@@ -59,139 +81,204 @@ def detect_character_skeleton(image_bytes, api_key):
         )
         return json.loads(response.text)
     except Exception as e:
-        st.error(f"Gemini Joint Detection Failed: {e}")
+        st.error(f"Gemini Scene Analysis Failed: {e}")
         return None
 
 # ============================================================
-# PHASE 2: LIMB DEFORMATION & BENDING (MESH WARPING)
+# STAGE 2: PROCEDURAL COMPOSITION & GROWTH ENGINE
 # ============================================================
 
-def bend_limb_mesh(image, joint_start, joint_mid, joint_end, bend_angle_deg):
-    """
-    Uses Piecewise Affine Transformation to deform image mesh around a joint.
-    """
-    h, w = image.shape[:2]
+def extract_sprite_crop(image_np, box):
+    """Extracts a sub-image based on normalized coordinates [ymin, xmin, ymax, xmax]."""
+    h, w = image_np.shape[:2]
+    ymin, xmin, ymax, xmax = box
     
-    p_start = np.array([joint_start[0] * w / 100.0, joint_start[1] * h / 100.0])
-    p_mid   = np.array([joint_mid[0] * w / 100.0,   joint_mid[1] * h / 100.0])
-    p_end   = np.array([joint_end[0] * w / 100.0,   joint_end[1] * h / 100.0])
-
-    angle_rad = math.radians(bend_angle_deg)
-    rot_matrix = np.array([
-        [math.cos(angle_rad), -math.sin(angle_rad)],
-        [math.sin(angle_rad),  math.cos(angle_rad)]
-    ])
-
-    p_end_bent = p_mid + np.dot(rot_matrix, (p_end - p_mid))
-
-    src_points = np.array([p_start, p_mid, p_end, [0, 0], [w, 0], [0, h], [w, h]])
-    dst_points = np.array([p_start, p_mid, p_end_bent, [0, 0], [w, 0], [0, h], [w, h]])
-
-    tform = PiecewiseAffineTransform()
-    tform.estimate(dst_points, src_points)
+    y1 = int(ymin * h / 100.0)
+    y2 = int(ymax * h / 100.0)
+    x1 = int(xmin * w / 100.0)
+    x2 = int(xmax * w / 100.0)
     
-    warped = warp(image, tform, output_shape=(h, w))
-    return (warped * 255).astype(np.uint8)
+    y1, y2 = max(0, y1), min(h, y2)
+    x1, x2 = max(0, x1), min(w, x2)
+    
+    if y2 <= y1 or x2 <= x1:
+        return None, (0, 0)
+        
+    crop = image_np[y1:y2, x1:x2].copy()
+    
+    # Remove paper white background to make it transparent/overlay-ready
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, alpha = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
+    
+    # Fallback if thresholding clears everything
+    if np.count_nonzero(alpha) < 10:
+        alpha = np.full(gray.shape, 255, dtype=np.uint8)
+        
+    rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
+    rgba[:, :, 3] = alpha
+    return rgba, (x1, y1)
 
-def create_gif_from_frames(frames, fps=12):
+def render_growth_frame(base_canvas, sprites_data, global_progress):
     """
-    Compiles a list of RGB numpy image frames into a GIF byte stream.
+    Renders elements appearing sequentially: 
+    Grass/Trees grow first, followed by leaves, then the character walks in.
     """
-    pil_frames = [Image.fromarray(f) for f in frames]
+    h, w = base_canvas.shape[:2]
+    frame = base_canvas.copy()
+    if frame.shape[2] == 3:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+
+    # Sort sprites by growth order
+    sorted_sprites = sorted(sprites_data, key=lambda x: x['growth_order'])
+
+    for item in sorted_sprites:
+        order = item['growth_order']
+        # Calculate individual appearance threshold based on global progress (0 to 1)
+        # Order 1 triggers from 0.0 - 0.4, Order 2 from 0.3 - 0.7, Order 3 (character) from 0.6 - 1.0
+        start_trigger = (order - 1) * 0.3
+        end_trigger = start_trigger + 0.5
+        
+        if global_progress < start_trigger:
+            continue  # Element hasn't started growing yet
+            
+        element_progress = min(1.0, (global_progress - start_trigger) / max(1e-6, (end_trigger - start_trigger)))
+        
+        sprite = item['sprite']
+        orig_pos = item['position']
+        if sprite is None:
+            continue
+
+        sh, sw = sprite.shape[:2]
+
+        if item['type'] == 'background_element':
+            # Growth effect: scale up from bottom-center
+            current_scale = element_progress
+            if current_scale <= 0:
+                continue
+            new_w = max(2, int(sw * current_scale))
+            new_h = max(2, int(sh * current_scale))
+            
+            resized = cv2.resize(sprite, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            # Paste onto canvas anchored at bottom-left of original bounding box
+            anchor_x = orig_pos[0]
+            anchor_y = orig_pos[1] + sh - new_h  # Grow upward from base
+            
+            frame = paste_rgba(frame, resized, anchor_x, anchor_y)
+
+        elif item['type'] == 'character':
+            # Walk-in effect: character slides in from off-screen left to final position
+            walk_progress = element_progress
+            start_x = -sw
+            target_x = orig_pos[0]
+            current_x = int(start_x + (target_x - start_x) * walk_progress)
+            
+            # Add subtle vertical bobbing while walking
+            bob = int(math.sin(walk_progress * math.pi * 6) * 5) if walk_progress < 1.0 else 0
+            current_y = orig_pos[1] + bob
+            
+            frame = paste_rgba(frame, sprite, current_x, current_y)
+
+    return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+def paste_rgba(canvas, sprite, x, y):
+    """Helper to cleanly paste a transparent RGBA sprite onto an RGBA canvas."""
+    ch, cw = sprite.shape[:2]
+    x2, y2 = x + cw, y + ch
+    
+    if x2 <= 0 or y2 <= 0 or x >= canvas.shape[1] or y >= canvas.shape[0]:
+        return canvas
+
+    cx1, cy1 = max(0, x), max(0, y)
+    cx2, cy2 = min(canvas.shape[1], x2), min(canvas.shape[0], y2)
+
+    sx1, sy1 = cx1 - x, cy1 - y
+    sx2, sy2 = sx1 + (cx2 - cx1), sy1 + (cy2 - cy1)
+
+    s_crop = sprite[sy1:sy2, sx1:sx2]
+    a = (s_crop[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
+    
+    bg_crop = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
+
+    blended = s_crop.astype(np.float32) * a + bg_crop * (1.0 - a)
+    canvas[cy1:cy2, cx1:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
+    return canvas
+
+def create_gif(frames, fps=12):
     buffer = io.BytesIO()
+    pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
     duration = int(1000 / fps)
     pil_frames[0].save(
-        buffer,
-        format="GIF",
-        save_all=True,
-        append_images=pil_frames[1:],
-        duration=duration,
-        loop=0
+        buffer, format="GIF", save_all=True, append_images=pil_frames[1:],
+        duration=duration, loop=0
     )
     return buffer.getvalue()
 
 # ============================================================
-# PHASE 3: STREAMLIT WORKFLOW
+# STAGE 3: STREAMLIT USER INTERFACE EXECUTION
 # ============================================================
 
-st.title("🤖 AI-Rigged Hand-Drawn Character Animator")
-
-uploaded_file = st.file_uploader("Upload Drawing", type=["png", "jpg", "jpeg"])
+uploaded_file = st.file_uploader("Upload Scene Drawing", type=["png", "jpg", "jpeg"])
 
 if uploaded_file and GEMINI_API_KEY:
     file_bytes = uploaded_file.read()
     image_np = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
-    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    
+    st.image(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB), caption="Original Uploaded Scene", width=500)
 
-    st.image(image_rgb, caption="Source Artwork", width=400)
-
-    if st.button("🔍 Step 1: Detect Character & Joints with Gemini"):
-        with st.spinner("Analyzing character skeleton via Gemini API..."):
-            skeleton_data = detect_character_skeleton(file_bytes, GEMINI_API_KEY)
+    if st.button("🔍 Step 1: Extract Scene Elements with Gemini", type="primary"):
+        with st.spinner("Gemini is analyzing and segmenting objects from your drawing..."):
+            scene_data = analyze_and_segment_scene(file_bytes, GEMINI_API_KEY)
             
-        if skeleton_data and skeleton_data.get("character_detected"):
-            st.session_state["skeleton"] = skeleton_data["joints"]
-            st.success("Joints identified successfully!")
-            st.json(skeleton_data["joints"])
+        if scene_data and "scene_elements" in scene_data:
+            st.session_state["scene_elements"] = scene_data["scene_elements"]
+            st.success(f"Successfully isolated {len(scene_data['scene_elements'])} scene components!")
+            st.json(scene_data)
 
-    if "skeleton" in st.session_state:
-        st.markdown("### 🦵 Animation Controls")
-        joints = st.session_state["skeleton"]
+    if "scene_elements" in st.session_state:
+        st.markdown("### 🎬 Step 2: Render Growth & Walk-In Animation")
+        
+        total_frames = st.slider("Animation Frame Count", 12, 60, 30)
+        fps = st.slider("Frames Per Second (FPS)", 6, 24, 12)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            max_knee_angle = st.slider("Max Knee Bend Angle", 0, 45, 25)
-            max_elbow_angle = st.slider("Max Elbow Bend Angle", 0, 45, 20)
-        with col2:
-            num_frames = st.slider("Total Animation Frames", 12, 48, 24)
-            fps = st.slider("Frames Per Second (FPS)", 6, 24, 12)
+        if st.button("🚀 Generate Scene Growth Animation"):
+            with st.spinner("Assembling and rendering growing background elements and character walk-in..."):
+                # Clean white background canvas plate
+                white_canvas = np.full(image_np.shape, 255, dtype=np.uint8)
+                
+                # Pre-extract sprite crops for each element found by Gemini
+                processed_sprites = []
+                for element in st.session_state["scene_elements"]:
+                    sprite, pos = extract_sprite_crop(image_np, element["box_2d"])
+                    processed_sprites.append({
+                        "name": element["name"],
+                        "type": element["type"],
+                        "growth_order": element["growth_order"],
+                        "sprite": sprite,
+                        "position": pos
+                    })
 
-        if st.button("🎬 Generate & Render GIF Animation", type="primary"):
-            frames = []
-            progress_bar = st.progress(0, text="Rendering animation sequence...")
+                # Render frame sequence
+                frames = []
+                progress_bar = st.progress(0, text="Rendering growth progression...")
+                
+                for i in range(total_frames):
+                    progress = i / max(1, total_frames - 1)
+                    frame = render_growth_frame(white_canvas, processed_sprites, progress)
+                    frames.append(frame)
+                    progress_bar.progress((i + 1) / total_frames)
 
-            for i in range(num_frames):
-                # Calculate smooth cyclical bending using sine waves
-                t = (i / num_frames) * 2 * math.pi
-                cur_knee_angle = math.sin(t) * max_knee_angle
-                cur_elbow_angle = math.sin(t + math.pi / 2) * max_elbow_angle
+                progress_bar.empty()
 
-                frame = image_rgb.copy()
+                # Build final GIF output
+                gif_bytes = create_gif(frames, fps=fps)
 
-                # Bend Left Leg
-                if "left_hip" in joints and "left_knee" in joints and "left_ankle" in joints:
-                    frame = bend_limb_mesh(
-                        frame, 
-                        joints["left_hip"], 
-                        joints["left_knee"], 
-                        joints["left_ankle"], 
-                        cur_knee_angle
-                    )
-
-                # Bend Left Arm
-                if "left_shoulder" in joints and "left_elbow" in joints and "left_wrist" in joints:
-                    frame = bend_limb_mesh(
-                        frame, 
-                        joints["left_shoulder"], 
-                        joints["left_elbow"], 
-                        joints["left_wrist"], 
-                        cur_elbow_angle
-                    )
-
-                frames.append(frame)
-                progress_bar.progress((i + 1) / num_frames)
-
-            progress_bar.empty()
-
-            # Compile into GIF
-            gif_data = create_gif_from_frames(frames, fps=fps)
-
-            st.markdown("### 🎉 Rendered Animation Result")
-            st.image(gif_data, caption="Animated Hand-Drawn Character", width=400)
-            
-            st.download_button(
-                label="⬇️ Download Animated GIF",
-                data=gif_data,
-                file_name="character_animation.gif",
-                mime="image/gif"
-            )
+                st.markdown("### 🎉 Rendered Animation Output")
+                st.image(gif_bytes, caption="Growing Scene + Character Walk-In", width=500)
+                
+                st.download_button(
+                    label="⬇️ Download Growth Animation GIF",
+                    data=gif_bytes,
+                    file_name="scene_growth_animation.gif",
+                    mime="image/gif"
+                )
