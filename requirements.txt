@@ -1,6 +1,5 @@
-google-genai
 streamlit
 opencv-python-headless
 numpy
 pillow
-scikit-image
+google-genai
