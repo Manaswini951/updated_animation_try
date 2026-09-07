@@ -28,13 +28,13 @@ st.markdown(
 GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", type="password")
 
 # ============================================================
-# STAGE 1: AI OBJECT & LAYER EXTRACTION (GEMINI VISION)
+# STAGE 1: AI OBJECT & LAYER EXTRACTION (WITH MODEL FALLBACK)
 # ============================================================
 
 def analyze_and_segment_scene(image_bytes, api_key):
     """
     Sends the drawing to Gemini to detect individual components 
-    and provide layering/positioning metadata.
+    with an automatic model fallback sequence to bypass 503 high-demand errors.
     """
     if not api_key:
         st.error("Please enter a valid Gemini API Key.")
@@ -68,21 +68,36 @@ def analyze_and_segment_scene(image_bytes, api_key):
     }
     """
 
-    try:
-        response = client.models.generate_content(
-            model='gemini-3.7-flash',
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
+    # Automatic fallback list if the primary model is busy (503 error)
+    fallback_models = [
+        'gemini-3.7-flash', 
+        'gemini-3.6-flash', 
+        'gemini-2.5-flash'
+    ]
+
+    for model_name in fallback_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
             )
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        st.error(f"Gemini Scene Analysis Failed: {e}")
-        return None
+            return json.loads(response.text)
+        except Exception as e:
+            # If 503 unavailable or model not found, try the next model in the list
+            if "503" in str(e) or "NOT_FOUND" in str(e) or "UNAVAILABLE" in str(e):
+                continue
+            else:
+                # For other errors, log it and try next
+                continue
+
+    st.error("All available Gemini models are currently experiencing high demand (503). Please try again in a moment.")
+    return None
 
 # ============================================================
 # STAGE 2: PROCEDURAL COMPOSITION & GROWTH ENGINE
@@ -133,13 +148,11 @@ def render_growth_frame(base_canvas, sprites_data, global_progress):
 
     for item in sorted_sprites:
         order = item['growth_order']
-        # Calculate individual appearance threshold based on global progress (0 to 1)
-        # Order 1 triggers from 0.0 - 0.4, Order 2 from 0.3 - 0.7, Order 3 (character) from 0.6 - 1.0
         start_trigger = (order - 1) * 0.3
         end_trigger = start_trigger + 0.5
         
         if global_progress < start_trigger:
-            continue  # Element hasn't started growing yet
+            continue  
             
         element_progress = min(1.0, (global_progress - start_trigger) / max(1e-6, (end_trigger - start_trigger)))
         
@@ -151,7 +164,6 @@ def render_growth_frame(base_canvas, sprites_data, global_progress):
         sh, sw = sprite.shape[:2]
 
         if item['type'] == 'background_element':
-            # Growth effect: scale up from bottom-center
             current_scale = element_progress
             if current_scale <= 0:
                 continue
@@ -159,21 +171,17 @@ def render_growth_frame(base_canvas, sprites_data, global_progress):
             new_h = max(2, int(sh * current_scale))
             
             resized = cv2.resize(sprite, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            
-            # Paste onto canvas anchored at bottom-left of original bounding box
             anchor_x = orig_pos[0]
             anchor_y = orig_pos[1] + sh - new_h  # Grow upward from base
             
             frame = paste_rgba(frame, resized, anchor_x, anchor_y)
 
         elif item['type'] == 'character':
-            # Walk-in effect: character slides in from off-screen left to final position
             walk_progress = element_progress
             start_x = -sw
             target_x = orig_pos[0]
             current_x = int(start_x + (target_x - start_x) * walk_progress)
             
-            # Add subtle vertical bobbing while walking
             bob = int(math.sin(walk_progress * math.pi * 6) * 5) if walk_progress < 1.0 else 0
             current_y = orig_pos[1] + bob
             
@@ -227,7 +235,7 @@ if uploaded_file and GEMINI_API_KEY:
     st.image(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB), caption="Original Uploaded Scene", width=500)
 
     if st.button("🔍 Step 1: Extract Scene Elements with Gemini", type="primary"):
-        with st.spinner("Gemini is analyzing and segmenting objects from your drawing..."):
+        with st.spinner("Gemini is analyzing and segmenting objects from your drawing (with auto-fallback)..."):
             scene_data = analyze_and_segment_scene(file_bytes, GEMINI_API_KEY)
             
         if scene_data and "scene_elements" in scene_data:
@@ -243,10 +251,8 @@ if uploaded_file and GEMINI_API_KEY:
 
         if st.button("🚀 Generate Scene Growth Animation"):
             with st.spinner("Assembling and rendering growing background elements and character walk-in..."):
-                # Clean white background canvas plate
                 white_canvas = np.full(image_np.shape, 255, dtype=np.uint8)
                 
-                # Pre-extract sprite crops for each element found by Gemini
                 processed_sprites = []
                 for element in st.session_state["scene_elements"]:
                     sprite, pos = extract_sprite_crop(image_np, element["box_2d"])
@@ -258,7 +264,6 @@ if uploaded_file and GEMINI_API_KEY:
                         "position": pos
                     })
 
-                # Render frame sequence
                 frames = []
                 progress_bar = st.progress(0, text="Rendering growth progression...")
                 
@@ -270,7 +275,6 @@ if uploaded_file and GEMINI_API_KEY:
 
                 progress_bar.empty()
 
-                # Build final GIF output
                 gif_bytes = create_gif(frames, fps=fps)
 
                 st.markdown("### 🎉 Rendered Animation Output")
