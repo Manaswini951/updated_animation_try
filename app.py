@@ -24,11 +24,11 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🦒 Hand-Drawn Animal Walk Animator — Seamless Connected Walk v5")
+st.title("🦒 Hand-Drawn Animal Walk Animator — Solid Connected Walk v6")
 
 st.caption(
-    "Gemini identifies the animal, anatomy, and custom gait profile. "
-    "Python physically animates the ORIGINAL drawing with seamless joint bridging."
+    "Gemini identifies animal anatomy. Python animates the ORIGINAL drawing "
+    "using solid, fully connected limb pivots to prevent any separation."
 )
 
 
@@ -74,30 +74,14 @@ WALK_CYCLES = st.sidebar.slider(
     2,
 )
 
-st.sidebar.markdown("### 🦵 Articulation & Gait")
+st.sidebar.markdown("### 🦵 Leg Movement & Gait")
 
 STEP_ANGLE = st.sidebar.slider(
-    "Leg swing intensity",
+    "Leg swing angle",
     2.0,
     25.0,
     10.0,
     0.5,
-)
-
-KNEE_BEND = st.sidebar.slider(
-    "Knee hinge flexibility",
-    0.0,
-    20.0,
-    8.0,
-    0.5,
-)
-
-FOOT_LIFT = st.sidebar.slider(
-    "Foot clearance lift",
-    0.0,
-    0.12,
-    0.035,
-    0.005,
 )
 
 BODY_BOB = st.sidebar.slider(
@@ -106,14 +90,6 @@ BODY_BOB = st.sidebar.slider(
     0.04,
     0.006,
     0.001,
-)
-
-GROUND_LOCK = st.sidebar.slider(
-    "Ground contact friction",
-    0.0,
-    1.0,
-    0.85,
-    0.05,
 )
 
 st.sidebar.markdown("### 🎬 Timing")
@@ -354,23 +330,20 @@ def analyze_scene(
     prompt = r"""
 Analyze this SINGLE hand-drawn animal scene for a 2D cut-out animation system.
 
-Your job is to dynamically figure out what animal this is, how its limbs operate, and provide exact anatomical data to ensure a seamless walk cycle.
+Identify the animal, its body, and its visible legs.
 
-DO NOT redraw the animal. Return geometry and behavioral specifications only.
-Coordinates must be normalized 0..100 and represented as [y,x].
+Return geometry only. Coordinates must be normalized 0..100 and represented as [y,x].
 
-IMPORTANT INSTRUCTIONS:
-
-1. Identify the main visible animal (e.g., giraffe, horse, dog, cat, person, etc.).
-2. Determine its natural locomotion type (e.g., "quadruped", "biped", "long-necked quadruped") and assign custom gait parameters (such as stride multipliers, leg phases, and body stiffness) so the limb movement looks organic and tailored specifically to this character.
-3. The animal polygon must surround the visible animal completely but exclude background and floor shadows.
-4. Identify EVERY clearly visible leg. Do NOT invent hidden legs.
-5. Each leg must have a tight polygon around the actual visible leg without floor shadows.
-6. Each leg must contain three critical joints:
-   - proximal: exact point where the visible leg attaches to the body.
-   - middle: actual knee / elbow / primary limb joint bend.
-   - distal: ankle / wrist / hoof area before any ground shadow.
-7. Conservatively follow the actual ink drawing.
+IMPORTANT:
+1. Identify the main visible animal.
+2. The animal polygon must surround the animal body completely, excluding background and floor shadows.
+3. Identify EVERY clearly visible leg.
+4. Each leg must have a tight polygon around the actual visible leg without floor shadows.
+5. Each leg must specify joints:
+   - proximal: exact point where the leg attaches to the body (pivot point for rotation).
+   - middle: knee/bend location.
+   - distal: hoof/foot location.
+6. Provide side tags: front_left, front_right, back_left, back_right.
 
 Return ONLY valid JSON with this exact structure:
 
@@ -378,9 +351,7 @@ Return ONLY valid JSON with this exact structure:
   "identified_character": "giraffe",
   "locomotion_profile": {
     "type": "quadruped",
-    "gait_style": "trot",
-    "stride_multiplier": 1.0,
-    "flexibility": 0.8
+    "stride_multiplier": 1.0
   },
   "animal_bbox": [ymin, xmin, ymax, xmax],
   "animal_polygon": [[y, x], ...],
@@ -403,16 +374,6 @@ Return ONLY valid JSON with this exact structure:
     }
   ],
   "notes": "..."
-}
-
-If no animal is visible:
-{
-  "identified_character": "none",
-  "locomotion_profile": {},
-  "animal_bbox": [],
-  "animal_polygon": [],
-  "parts": [],
-  "notes": "No animal found"
 }
 """
 
@@ -463,7 +424,7 @@ If no animal is visible:
                 )
 
             st.success(
-                f"✅ Anatomy and gait analyzed with `{current_model}`"
+                f"✅ Anatomy analyzed with `{current_model}`"
             )
 
             return data
@@ -684,38 +645,6 @@ def rotation_matrix(
         ),
         float(angle),
         1.0,
-    )
-
-
-def rotate_point(
-    point,
-    center,
-    angle,
-):
-    angle_rad = math.radians(
-        float(angle)
-    )
-
-    c = math.cos(angle_rad)
-    s = math.sin(angle_rad)
-
-    q = (
-        np.asarray(
-            point,
-            dtype=np.float32,
-        )
-        - center
-    )
-
-    return (
-        center
-        + np.array(
-            [
-                c * q[0] - s * q[1],
-                s * q[0] + c * q[1],
-            ],
-            dtype=np.float32,
-        )
     )
 
 
@@ -958,33 +887,8 @@ def warp_rgba(
     return transformed
 
 
-def translate_rgba(
-    sprite,
-    dx,
-    dy,
-):
-    h, w = sprite.shape[:2]
-
-    matrix = np.array(
-        [
-            [1, 0, float(dx)],
-            [0, 1, float(dy)],
-        ],
-        dtype=np.float32,
-    )
-
-    return cv2.warpAffine(
-        sprite,
-        matrix,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0),
-    )
-
-
 # ============================================================
-# LEG DETECTION / PREPARATION
+# LEG PREPARATION
 # ============================================================
 
 def leg_parts(scene):
@@ -1035,17 +939,7 @@ def prepare_leg(
         "joints"
     ) or {}
 
-    if (
-        len(polygon) < 3
-        or not all(
-            key in joints
-            for key in (
-                "proximal",
-                "middle",
-                "distal",
-            )
-        )
-    ):
+    if len(polygon) < 3 or "proximal" not in joints:
         return None
 
     h, w = image_bgr.shape[:2]
@@ -1113,11 +1007,8 @@ def prepare_leg(
             w,
             h,
         )
-        for key in (
-            "proximal",
-            "middle",
-            "distal",
-        )
+        for key in joints
+        if isinstance(joints[key], (list, tuple)) and len(joints[key]) >= 2
     }
 
     local_joints = {
@@ -1150,235 +1041,31 @@ def prepare_leg(
 
 
 # ============================================================
-# SEAMLESS ARTICULATED LEG WITH JOINT BRIDGING
+# SOLID CONNECTED PENDULUM LEG
 # ============================================================
 
-def leg_root_radius(leg):
-    P = leg["joints"]["proximal"]
-    M = leg["joints"]["middle"]
-
-    length = float(
-        np.linalg.norm(M - P)
-    )
-
-    return max(
-        6,
-        min(
-            28,
-            int(length * 0.22),
-        ),
-    )
-
-
-def articulated_leg(
+def swing_leg(
     leg,
-    swing,
-    knee,
-    foot_lift,
+    swing_angle,
 ):
     """
-    SEAMLESS ARTICULATION (v5):
-    To completely eliminate any gap or separation at the knee and socket joints,
-    this implementation creates a wide alpha transition bridge (ball-and-socket sleeve)
-    plus a continuous smoothing pass across the hinge pixel boundary.
+    Treats each leg as a single solid cut-out piece rotating smoothly 
+    around its shoulder/hip (proximal) joint pivot. 
+    This 100% guarantees the leg never tears, splits, or separates into pieces.
     """
     sprite = leg["sprite"]
-    h, w = sprite.shape[:2]
+    joints = leg["joints"]
 
-    P = leg["joints"]["proximal"]
-    M = leg["joints"]["middle"]
-    D = leg["joints"]["distal"]
+    # Pivot around shoulder/hip (proximal) joint
+    if "proximal" in joints:
+        pivot = (float(joints["proximal"][0]), float(joints["proximal"][1]))
+    else:
+        pivot = (float(sprite.shape[1] // 2), 0.0)
 
-    upper_vector = M - P
-    lower_vector = D - M
+    matrix = rotation_matrix(swing_angle, pivot)
+    rotated = warp_rgba(sprite, sprite[:, :, 3].copy(), matrix)
 
-    upper_length = max(
-        1.0,
-        float(
-            np.linalg.norm(
-                upper_vector
-            )
-        ),
-    )
-
-    lower_length = max(
-        1.0,
-        float(
-            np.linalg.norm(
-                lower_vector
-            )
-        ),
-    )
-
-    upper_unit = (
-        upper_vector
-        / upper_length
-    )
-
-    lower_unit = (
-        lower_vector
-        / lower_length
-    )
-
-    root_radius = leg_root_radius(
-        leg
-    )
-
-    # Generous knee overlap zone to make upper and lower sleeves blend invisibly
-    knee_overlap = max(
-        8,
-        min(
-            26,
-            int(
-                min(
-                    upper_length,
-                    lower_length,
-                )
-                * 0.28
-            ),
-        ),
-    )
-
-    yy, xx = np.mgrid[
-        0:h,
-        0:w,
-    ].astype(np.float32)
-
-    q = np.stack(
-        [xx, yy],
-        axis=-1,
-    )
-
-    alpha = sprite[:, :, 3]
-
-    upper_projection = np.sum(
-        (q - P) * upper_unit,
-        axis=-1,
-    )
-
-    lower_projection = np.sum(
-        (q - M) * lower_unit,
-        axis=-1,
-    )
-
-    base_alpha = alpha.astype(
-        np.float32
-    )
-
-    # Upper segment extends deep into the body socket and past the knee hinge
-    upper_region = (
-        (upper_projection >= -root_radius * 0.8)
-        &
-        (
-            upper_projection
-            <= upper_length
-            + knee_overlap
-        )
-    )
-
-    upper_mask = np.where(
-        upper_region,
-        base_alpha,
-        0,
-    ).astype(np.uint8)
-
-    # Lower segment extends well above the knee hinge into the upper segment's territory
-    lower_region = (
-        (lower_projection >= -knee_overlap)
-        &
-        (
-            lower_projection
-            <= lower_length
-            + knee_overlap * 0.5
-        )
-    )
-
-    lower_mask = np.where(
-        lower_region,
-        base_alpha,
-        0,
-    ).astype(np.uint8)
-
-    # Robust morphological smoothing for joint continuity
-    bridge_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (5, 5),
-    )
-
-    upper_mask = cv2.dilate(
-        upper_mask,
-        bridge_kernel,
-    )
-    lower_mask = cv2.dilate(
-        lower_mask,
-        bridge_kernel,
-    )
-
-    upper_matrix = rotation_matrix(
-        swing,
-        P,
-    )
-
-    upper = warp_rgba(
-        sprite,
-        upper_mask,
-        upper_matrix,
-    )
-
-    M1 = rotate_point(
-        M,
-        P,
-        swing,
-    )
-
-    lift_pixels = (
-        float(foot_lift)
-        * h
-    )
-
-    lift_angle = 0.0
-
-    if lift_pixels > 0:
-        lift_angle = math.degrees(
-            math.atan2(
-                lift_pixels * 0.30,
-                max(
-                    lower_length,
-                    1.0,
-                ),
-            )
-        )
-
-        lift_angle = min(
-            lift_angle,
-            8.0,
-        )
-
-        if D[1] >= M[1]:
-            lift_angle = -lift_angle
-
-    lower_angle = (
-        swing
-        + knee
-        + lift_angle
-    )
-
-    lower_rotated = warp_rgba(
-        sprite,
-        lower_mask,
-        rotation_matrix(
-            lower_angle,
-            M,
-        ),
-    )
-
-    lower = translate_rgba(
-        lower_rotated,
-        M1[0] - M[0],
-        M1[1] - M[1],
-    )
-
-    return upper, lower
+    return rotated, leg["bbox"][0], leg["bbox"][1]
 
 
 # ============================================================
@@ -1528,7 +1215,7 @@ def remove_animal_from_background(
 
 
 # ============================================================
-# BODY-ONLY SPRITE
+# BODY-ONLY SPRITE (WITH LEGS RENDERED UNDERNEATH)
 # ============================================================
 
 def make_body_sprite(
@@ -1536,121 +1223,15 @@ def make_body_sprite(
     animal_bbox,
     prepared_legs,
 ):
-    body = animal.copy()
-
-    ax1, ay1, ax2, ay2 = animal_bbox
-    body_h, body_w = body.shape[:2]
-
-    for leg in prepared_legs:
-        lx1, ly1, lx2, ly2 = leg[
-            "bbox"
-        ]
-
-        local_x1 = lx1 - ax1
-        local_y1 = ly1 - ay1
-        local_x2 = lx2 - ax1
-        local_y2 = ly2 - ay1
-
-        bx1 = max(
-            0,
-            local_x1,
-        )
-
-        by1 = max(
-            0,
-            local_y1,
-        )
-
-        bx2 = min(
-            body_w,
-            local_x2,
-        )
-
-        by2 = min(
-            body_h,
-            local_y2,
-        )
-
-        if (
-            bx1 >= bx2
-            or by1 >= by2
-        ):
-            continue
-
-        sx1 = bx1 - local_x1
-        sy1 = by1 - local_y1
-
-        sx2 = sx1 + (
-            bx2 - bx1
-        )
-
-        sy2 = sy1 + (
-            by2 - by1
-        )
-
-        leg_mask = leg[
-            "mask"
-        ][
-            sy1:sy2,
-            sx1:sx2
-        ].copy()
-
-        P = leg[
-            "joints"
-        ]["proximal"]
-
-        root_radius = leg_root_radius(
-            leg
-        )
-
-        px = int(
-            P[0] - (
-                lx1 - ax1
-            )
-        )
-
-        py = int(
-            P[1] - (
-                ly1 - ay1
-            )
-        )
-
-        px -= sx1
-        py -= sy1
-
-        # Generous collar blend around the body root attachment
-        cv2.circle(
-            leg_mask,
-            (
-                px,
-                py,
-            ),
-            int(root_radius * 1.3),
-            0,
-            -1,
-        )
-
-        body_alpha = body[
-            by1:by2,
-            bx1:bx2,
-            3
-        ]
-
-        body_alpha[
-            leg_mask > 0
-        ] = 0
-
-        body[
-            by1:by2,
-            bx1:bx2,
-            3
-        ] = body_alpha
-
-    return body
+    """
+    Leaves the body completely intact. The leg roots are tucked safely 
+    underneath the body torso so they never pull away or detach.
+    """
+    return animal.copy()
 
 
 # ============================================================
-# WALKING PHASE & ADAPTIVE GAIT
+# WALKING PHASE & GAIT
 # ============================================================
 
 def phase_for(
@@ -1706,13 +1287,9 @@ def create_walking_pose(
     frame = background.copy()
     h, w = background.shape[:2]
 
-    # Extract dynamic gait adjustments if provided by Gemini profile
     stride_mult = 1.0
-    flexibility = 1.0
-
     if profile and isinstance(profile, dict):
         stride_mult = float(profile.get("stride_multiplier", 1.0))
-        flexibility = float(profile.get("flexibility", 1.0))
 
     bob = int(
         math.sin(
@@ -1726,13 +1303,8 @@ def create_walking_pose(
 
     bx, by, _, _ = body_bbox
 
-    frame = alpha_over(
-        frame,
-        body_sprite,
-        bx,
-        by + bob,
-    )
-
+    # 1. Render legs FIRST so their upper attachment points are 
+    # hidden securely underneath the body sprite.
     for index, leg in enumerate(
         prepared_legs
     ):
@@ -1765,58 +1337,22 @@ def create_walking_pose(
         if "back" in side:
             swing *= 0.90
 
-        lift = max(
-            0.0,
-            gait,
-        ) * FOOT_LIFT
-
-        lift *= (
-            1.0
-            - 0.65
-            * GROUND_LOCK
-        )
-
-        if raw > 0:
-            knee = (
-                -KNEE_BEND
-                * flexibility
-                * gait
-            )
-
-        else:
-            knee = (
-                KNEE_BEND
-                * 0.35
-                * flexibility
-                * gait
-            )
-
-        upper, lower = articulated_leg(
-            leg,
-            swing,
-            knee,
-            lift,
-        )
-
-        lx, ly, _, _ = leg[
-            "bbox"
-        ]
-
-        ly += bob
+        rotated_leg, lx, ly = swing_leg(leg, swing)
 
         frame = alpha_over(
             frame,
-            upper,
+            rotated_leg,
             lx,
-            ly,
+            ly + bob,
         )
 
-        frame = alpha_over(
-            frame,
-            lower,
-            lx,
-            ly,
-        )
+    # 2. Render body ON TOP of the legs to hide any root seams.
+    frame = alpha_over(
+        frame,
+        body_sprite,
+        bx,
+        by + bob,
+    )
 
     return frame
 
@@ -1832,8 +1368,16 @@ def create_standing_pose(
     prepared_legs,
 ):
     frame = background.copy()
-
     bx, by, _, _ = body_bbox
+
+    for leg in prepared_legs:
+        rotated_leg, lx, ly = swing_leg(leg, 0.0)
+        frame = alpha_over(
+            frame,
+            rotated_leg,
+            lx,
+            ly,
+        )
 
     frame = alpha_over(
         frame,
@@ -1841,32 +1385,6 @@ def create_standing_pose(
         bx,
         by,
     )
-
-    for leg in prepared_legs:
-        upper, lower = articulated_leg(
-            leg,
-            0.0,
-            0.0,
-            0.0,
-        )
-
-        lx, ly, _, _ = leg[
-            "bbox"
-        ]
-
-        frame = alpha_over(
-            frame,
-            upper,
-            lx,
-            ly,
-        )
-
-        frame = alpha_over(
-            frame,
-            lower,
-            lx,
-            ly,
-        )
 
     return frame
 
@@ -2504,7 +2022,7 @@ with c1:
 with c2:
     st.markdown(
         """
-### 🎬 Seamless v5 Animation
+### 🎬 Solid Connected Animation
 
 **1. Completely white canvas**
 
@@ -2518,7 +2036,7 @@ with c2:
 
 ⬇️
 
-**4. Animal walks with seamless ball-and-socket connected joints**
+**4. Legs swing smoothly as solid units with zero gaps**
 
 ⬇️
 
@@ -2532,12 +2050,12 @@ with c2:
 # ============================================================
 
 if st.button(
-    "🔍 Analyze drawing & gait with Gemini",
+    "🔍 Analyze drawing with Gemini",
     type="primary",
     use_container_width=True,
 ):
     with st.spinner(
-        "Gemini is identifying animal anatomy and locomotion profile..."
+        "Gemini is analyzing animal anatomy..."
     ):
         scene = analyze_scene(
             gemini_bytes,
@@ -2574,7 +2092,7 @@ st.success(
 
 
 with st.expander(
-    "Gemini anatomy & locomotion profile JSON"
+    "Gemini anatomy JSON"
 ):
     st.json(
         scene
@@ -2621,16 +2139,14 @@ for part in parts:
 
 if not prepared_legs:
     st.error(
-        "Gemini did not return usable leg "
-        "polygons and joints."
+        "Gemini did not return usable leg polygons and joints."
     )
 
     st.stop()
 
 
 st.success(
-    f"Prepared {len(prepared_legs)} seamlessly bridged "
-    "original-pixel leg cut-outs."
+    f"Prepared {len(prepared_legs)} solid connected leg cut-outs."
 )
 
 
@@ -2658,51 +2174,18 @@ body_sprite = make_body_sprite(
 
 
 # ============================================================
-# DEBUG / EXTRACTION PREVIEW
-# ============================================================
-
-with st.expander(
-    "🔬 Extraction preview"
-):
-    preview_white = np.full(
-        image.shape,
-        255,
-        dtype=np.uint8,
-    )
-
-    preview_white = alpha_over(
-        preview_white,
-        animal,
-        animal_bbox[0],
-        animal_bbox[1],
-    )
-
-    st.image(
-        cv2.cvtColor(
-            preview_white,
-            cv2.COLOR_BGR2RGB,
-        ),
-        caption=(
-            "Extracted original animal "
-            "on white canvas"
-        ),
-        use_container_width=True,
-    )
-
-
-# ============================================================
 # STEP 2
 # ============================================================
 
 st.markdown("---")
 
 st.header(
-    "🦵 Step 2 — Seamless connected walking poses"
+    "🦵 Step 2 — Solid connected walking poses"
 )
 
 st.write(
-    "Each leg uses an overlapping sleeve bridge and socket collar "
-    "to ensure the knees and roots stay completely fused without tearing apart."
+    "Each leg is maintained as a single unbroken piece rotating around its "
+    "hip/shoulder pivot, eliminating any knee splitting or body separation."
 )
 
 
@@ -2712,7 +2195,7 @@ if st.button(
     use_container_width=True,
 ):
     with st.spinner(
-        "Building seamlessly bridged walking poses..."
+        "Building solid walking poses..."
     ):
         clean_background = (
             remove_animal_from_background(
@@ -2778,9 +2261,9 @@ if "walk_keyframes" in st.session_state:
             st.session_state[
                 "walk_keyframes"
             ],
-            "seamless_walk_pose",
+            "connected_pose",
         ),
-        "seamless_animal_walk_poses.zip",
+        "connected_animal_walk_poses.zip",
         "application/zip",
         use_container_width=True,
     )
@@ -2796,15 +2279,6 @@ st.header(
     "🎞️ Step 3 — Full animation render"
 )
 
-st.write(
-    """
-The final animation sequence:
-
-**White canvas → animal enters → reaches original placement
-→ walks with connected limbs → scenery merges back in.**
-"""
-)
-
 
 if st.button(
     "🚀 Render full animation",
@@ -2812,146 +2286,4 @@ if st.button(
     use_container_width=True,
 ):
     with st.spinner(
-        "Rendering complete seamless animation..."
-    ):
-        locomotion_profile = scene.get("locomotion_profile", {})
-
-        frames = build_animation(
-            image=image,
-            animal=animal,
-            animal_bbox=animal_bbox,
-            body_sprite=body_sprite,
-            prepared_legs=prepared_legs,
-            total_frames=TOTAL_FRAMES,
-            walk_cycles=WALK_CYCLES,
-            mode=ANIMATION_MODE,
-            walk_in_fraction=WALK_IN_FRACTION,
-            stand_fraction=STAND_FRACTION,
-            merge_fraction=MERGE_FRACTION,
-            locomotion_profile=locomotion_profile,
-        )
-
-        st.session_state[
-            "frames"
-        ] = frames
-
-    st.success(
-        f"Rendered {len(frames)} frames at {FPS} FPS."
-    )
-
-
-# ============================================================
-# RESULT
-# ============================================================
-
-if "frames" in st.session_state:
-    frames = st.session_state[
-        "frames"
-    ]
-
-    gif = gif_bytes(
-        frames,
-        FPS,
-    )
-
-    st.markdown("---")
-
-    st.header(
-        "🎉 Final Animation"
-    )
-
-    st.image(
-        gif,
-        caption=(
-            "White canvas → walking animal → "
-            "seamless joints → scenery merge"
-        ),
-        use_container_width=True,
-    )
-
-    a, b, c = st.columns(3)
-
-    with a:
-        st.download_button(
-            "⬇️ Download GIF",
-            gif,
-            "seamless_animal_walk.gif",
-            "image/gif",
-            use_container_width=True,
-        )
-
-    with b:
-        mp4 = mp4_bytes(
-            frames,
-            FPS,
-        )
-
-        if mp4:
-            st.download_button(
-                "⬇️ Download MP4",
-                mp4,
-                "seamless_animal_walk.mp4",
-                "video/mp4",
-                use_container_width=True,
-            )
-
-        else:
-            st.info(
-                "MP4 unavailable in this environment."
-            )
-
-    with c:
-        st.download_button(
-            "⬇️ Download PNG frames",
-            zip_frames(
-                frames,
-                "animal_walk_frame",
-            ),
-            "seamless_animal_walk_frames.zip",
-            "application/zip",
-            use_container_width=True,
-        )
-
-    st.markdown(
-        "### 🖼️ Animation frame preview"
-    )
-
-    indices = np.linspace(
-        0,
-        len(frames) - 1,
-        min(
-            16,
-            len(frames),
-        ),
-        dtype=int,
-    )
-
-    cols = st.columns(4)
-
-    for n, index in enumerate(
-        indices
-    ):
-        with cols[
-            n % 4
-        ]:
-            st.image(
-                cv2.cvtColor(
-                    frames[index],
-                    cv2.COLOR_BGR2RGB,
-                ),
-                caption=f"Frame {index + 1}",
-                use_container_width=True,
-            )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown("---")
-
-st.caption(
-    "v5 — Seamless connected original-pixel animal animation. "
-    "Gemini provides dynamic anatomy, species identification, and custom gait profiles. "
-    "Python performs seamless joint bridging and motion rendering."
-)
+        "
