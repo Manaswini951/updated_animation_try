@@ -25,13 +25,13 @@ st.set_page_config(
 )
 
 st.title(
-    "🦒 Hand-Drawn Animal Walk Animator — Solid Connected Walk v7"
+    "🦒 Hand-Drawn Animal Walk Animator — Solid Connected Walk v8"
 )
 
 st.caption(
     "Gemini identifies animal anatomy. Python animates the ORIGINAL drawing "
-    "using solid, fully connected limb pivots. The original animal is hidden "
-    "until the final scenery merge to prevent duplicate-leg ghosting."
+    "using solid connected limb pivots. The original animal is hidden during "
+    "walking to prevent duplicate-leg ghosting."
 )
 
 
@@ -238,7 +238,6 @@ def discover_models(
         key = name.lower()
 
         if key not in seen:
-
             seen.add(key)
             result.append(name)
 
@@ -377,60 +376,97 @@ Analyze this SINGLE hand-drawn animal scene for a 2D cut-out animation system.
 
 Identify the animal, its body, and its visible legs.
 
-Return geometry only. Coordinates must be normalized 0..100 and represented as [y,x].
+Return geometry only.
+
+Coordinates must be normalized 0..100 and represented as [y,x].
 
 IMPORTANT:
 
 1. Identify the main visible animal.
 
-2. The animal polygon must surround the animal body completely,
-   excluding background and floor shadows.
+2. The animal polygon must surround the animal completely,
+   including torso, head, neck, tail and visible limbs,
+   but excluding background and floor shadows.
 
 3. Identify EVERY clearly visible leg.
 
 4. Each leg must have a tight polygon around the actual visible leg
    without floor shadows.
 
-5. Each leg must specify joints:
-   - proximal: exact point where the leg attaches to the body
-     (pivot point for rotation).
-   - middle: knee/bend location.
-   - distal: hoof/foot location.
+5. Each leg must specify:
+
+   - proximal:
+     exact point where the leg attaches to the body.
+
+   - middle:
+     knee/bend location.
+
+   - distal:
+     hoof/foot location.
 
 6. Provide side tags:
-   front_left, front_right, back_left, back_right.
 
-7. The BODY part polygon should describe the actual torso/body region,
-   not the complete leg shapes.
+   front_left
+   front_right
+   back_left
+   back_right
 
-Return ONLY valid JSON with this exact structure:
+7. The BODY polygon should describe the torso/body region,
+   NOT the complete legs.
+
+8. Do not include floor shadows as animal parts.
+
+9. Do not invent hidden legs that cannot be seen.
+
+10. Preserve the exact original position of the animal.
+
+Return ONLY valid JSON with this structure:
 
 {
   "identified_character": "giraffe",
+
   "locomotion_profile": {
     "type": "quadruped",
     "stride_multiplier": 1.0
   },
-  "animal_bbox": [ymin, xmin, ymax, xmax],
-  "animal_polygon": [[y, x], ...],
+
+  "animal_bbox": [
+    ymin,
+    xmin,
+    ymax,
+    xmax
+  ],
+
+  "animal_polygon": [
+    [y,x]
+  ],
+
   "parts": [
+
     {
       "name": "body",
       "type": "body",
-      "polygon": [[y, x], ...]
+      "polygon": [
+        [y,x]
+      ]
     },
+
     {
       "name": "front_left_leg",
       "type": "leg",
       "side": "front_left",
-      "polygon": [[y, x], ...],
+      "polygon": [
+        [y,x]
+      ],
       "joints": {
-        "proximal": [y, x],
-        "middle": [y, x],
-        "distal": [y, x]
+        "proximal": [y,x],
+        "middle": [y,x],
+        "distal": [y,x]
       }
     }
+
   ],
+
   "notes": "..."
 }
 """
@@ -486,7 +522,6 @@ Return ONLY valid JSON with this exact structure:
                 data,
                 dict,
             ):
-
                 raise ValueError(
                     "Gemini response was not a JSON object."
                 )
@@ -564,7 +599,6 @@ def poly_px(
         polygon,
         list,
     ):
-
         return np.empty(
             (0, 2),
             dtype=np.int32,
@@ -788,7 +822,7 @@ def ink_mask(
         cv2.COLOR_BGR2HSV,
     )
 
-    H, S, V = cv2.split(hsv)
+    _, S, V = cv2.split(hsv)
 
     colored = (
         S > 35
@@ -906,16 +940,14 @@ def alpha_over(
 
     if source.shape[2] == 3:
 
-        alpha_channel = np.full(
-            source.shape[:2],
-            255,
-            dtype=np.uint8,
-        )
-
         source = np.dstack(
             [
                 source,
-                alpha_channel,
+                np.full(
+                    source.shape[:2],
+                    255,
+                    dtype=np.uint8,
+                ),
             ]
         )
 
@@ -980,8 +1012,7 @@ def alpha_over(
         / 255.0
     )
 
-    if alpha.ndim == 2:
-        alpha = alpha[:, :, None]
+    alpha = alpha[:, :, None]
 
     dst = destination[
         y1:y2,
@@ -990,19 +1021,10 @@ def alpha_over(
         np.float32
     )
 
-    if dst.ndim == 2:
+    if dst.ndim != 3:
+        return destination
 
-        dst = cv2.cvtColor(
-            dst.astype(
-                np.uint8
-            ),
-            cv2.COLOR_GRAY2BGR,
-        ).astype(
-            np.float32
-        )
-
-    if dst.shape[2] != 3:
-        dst = dst[:, :, :3]
+    dst = dst[:, :, :3]
 
     result = (
         src_rgb * alpha
@@ -1060,9 +1082,7 @@ def warp_rgba(
         borderValue=0,
     )
 
-    transformed[:, :, 3] = (
-        transformed_alpha
-    )
+    transformed[:, :, 3] = transformed_alpha
 
     return transformed
 
@@ -1131,7 +1151,6 @@ def prepare_leg(
         len(polygon) < 3
         or "proximal" not in joints
     ):
-
         return None
 
     h, w = image_bgr.shape[:2]
@@ -1166,6 +1185,9 @@ def prepare_leg(
 
     x1, y1, x2, y2 = bbox
 
+    if x2 <= x1 or y2 <= y1:
+        return None
+
     sprite = cv2.cvtColor(
         image_bgr[
             y1:y2,
@@ -1179,6 +1201,8 @@ def prepare_leg(
         x1:x2
     ].copy()
 
+    # Slight expansion keeps the original hand-drawn stroke
+    # connected after rotation.
     local_mask = cv2.dilate(
         local_mask,
         cv2.getStructuringElement(
@@ -1250,9 +1274,10 @@ def swing_leg(
     swing_angle,
 ):
     """
-    Treat each leg as one solid connected cut-out.
+    ORIGINAL GAIT ALGORITHM.
 
-    The original algorithm is intentionally preserved.
+    Each leg remains a single solid cut-out and rotates
+    around the proximal joint.
     """
 
     sprite = leg["sprite"]
@@ -1391,65 +1416,6 @@ def extract_animal(
 
 
 # ============================================================
-# REMOVE ANIMAL FROM ORIGINAL BACKGROUND
-# ============================================================
-
-def remove_animal_from_background(
-    image,
-    animal,
-    bbox,
-):
-
-    background = image.copy()
-
-    x1, y1, x2, y2 = bbox
-
-    if (
-        x2 <= x1
-        or y2 <= y1
-    ):
-
-        return background
-
-    alpha = animal[
-        :,
-        :,
-        3
-    ]
-
-    full_mask = np.zeros(
-        image.shape[:2],
-        dtype=np.uint8,
-    )
-
-    full_mask[
-        y1:y2,
-        x1:x2
-    ] = alpha
-
-    full_mask = cv2.dilate(
-        full_mask,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (9, 9),
-        ),
-    )
-
-    try:
-
-        return cv2.inpaint(
-            background,
-            full_mask,
-            7,
-            cv2.INPAINT_TELEA,
-        )
-
-    except Exception:
-
-        return background
-
-
-# ============================================================
 # BODY-ONLY SPRITE
 # ============================================================
 
@@ -1459,20 +1425,17 @@ def make_body_sprite(
     prepared_legs,
 ):
     """
-    IMPORTANT GHOST-LEG FIX.
+    Critical anti-ghosting stage.
 
-    `animal` contains the complete extracted animal,
-    including its original stationary legs.
+    The complete extracted animal contains the original
+    stationary legs.
 
-    The old implementation simply returned animal.copy(),
-    which meant those original legs remained permanently
-    inside the body sprite.
+    We remove those leg regions from the body sprite so
+    only the animated leg cut-outs can appear during walking.
 
-    Here we remove the leg regions from the body sprite.
-
-    The upper proximal attachment area is restored slightly
-    so that the body remains visually connected to the
-    animated legs.
+    A very small region around each proximal attachment is
+    retained so the animated leg remains visually connected
+    to the torso.
     """
 
     body = animal.copy()
@@ -1492,16 +1455,16 @@ def make_body_sprite(
 
     body_h, body_w = alpha.shape
 
-    # --------------------------------------------------------
-    # Remove extracted leg regions from the body sprite.
-    # --------------------------------------------------------
+    bx, by, _, _ = animal_bbox
 
     leg_union = np.zeros(
         (body_h, body_w),
         dtype=np.uint8,
     )
 
-    bx, by, _, _ = animal_bbox
+    # --------------------------------------------------------
+    # Build a union of every extracted leg mask.
+    # --------------------------------------------------------
 
     for leg in prepared_legs:
 
@@ -1514,8 +1477,6 @@ def make_body_sprite(
 
         lx, ly = leg["bbox"][0], leg["bbox"][1]
 
-        # Convert global leg coordinates into
-        # animal-sprite coordinates.
         local_x = int(
             lx - bx
         )
@@ -1578,10 +1539,25 @@ def make_body_sprite(
         )
 
     # --------------------------------------------------------
-    # Do NOT completely erase the proximal attachment area.
+    # Expand removal slightly.
     #
-    # This keeps the torso visually covering the animated
-    # leg root, preserving the connected appearance.
+    # This is important because the animal extraction and
+    # individual leg extraction may not have identical edges.
+    # --------------------------------------------------------
+
+    removal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (7, 7),
+    )
+
+    leg_union = cv2.dilate(
+        leg_union,
+        removal_kernel,
+        iterations=1,
+    )
+
+    # --------------------------------------------------------
+    # Protect ONLY a small proximal attachment area.
     # --------------------------------------------------------
 
     protected = np.zeros_like(
@@ -1592,7 +1568,7 @@ def make_body_sprite(
 
         global_joints = leg.get(
             "global",
-            {}
+            {},
         )
 
         proximal = global_joints.get(
@@ -1610,13 +1586,22 @@ def make_body_sprite(
             proximal[1] - by
         )
 
-        # Approximate attachment radius based on
-        # leg sprite width.
-        radius = max(
-            5,
-            min(
-                leg["sprite"].shape[:2]
-            ) // 10,
+        # Small attachment radius.
+        #
+        # Deliberately much smaller than the old //10 rule.
+        leg_h, leg_w = leg[
+            "sprite"
+        ].shape[:2]
+
+        radius = int(
+            np.clip(
+                min(
+                    leg_h,
+                    leg_w,
+                ) * 0.035,
+                4,
+                10,
+            )
         )
 
         cv2.circle(
@@ -1631,7 +1616,7 @@ def make_body_sprite(
         )
 
     # --------------------------------------------------------
-    # Erase legs, except the protected body attachment zones.
+    # Actual removal.
     # --------------------------------------------------------
 
     removable = cv2.bitwise_and(
@@ -1642,17 +1627,25 @@ def make_body_sprite(
     )
 
     alpha[
-        removable > 20
+        removable > 15
     ] = 0
 
-    # Very small blur prevents a hard alpha cut.
+    # Remove faint residual pixels around the cut.
     alpha = cv2.GaussianBlur(
         alpha,
         (3, 3),
         0,
     )
 
-    body[:, :, 3] = alpha
+    # Do not allow nearly invisible remnants to become
+    # ghost limbs after compositing.
+    alpha[
+        alpha < 18
+    ] = 0
+
+    body[
+        :, :, 3
+    ] = alpha
 
     return body
 
@@ -1755,9 +1748,9 @@ def create_walking_pose(
 
     bx, by, _, _ = body_bbox
 
-    # --------------------------------------------------------
-    # 1. LEGS FIRST
-    # --------------------------------------------------------
+    # ========================================================
+    # LEGS FIRST
+    # ========================================================
 
     for index, leg in enumerate(
         prepared_legs
@@ -1806,12 +1799,9 @@ def create_walking_pose(
             ly + bob,
         )
 
-    # --------------------------------------------------------
-    # 2. BODY ON TOP
-    #
-    # body_sprite no longer contains the complete stationary
-    # legs, so it cannot create the duplicate-leg problem.
-    # --------------------------------------------------------
+    # ========================================================
+    # BODY LAST
+    # ========================================================
 
     frame = alpha_over(
         frame,
@@ -1892,6 +1882,47 @@ def ease_in_out(
 
 
 # ============================================================
+# TRANSLATE COMPLETE WALKING ANIMAL
+# ============================================================
+
+def translate_walking_pose(
+    pose,
+    dx,
+    dy,
+):
+
+    H, W = pose.shape[:2]
+
+    matrix = np.float32(
+        [
+            [
+                1.0,
+                0.0,
+                dx,
+            ],
+            [
+                0.0,
+                1.0,
+                dy,
+            ],
+        ]
+    )
+
+    return cv2.warpAffine(
+        pose,
+        matrix,
+        (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(
+            255,
+            255,
+            255,
+        ),
+    )
+
+
+# ============================================================
 # WALK-IN FRAME
 # ============================================================
 
@@ -1904,24 +1935,11 @@ def create_moving_walking_frame(
     travel_p,
     profile=None,
 ):
-    """
-    Create the normal walking pose at the animal's ORIGINAL
-    coordinates and then translate the COMPLETE walking animal
-    as one unit.
-
-    Therefore:
-        - legs animate while entering
-        - body and legs move together
-        - animal does not appear as a static standing animal
-        - background remains pure white
-        - no duplicate animal exists underneath
-    """
 
     H, W = white_canvas.shape[:2]
 
     # --------------------------------------------------------
-    # Build normal walking pose on pure white at the exact
-    # original position.
+    # Build the walking animal at its EXACT ORIGINAL position.
     # --------------------------------------------------------
 
     pose = create_walking_pose(
@@ -1933,15 +1951,11 @@ def create_moving_walking_frame(
         profile=profile,
     )
 
-    bx, by, bw, bh = body_bbox
-
-    # --------------------------------------------------------
-    # Use actual animal bbox width for entering.
-    # --------------------------------------------------------
+    bx, by, x2, y2 = body_bbox
 
     animal_width = max(
         1,
-        bw,
+        x2 - bx,
     )
 
     extra = int(
@@ -1963,27 +1977,30 @@ def create_moving_walking_frame(
             + extra
         )
 
-    target_x = bx
+    # --------------------------------------------------------
+    # Smooth movement from outside the canvas to original X.
+    # --------------------------------------------------------
 
-    # Smooth travel.
     p = ease_in_out(
         travel_p
     )
 
-    current_x = int(
+    current_x = (
         start_x
         + (
-            target_x
+            bx
             - start_x
         )
         * p
     )
 
-    # --------------------------------------------------------
-    # Small natural vertical movement.
-    # --------------------------------------------------------
+    dx = (
+        current_x
+        - bx
+    )
 
-    dy = int(
+    # Tiny vertical entrance arc.
+    dy = (
         math.sin(
             p
             * math.pi
@@ -1992,40 +2009,11 @@ def create_moving_walking_frame(
         * 0.004
     )
 
-    dx = (
-        current_x
-        - target_x
-    )
-
-    matrix = np.float32(
-        [
-            [
-                1.0,
-                0.0,
-                dx,
-            ],
-            [
-                0.0,
-                1.0,
-                dy,
-            ],
-        ]
-    )
-
-    moved = cv2.warpAffine(
+    return translate_walking_pose(
         pose,
-        matrix,
-        (W, H),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(
-            255,
-            255,
-            255,
-        ),
+        dx,
+        dy,
     )
-
-    return moved
 
 
 # ============================================================
@@ -2052,6 +2040,127 @@ def smooth_merge(
 
 
 # ============================================================
+# FRAME ALLOCATION
+# ============================================================
+
+def allocate_frames(
+    total_frames,
+    mode,
+    walk_fraction,
+    merge_fraction,
+):
+    """
+    Allocate EXACTLY total_frames.
+
+    Unlike the previous version, no phase is allowed to push
+    the total over TOTAL_FRAMES and then get blindly truncated.
+    """
+
+    if mode == "Walk in place only":
+
+        return (
+            0,
+            total_frames,
+            0,
+        )
+
+    requested_walk = max(
+        6,
+        int(
+            round(
+                total_frames
+                * walk_fraction
+            )
+        ),
+    )
+
+    requested_merge = 0
+
+    if mode == (
+        "White canvas → walk in → stand → merge"
+    ):
+
+        requested_merge = max(
+            5,
+            int(
+                round(
+                    total_frames
+                    * merge_fraction
+                )
+            ),
+        )
+
+    # Keep at least one frame for the middle phase.
+    maximum_walk = max(
+        1,
+        total_frames
+        - requested_merge
+        - 1,
+    )
+
+    walk_n = min(
+        requested_walk,
+        maximum_walk,
+    )
+
+    maximum_merge = max(
+        0,
+        total_frames
+        - walk_n
+        - 1,
+    )
+
+    merge_n = min(
+        requested_merge,
+        maximum_merge,
+    )
+
+    stand_n = (
+        total_frames
+        - walk_n
+        - merge_n
+    )
+
+    # Final safety.
+    if stand_n < 1:
+
+        deficit = (
+            1
+            - stand_n
+        )
+
+        reduce_merge = min(
+            deficit,
+            max(
+                0,
+                merge_n - 1,
+            ),
+        )
+
+        merge_n -= reduce_merge
+        deficit -= reduce_merge
+
+        if deficit > 0:
+
+            walk_n = max(
+                1,
+                walk_n - deficit,
+            )
+
+    stand_n = (
+        total_frames
+        - walk_n
+        - merge_n
+    )
+
+    return (
+        walk_n,
+        stand_n,
+        merge_n,
+    )
+
+
+# ============================================================
 # COMPLETE ANIMATION
 # ============================================================
 
@@ -2069,175 +2178,135 @@ def build_animation(
     merge_fraction,
     locomotion_profile=None,
 ):
-    """
-    COMPLETE COMPOSITION PIPELINE
-
-    Phase 1:
-        Pure white.
-
-    Phase 2:
-        Animated animal walks in from the selected side.
-
-    Phase 3:
-        Animal reaches exact original position and continues
-        walking or stands.
-
-    Phase 4:
-        The COMPLETE ORIGINAL IMAGE fades in.
-
-    IMPORTANT:
-        The original animal/background is NOT shown during
-        the walking phase.
-
-        This is what eliminates the 8-leg ghosting illusion.
-    """
 
     H, W = image.shape[:2]
 
-    # --------------------------------------------------------
+    # ========================================================
     # PURE WHITE CANVAS
-    # --------------------------------------------------------
+    # ========================================================
 
     white = np.full(
-        (H, W, 3),
+        (
+            H,
+            W,
+            3,
+        ),
         255,
         dtype=np.uint8,
     )
 
-    # --------------------------------------------------------
-    # We deliberately DO NOT use clean_background for the
-    # actual walking sequence.
-    #
-    # It can still be generated for compatibility/diagnostic
-    # purposes, but it is not displayed underneath the walker.
-    # --------------------------------------------------------
+    # ========================================================
+    # EXACT FRAME ALLOCATION
+    # ========================================================
 
-    # Kept here because the function is still useful elsewhere.
-    # No walking frame is composited onto it.
-    _ = remove_animal_from_background(
-        image,
-        animal,
-        animal_bbox,
+    walk_n, stand_n, merge_n = (
+        allocate_frames(
+            total_frames,
+            mode,
+            walk_in_fraction,
+            merge_fraction,
+        )
     )
-
-    # --------------------------------------------------------
-    # FRAME ALLOCATION
-    # --------------------------------------------------------
-
-    if mode == "Walk in place only":
-
-        walk_n = 0
-        merge_n = 0
-        stand_n = total_frames
-
-    else:
-
-        walk_n = max(
-            8,
-            int(
-                total_frames
-                * walk_in_fraction
-            ),
-        )
-
-        if mode == (
-            "White canvas → walk in → stand"
-        ):
-
-            merge_n = 0
-
-        else:
-
-            merge_n = max(
-                5,
-                int(
-                    total_frames
-                    * merge_fraction
-                ),
-            )
-
-        # ----------------------------------------------------
-        # Remaining frames after walk-in and merge.
-        # ----------------------------------------------------
-
-        stand_n = max(
-            8,
-            total_frames
-            - walk_n
-            - merge_n,
-        )
 
     frames = []
 
     # ========================================================
-    # PHASE 1 / 2
+    # PHASE 0
     #
-    # PURE WHITE → ANIMATED ANIMAL WALKS IN
+    # GUARANTEED PURE WHITE INTRO
+    #
+    # This makes the animation visibly begin from a blank
+    # canvas rather than immediately showing an off-screen
+    # translated object.
     # ========================================================
 
     if walk_n > 0:
 
-        for i in range(
-            walk_n
+        intro_n = min(
+            3,
+            max(
+                1,
+                walk_n // 5,
+            ),
+        )
+
+        for _ in range(
+            intro_n
         ):
 
-            if walk_n == 1:
-
-                travel_p = 1.0
-
-            else:
-
-                travel_p = (
-                    i
-                    / (
-                        walk_n - 1
-                    )
-                )
-
-            # ------------------------------------------------
-            # Animate the gait DURING the entrance.
-            # ------------------------------------------------
-
-            if walk_n <= 1:
-
-                gait_t = 0.0
-
-            else:
-
-                gait_t = (
-                    travel_p
-                    * max(
-                        1.0,
-                        float(
-                            walk_cycles
-                        )
-                        if walk_cycles > 0
-                        else 1.0,
-                    )
-                )
-
-            frame = (
-                create_moving_walking_frame(
-                    white_canvas=white,
-                    body_sprite=body_sprite,
-                    body_bbox=animal_bbox,
-                    prepared_legs=prepared_legs,
-                    t=gait_t,
-                    travel_p=travel_p,
-                    profile=locomotion_profile,
-                )
-            )
-
             frames.append(
-                frame
+                white.copy()
             )
+
+    else:
+
+        intro_n = 0
+
+    # Remaining walk-in frames.
+    actual_walk_frames = (
+        walk_n
+        - intro_n
+    )
 
     # ========================================================
-    # PHASE 3
+    # PHASE 1
     #
-    # EXACT ORIGINAL POSITION
+    # ANIMAL WALKS IN FROM OUTSIDE
+    # ========================================================
+
+    for i in range(
+        actual_walk_frames
+    ):
+
+        if actual_walk_frames <= 1:
+
+            travel_p = 1.0
+
+        else:
+
+            travel_p = (
+                i
+                / (
+                    actual_walk_frames
+                    - 1
+                )
+            )
+
+        # At least one complete gait cycle occurs during entry.
+        gait_cycles = max(
+            1.0,
+            float(
+                walk_cycles
+            ),
+        )
+
+        gait_t = (
+            travel_p
+            * gait_cycles
+        )
+
+        frame = (
+            create_moving_walking_frame(
+                white_canvas=white,
+                body_sprite=body_sprite,
+                body_bbox=animal_bbox,
+                prepared_legs=prepared_legs,
+                t=gait_t,
+                travel_p=travel_p,
+                profile=locomotion_profile,
+            )
+        )
+
+        frames.append(
+            frame
+        )
+
+    # ========================================================
+    # PHASE 2
     #
-    # STILL WHITE BACKGROUND
+    # ANIMAL IS NOW AT EXACT ORIGINAL POSITION
+    #
+    # WHITE BACKGROUND REMAINS.
     # ========================================================
 
     if stand_n > 0:
@@ -2292,30 +2361,41 @@ def build_animation(
                 )
 
     # ========================================================
+    # PHASE 3
+    #
+    # FINAL EXACT-POSITION ISOLATED FRAME
+    # ========================================================
+
+    if frames:
+
+        final_isolated_frame = (
+            frames[-1].copy()
+        )
+
+    else:
+
+        final_isolated_frame = (
+            create_standing_pose(
+                white,
+                body_sprite,
+                animal_bbox,
+                prepared_legs,
+            )
+        )
+
+    # ========================================================
     # PHASE 4
     #
-    # ORIGINAL SCENERY FADES IN
-    #
-    # IMPORTANT:
-    # This fades the COMPLETE original image over the
-    # isolated animated animal.
+    # COMPLETE ORIGINAL SCENERY MERGE
     # ========================================================
 
     if merge_n > 0:
-
-        if frames:
-
-            last_frame = frames[-1]
-
-        else:
-
-            last_frame = white.copy()
 
         for i in range(
             merge_n
         ):
 
-            if merge_n == 1:
+            if merge_n <= 1:
 
                 p = 1.0
 
@@ -2324,12 +2404,13 @@ def build_animation(
                 p = (
                     i
                     / (
-                        merge_n - 1
+                        merge_n
+                        - 1
                     )
                 )
 
             frame = smooth_merge(
-                last_frame,
+                final_isolated_frame,
                 image,
                 p,
             )
@@ -2369,7 +2450,7 @@ def build_animation(
             )
 
     # ========================================================
-    # FORCE FINAL ORIGINAL IMAGE
+    # GUARANTEE FINAL FRAME
     # ========================================================
 
     if (
@@ -2634,15 +2715,20 @@ def detection_overlay(
                 and len(joint) >= 2
             ):
 
-                x, y = (
-                    pt_px(
-                        joint,
-                        w,
-                        h,
-                    )
-                    .astype(
-                        int
-                    )
+                point = pt_px(
+                    joint,
+                    w,
+                    h,
+                ).astype(
+                    int
+                )
+
+                x = int(
+                    point[0]
+                )
+
+                y = int(
+                    point[1]
                 )
 
                 cv2.circle(
@@ -2871,8 +2957,8 @@ st.image(
         cv2.COLOR_BGR2RGB,
     ),
     caption=(
-        "Green = animal body | "
-        "Orange = legs | "
+        "Green = animal | "
+        "Orange = leg polygons | "
         "Red = joints"
     ),
     use_container_width=True,
@@ -2951,10 +3037,9 @@ st.header(
 )
 
 st.write(
-    "Each leg is maintained as a single unbroken piece rotating "
-    "around its hip/shoulder pivot. The original stationary leg "
-    "pixels are removed from the body sprite so they cannot "
-    "appear underneath the moving legs."
+    "The preview uses the same pure-white isolated composition "
+    "as the final animation. Original stationary legs are removed "
+    "from the body sprite before the animated legs are rendered."
 )
 
 
@@ -2967,12 +3052,6 @@ if st.button(
     with st.spinner(
         "Building solid walking poses..."
     ):
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Preview on WHITE, exactly like the final walk-in.
-        # This makes ghosting immediately visible if it occurs.
-        # ----------------------------------------------------
 
         white_preview = np.full(
             image.shape,
@@ -3131,7 +3210,7 @@ if "frames" in st.session_state:
         gif,
         caption=(
             "Pure white → animal walks in while animated → "
-            "exact position → scenery gradually appears → "
+            "exact original position → scenery gradually appears → "
             "original drawing"
         ),
         use_container_width=True,
@@ -3226,8 +3305,10 @@ if "frames" in st.session_state:
 st.markdown("---")
 
 st.caption(
-    "v7 — Solid connected animation. Gemini provides anatomy and joints. "
-    "Python performs the original pendulum limb rotation. The original "
-    "stationary animal is hidden during walking and restored only through "
-    "the final complete-image merge."
+    "v8 — Solid connected animation. Gemini provides anatomy and "
+    "joints. The original pendulum leg algorithm is preserved. "
+    "Stationary leg pixels are removed from the body sprite before "
+    "walking, the isolated animal enters over pure white, reaches "
+    "its original position, and the complete original scenery is "
+    "restored only during the final merge."
 )
