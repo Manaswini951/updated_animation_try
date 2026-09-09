@@ -1,5 +1,5 @@
-streamlit
-opencv-python-headless
-numpy
-pillow
-google-genai
+streamlit>=1.38.0
+google-genai>=0.1.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
