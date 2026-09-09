@@ -2769,7 +2769,7 @@ with c1:
             cv2.COLOR_BGR2RGB,
         ),
         caption="Original drawing",
-        width="stretch",
+        use_container_width=True,
     )
 
 with c2:
@@ -2810,7 +2810,7 @@ with c2:
 if st.button(
     "🔍 Analyze drawing with Gemini",
     type="primary",
-    width="stretch",
+    use_container_width=True,
 ):
 
     with st.spinner(
@@ -2875,7 +2875,7 @@ st.image(
         "Orange = legs | "
         "Red = joints"
     ),
-    width="stretch",
+    use_container_width=True,
 )
 
 
@@ -2961,7 +2961,7 @@ st.write(
 if st.button(
     "🦒 Generate 4 connected walking poses",
     type="primary",
-    width="stretch",
+    use_container_width=True,
 ):
 
     with st.spinner(
@@ -3037,7 +3037,7 @@ if "walk_keyframes" in st.session_state:
                     cv2.COLOR_BGR2RGB,
                 ),
                 caption=f"Pose {i + 1}",
-                width="stretch",
+                use_container_width=True,
             )
 
     st.download_button(
@@ -3050,7 +3050,7 @@ if "walk_keyframes" in st.session_state:
         ),
         "connected_animal_walk_poses.zip",
         "application/zip",
-        width="stretch",
+        use_container_width=True,
     )
 
 
@@ -3068,7 +3068,7 @@ st.header(
 if st.button(
     "🚀 Render full animation",
     type="primary",
-    width="stretch",
+    use_container_width=True,
 ):
 
     with st.spinner(
@@ -3134,7 +3134,7 @@ if "frames" in st.session_state:
             "exact position → scenery gradually appears → "
             "original drawing"
         ),
-        width="stretch",
+        use_container_width=True,
     )
 
     a, b, c = st.columns(3)
@@ -3146,7 +3146,7 @@ if "frames" in st.session_state:
             gif,
             "connected_animal_walk.gif",
             "image/gif",
-            width="stretch",
+            use_container_width=True,
         )
 
     with b:
@@ -3163,7 +3163,7 @@ if "frames" in st.session_state:
                 mp4,
                 "connected_animal_walk.mp4",
                 "video/mp4",
-                width="stretch",
+                use_container_width=True,
             )
 
         else:
@@ -3182,7 +3182,7 @@ if "frames" in st.session_state:
             ),
             "connected_animal_walk_frames.zip",
             "application/zip",
-            width="stretch",
+            use_container_width=True,
         )
 
     st.markdown(
@@ -3215,7 +3215,7 @@ if "frames" in st.session_state:
                     cv2.COLOR_BGR2RGB,
                 ),
                 caption=f"Frame {index + 1}",
-                width="stretch",
+                use_container_width=True,
             )
 
 
